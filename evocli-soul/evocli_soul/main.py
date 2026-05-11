@@ -147,8 +147,22 @@ async def main() -> None:
         except Exception as e:
             log.warning("Daemon workers init failed (non-fatal): %s", e)
 
+    # Fix: 启动 Evolution 后台调度器（每10分钟读取真实事件，检测重复模式，生成 Skill 草案）
+    # 根因：start_background_scheduler() 从未被调用，Evolution 系统完全处于休眠状态。
+    async def _start_evolution_scheduler():
+        try:
+            import evocli_soul.state as _st
+            from evocli_soul.evolution import EvolutionEngine
+            engine = EvolutionEngine(_st.get_bridge())
+            engine.start_background_scheduler()
+            log.info("Evolution background scheduler started (reads events.db every 10m)")
+        except Exception as e:
+            log.warning("Evolution scheduler init failed (non-fatal): %s", e)
+
     task1 = asyncio.create_task(_start_daemons())   # 包含 memory_distill(5m) + evolution_scan(10m)
     task1.add_done_callback(_log_task_exception)
+    task_evo = asyncio.create_task(_start_evolution_scheduler())   # Fix: Evolution 调度器
+    task_evo.add_done_callback(_log_task_exception)
     task2 = asyncio.create_task(_warmup_model_context())  # 后台预热 context window
     task2.add_done_callback(_log_task_exception)
 

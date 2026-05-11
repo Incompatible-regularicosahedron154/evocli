@@ -878,12 +878,24 @@ class EvoCLIAgent:
             return {}
     
     async def _inject_context(self, user_input: str, ctx: dict) -> str:
-        """Prefix user input with code context if available."""
+        """Prefix user input with file context from ContextEngine.
+
+        注入策略（避免双重注入）：
+        - user_context（当前文件、git diff、对话历史）→ 注入 user message（所有路径）
+        - system_prompt（约束、记忆、RepoMap）→ 由各 LLM 路径的 system message 处理：
+            * pydantic-ai: 初始化时设置静态约束 + memory_recall 工具按需召回
+            * _stream_litellm: Fix 3 直接使用 ctx["system_prompt"] 作为 system message
+            * _run_litellm:    同上
+        不在此处注入 system_prompt 以避免 LiteLLM 路径的 token 双重消耗。
+        """
         parts = []
+
+        # 注入 user_context（当前文件内容、git diff、对话历史）
         if ctx.get("user_context"):
             parts.append(ctx["user_context"])
+
         parts.append(user_input)
-        return "\n\n---\n".join(parts) if len(parts) > 1 else user_input
+        return "\n\n---\n".join(p for p in parts if p.strip()) if len(parts) > 1 else user_input
     
     async def run(self, user_input: str, context_params: dict | None = None) -> str:
         """Run agent with context injection."""
@@ -1075,21 +1087,27 @@ class EvoCLIAgent:
         from evocli_soul.llm_client import LLMClient
         
         llm = LLMClient(self.config)
-        constraints = "（无）"
-        if self.memory:
-            try:
-                c = self.memory.get_constraints()
-                if c:
-                    constraints = "\n".join(f"- {x}" for x in c)
-            except Exception as e:
-                log.debug("_run_litellm: failed to load constraints (non-fatal): %s", e)
-        
-        system = build_system_prompt(
-            constraints=constraints,
-            goal=ctx.get("system_prompt", user_input)[:500] if ctx.get("system_prompt") else user_input[:200],
-            read_only=self.read_only,
-            compact=False,
-        )
+
+        # Fix: 使用 context_engine 构建的完整 system_prompt（含约束、记忆、RepoMap）。
+        # 原版将 system_prompt 截断到 500 字符作为 "goal" 参数，丢失了大量上下文。
+        # 与 _stream_litellm 的 Fix 3 逻辑一致，确保所有 LiteLLM 路径行为统一。
+        if ctx and ctx.get("system_prompt"):
+            system = ctx["system_prompt"]
+        else:
+            constraints = "（无）"
+            if self.memory:
+                try:
+                    c = self.memory.get_constraints()
+                    if c:
+                        constraints = "\n".join(f"- {x}" for x in c)
+                except Exception as e:
+                    log.debug("_run_litellm: failed to load constraints: %s", e)
+            system = build_system_prompt(
+                constraints=constraints,
+                goal=user_input[:200],
+                read_only=self.read_only,
+                compact=False,
+            )
         conversation = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_input},
@@ -1139,12 +1157,29 @@ class EvoCLIAgent:
         
         llm   = LLMClient(self.config)
         tier  = llm._resolve_model("auto")   # Router alias ("fast"/"smart")
-        system = build_system_prompt(
-            constraints="（无）",
-            goal=user_input[:200],
-            read_only=self.read_only,
-            compact=True,
-        )
+
+        # Fix: 使用 context_engine 构建的 system_prompt（含项目约束、记忆、RepoMap）。
+        # 原版硬编码 constraints="（无）" 导致所有精心构建的上下文被丢弃。
+        # ctx["system_prompt"] 由 _build_context() 通过 ContextEngine.build() 生成。
+        if ctx and ctx.get("system_prompt"):
+            system = ctx["system_prompt"]
+            log.debug("_stream_litellm: using context_engine system_prompt (%d chars)", len(system))
+        else:
+            # Fallback: 从 memory 加载约束（比"（无）"更准确）
+            constraints = "（无）"
+            if self.memory:
+                try:
+                    c = self.memory.get_constraints()
+                    if c:
+                        constraints = "\n".join(f"- {x}" for x in c)
+                except Exception:
+                    pass
+            system = build_system_prompt(
+                constraints=constraints,
+                goal=user_input[:200],
+                read_only=self.read_only,
+                compact=True,
+            )
         # 20-second timeout on the initial API connection.
         # 90s was too long — on blocked/misconfigured networks it means the user
         # stares at a frozen "Streaming..." screen for 90s before seeing any error.

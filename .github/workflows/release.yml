@@ -1,0 +1,215 @@
+name: Release
+
+# 手动触发 — Actions → Run workflow → 填写版本号
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag（如 v0.2.0）'
+        required: true
+        type: string
+      draft:
+        description: '发布为草稿（Draft）'
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: '标记为预发布（Pre-release）'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BIN: evocli
+
+# ─────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── 多平台并行构建 ─────────────────────────────────────────────
+  build:
+    name: Build · ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # 一个平台失败不影响其余平台
+      matrix:
+        include:
+          # Linux x86_64（native）
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+
+          # Linux AArch64（cross 容器构建）
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+
+          # Windows x86_64（native MSVC）
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+          # macOS Intel（native，macos-13 = x86_64 runner）
+          - target: x86_64-apple-darwin
+            os: macos-13
+
+          # macOS Apple Silicon（native，macos-latest = arm64 runner）
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── 工具链 ────────────────────────────────────────────────
+      - name: Install Rust 1.82
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.82"
+          targets: ${{ matrix.target }}
+
+      # ── Cargo 缓存 ────────────────────────────────────────────
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      # ── 安装 cross（仅 aarch64-linux）────────────────────────
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # ── 编译 ─────────────────────────────────────────────────
+      - name: Build (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release --bin ${{ env.BIN }} --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --bin ${{ env.BIN }} --target ${{ matrix.target }}
+
+      # ── 打包 · Linux / macOS ─────────────────────────────────
+      - name: Pack (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          TARGET="${{ matrix.target }}"
+          BIN_PATH="target/${TARGET}/release/${{ env.BIN }}"
+          ARCHIVE="${{ env.BIN }}-${VERSION}-${TARGET}.tar.gz"
+
+          # 仅 native 构建执行 strip（cross 产物用目标架构 strip）
+          if [[ "${{ matrix.use_cross }}" != "true" ]]; then
+            strip "${BIN_PATH}" 2>/dev/null || true
+          fi
+
+          tar -czf "${ARCHIVE}" -C "$(dirname "${BIN_PATH}")" "$(basename "${BIN_PATH}")"
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      # ── 打包 · Windows ───────────────────────────────────────
+      - name: Pack (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $TARGET   = "${{ matrix.target }}"
+          $VERSION  = "${{ inputs.version }}"
+          $BIN_PATH = "target\${TARGET}\release\${{ env.BIN }}.exe"
+          $ARCHIVE  = "${{ env.BIN }}-${VERSION}-${TARGET}.zip"
+
+          Compress-Archive -Path $BIN_PATH -DestinationPath $ARCHIVE
+          $hash = (Get-FileHash -Algorithm SHA256 $ARCHIVE).Hash.ToLower()
+          "$hash  $ARCHIVE" | Out-File -FilePath "${ARCHIVE}.sha256" -Encoding utf8
+
+      # ── 上传构建产物 ─────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.target }}
+          # 同时上传 .tar.gz/.zip 及对应 .sha256
+          path: ${{ env.BIN }}-${{ inputs.version }}-${{ matrix.target }}.*
+          retention-days: 1        # release 完成后无需长期保留
+
+  # ── 发布 GitHub Release ────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write             # 需要写权限才能创建 release / tag
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 将所有平台的 artifact 合并到 dist/
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      # 把各平台的 .sha256 合并成一个文件
+      - name: Merge checksums
+        run: |
+          cd dist
+          cat *.sha256 > checksums-sha256.txt
+          rm -f *.sha256        # 清理单独的 .sha256 避免重复上传
+          echo "=== checksums-sha256.txt ==="
+          cat checksums-sha256.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: EvoCLI ${{ inputs.version }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true   # 自动汇总 PR / commit 变更
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums-sha256.txt
+          body: |
+            ## EvoCLI ${{ inputs.version }}
+
+            AI 编程 Runtime — Rust Host + Python Soul。
+
+            ### 安装
+
+            下载对应平台压缩包，解压后将 `evocli` 加入 `PATH`：
+
+            ```bash
+            # Linux / macOS
+            tar -xzf evocli-${{ inputs.version }}-<target>.tar.gz
+            sudo mv evocli /usr/local/bin/
+            ```
+
+            Python Soul 需单独安装：
+            ```bash
+            pip install evocli-soul
+            # 或开发模式：
+            # EVOCLI_SOUL=evocli-soul/evocli_soul/main.py evocli
+            ```
+
+            ### 平台支持
+
+            | 平台 | 架构 | 文件 |
+            |------|------|------|
+            | Linux | x86_64 | `evocli-${{ inputs.version }}-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux | aarch64 | `evocli-${{ inputs.version }}-aarch64-unknown-linux-gnu.tar.gz` |
+            | macOS | Intel | `evocli-${{ inputs.version }}-x86_64-apple-darwin.tar.gz` |
+            | macOS | Apple Silicon | `evocli-${{ inputs.version }}-aarch64-apple-darwin.tar.gz` |
+            | Windows | x86_64 | `evocli-${{ inputs.version }}-x86_64-pc-windows-msvc.zip` |
+
+            ### 校验完整性
+
+            ```bash
+            sha256sum --check checksums-sha256.txt
+            ```
