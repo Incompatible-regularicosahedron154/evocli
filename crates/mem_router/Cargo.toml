@@ -1,0 +1,25 @@
+﻿[package]
+name    = "mem_router"
+version.workspace = true
+edition.workspace = true
+
+# MemRouter: 自训练记忆写入决策分类器
+# Phase 1: LLM 打标签 (冷启动, 零数据)
+# Phase 2: 嵌入向量 + 逻辑回归 (200条/类后自动训练)
+# Phase 3: 低置信度回退 LLM (持续积累 + 周期重训)
+#
+# 嵌入模型: jinaai/jina-embeddings-v2-base-zh
+#   中英双语, 768维, fastembed ONNX CPU, 无显卡依赖
+
+[dependencies]
+anyhow.workspace     = true
+serde.workspace      = true
+serde_json.workspace = true
+rusqlite.workspace   = true
+chrono.workspace     = true
+dirs.workspace       = true
+tracing.workspace    = true
+ndarray.workspace = true
+
+# fastembed: ONNX CPU 嵌入推理 (支持 jina-embeddings-v2-base-zh)
+fastembed = "5"

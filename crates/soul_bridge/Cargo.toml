@@ -1,0 +1,19 @@
+[package]
+name    = "soul_bridge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "soul_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+tokio.workspace      = true
+serde.workspace      = true
+serde_json.workspace = true
+anyhow.workspace     = true
+thiserror.workspace  = true
+tracing.workspace    = true
+uuid.workspace       = true
+dirs.workspace       = true   # v3.x: managed Python path detection
+

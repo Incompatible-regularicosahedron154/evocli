@@ -1,0 +1,20 @@
+[package]
+name    = "knowledge_graph"
+version.workspace = true
+edition.workspace = true
+
+# GitNexus-inspired: 代码知识图谱 + BM25 搜索 + 社区检测 + 爆炸半径分析
+# 将 GitNexus 的核心能力内置到 EvoCLI，无需外部 MCP 服务器
+
+[dependencies]
+anyhow.workspace     = true
+rusqlite.workspace   = true
+serde.workspace      = true
+serde_json.workspace = true
+chrono.workspace     = true
+uuid.workspace       = true
+tracing.workspace    = true
+# BM25 全文搜索 (GitNexus hybrid search 的 BM25 部分)
+tantivy.workspace    = true
+# 图算法：Louvain 社区检测 + BFS 爆炸半径
+petgraph.workspace   = true

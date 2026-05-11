@@ -1,0 +1,83 @@
+# AGENTS.md — EvoCLI 项目约束文件
+# =====================================
+# 此文件由 EvoCLI AI 在每次会话开始时自动读取。
+# 在这里定义项目专属的规则、约束和行为要求。
+# 放置位置：项目根目录（与 Cargo.toml / package.json 同级）
+#
+# 兼容格式：同时支持 Cursor (.cursorrules)、Claude Code (CLAUDE.md)
+#
+# 使用方式：
+#   evocli          # AI 自动加载此文件
+#   evocli init     # 初始化时自动创建示例
+
+## 项目概述
+
+<!-- 简要描述项目，帮助 AI 建立上下文 -->
+这是一个 [项目类型] 项目，使用 [技术栈]。
+
+## 必须遵守（ALWAYS）
+
+<!-- AI 在此项目中必须始终遵守的规则 -->
+
+- 运行测试前必须先运行 lint：`cargo clippy` 或 `npm run lint`
+- 提交前运行完整测试套件
+- 新功能必须添加对应的单元测试
+- 不使用 `unwrap()`，改用 `?` 运算符或 `match`
+- 所有公共 API 必须有文档注释
+
+## 需要确认（ASK FIRST）
+
+<!-- 执行前必须询问用户的操作 -->
+
+- 添加新的外部依赖
+- 修改数据库 schema 或 API 接口定义
+- 删除任何文件或目录
+- 修改配置文件（.env、docker-compose.yml 等）
+
+## 绝对禁止（NEVER）
+
+<!-- AI 在此项目中永远不应该做的事情 -->
+
+- 修改 `generated/` 或 `dist/` 目录下的文件
+- 提交包含密钥或密码的文件
+- 删除测试代码
+- 使用 `// TODO: implement` 或 `pass` 占位符而不实现
+
+## 代码规范
+
+<!-- 项目特有的代码风格要求 -->
+
+### 命名约定
+- 变量：camelCase（JS/TS）或 snake_case（Rust/Python）
+- 类型/接口：PascalCase
+- 常量：SCREAMING_SNAKE_CASE
+
+### 文件结构
+```
+src/
+  components/   UI 组件
+  utils/        工具函数
+  types/        类型定义
+tests/          测试文件（与 src/ 结构对应）
+```
+
+### 测试要求
+- 单元测试覆盖率 > 80%
+- 使用 `describe` + `it` 结构（Jest）或 `#[test]`（Rust）
+
+## 技术栈备注
+
+<!-- 特殊的依赖版本、已知问题、工作绕过方法 -->
+
+- Node.js 版本：20.x（不兼容 Node 18）
+- 数据库迁移：运行 `npm run migrate` 而非直接修改 schema
+- CI/CD：推送到 main 分支会自动触发部署
+
+## 记忆提示
+
+<!-- 希望 AI 主动记忆的项目特有知识 -->
+
+AI 在发现以下类型信息时，请使用 `memory_write` 记录：
+- 项目特有的 bug 修复模式
+- 性能优化技巧
+- 非显而易见的依赖关系

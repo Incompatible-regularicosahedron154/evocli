@@ -1,0 +1,61 @@
+[package]
+name    = "evocli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "evocli"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace              = true
+anyhow.workspace             = true
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+serde.workspace              = true
+serde_json.workspace         = true
+
+# CLI & Config
+clap.workspace               = true
+toml.workspace               = true
+dirs.workspace               = true
+dialoguer.workspace          = true
+keyring.workspace            = true
+
+# Logging (daily-rotating file appender)
+tracing-appender = "0.2"
+
+# Soul Bridge (IPC)
+soul_bridge = { path = "../soul_bridge" }
+
+# TUI
+evocli-tui = { path = "../tui" }
+
+# Code Intelligence
+code_intel = { path = "../code_intel" }
+
+# Tools（用于 shell.run 执行）
+tools = { path = "../tools" }
+
+# Contracts
+contracts = { path = "../contracts" }
+
+# Filesystem search（tool_dispatch 中的 search.code）
+walkdir.workspace = true
+
+# Diff generation and application (replaces hand-rolled simple_diff)
+diffy.workspace = true
+
+# DateTime for Session timestamps
+chrono.workspace = true
+
+# EventBus
+rusqlite.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+# MCP (P3-2: Model Context Protocol)
+mcp = { path = "../mcp" }
+
+# Knowledge Graph (GitNexus-inspired: BM25 + community detection + blast radius)
+# Used by tool_dispatch.rs for code_intel.bm25_search / blast_radius / communities / symbol_context
+knowledge_graph = { path = "../knowledge_graph" }

@@ -1,0 +1,338 @@
+"""
+LLM Client — LiteLLM Router with Smart Tiering
+
+研究来源:
+- Aider: 使用 litellm 作为统一 LLM 接口，支持 100+ provider
+- 原实现: 自定义 _resolve_model() 路由逻辑（~50行手写路由代码）
+- 改为: litellm.Router — 原生支持重试、fallback、负载均衡、成本追踪
+
+litellm.Router 优势（vs 自写 _resolve_model）:
+  - 自动重试（次数可配置）
+  - Provider 级别 fallback（当主 provider 挂掉时自动切换）
+  - 负载均衡（多 key 时轮询）
+  - 内置成本计算、速率限制感知
+  - 无需手动 PROVIDER_PREFIXES 映射
+
+Tiers:
+  - fast: gpt-4o-mini / claude-3-5-haiku — 快速任务、commit 消息、lint
+  - smart: gpt-4o / claude-3-7-sonnet — 架构分析、复杂推理（Architect 模式）
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import AsyncGenerator
+
+import litellm
+from litellm import Router
+
+log = logging.getLogger("evocli.soul.llm")
+
+litellm.suppress_debug_info = True
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
+DEFAULT_MODELS = {
+    "fast": "claude-3-5-haiku-latest",
+    "smart": "claude-sonnet-4-5-20250514",
+}
+
+
+class LLMClient:
+    """
+    Multi-provider LLM client using litellm.Router.
+    研究: litellm.Router 替代自定义 _resolve_model()，
+    原生支持重试/fallback/负载均衡，无需手写 PROVIDER_PREFIXES 映射。
+    """
+
+    def __init__(self, config: dict | None = None):
+        # If no config provided (or empty), auto-load from ~/.evocli/config.toml
+        # This is the normal case when LLMClient is created inside the Soul process
+        # without config being passed explicitly from Rust.
+        self._config = config or {}
+        if not self._config or not self._config.get("api_key"):
+            self._config = self._load_config_from_disk() or self._config
+
+        self._provider  = self._config.get("provider", "openai")
+        tiers           = self._config.get("tiers", {})
+        self._fast_model  = tiers.get("fast",  DEFAULT_MODELS["fast"])
+        self._smart_model = tiers.get("smart", DEFAULT_MODELS["smart"])
+        self._base_url  = self._config.get("base_url")
+        api_key = self._config.get("api_key")
+        if api_key:
+            self._ensure_api_key(api_key)
+
+        # ── litellm.Router ────────────────────────────────────────────────
+        model_list = self._build_router_model_list(api_key)
+        self._router = Router(
+            model_list=model_list,
+            num_retries=3,
+            retry_after=0.5,
+            allowed_fails=2,
+        )
+
+        self._models = {"fast": self._fast_model, "smart": self._smart_model}
+        log.info("LLMClient (Router): provider=%s fast=%s smart=%s base_url=%s",
+                 self._provider, self._fast_model, self._smart_model,
+                 self._base_url or "(default)")
+
+    @staticmethod
+    def _load_config_from_disk() -> dict:
+        """Load LLM config directly from ~/.evocli/config.toml (Soul-side config read)."""
+        try:
+            from pathlib import Path
+            import tomllib
+            cfg_path = Path.home() / ".evocli" / "config.toml"
+            if not cfg_path.exists():
+                return {}
+            with open(cfg_path, "rb") as f:
+                cfg = tomllib.load(f)
+            # Apply env var overrides
+            llm = cfg.get("llm", {})
+            if not llm.get("api_key"):
+                for env_var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"):
+                    val = os.environ.get(env_var)
+                    if val:
+                        llm["api_key"] = val
+                        break
+            return llm
+        except Exception as e:
+            log.debug("LLMClient: config load failed: %s", e)
+            return {}
+
+    def _build_router_model_list(self, api_key: str | None) -> list[dict]:
+        """Build litellm.Router model list from config."""
+        common_params: dict = {}
+        if self._base_url:
+            common_params["api_base"] = self._base_url
+        if api_key:
+            common_params["api_key"] = api_key
+
+        return [
+            {
+                "model_name":    "fast",
+                "litellm_params": {"model": self._fast_model, **common_params},
+            },
+            {
+                "model_name":    "smart",
+                "litellm_params": {"model": self._smart_model, **common_params},
+            },
+        ]
+
+    def _ensure_api_key(self, key: str) -> None:
+        """Set API key in environment if not already present."""
+        env_map = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+        }
+        env_var = env_map.get(self._provider)
+        if env_var and not os.environ.get(env_var):
+            os.environ[env_var] = key
+
+    def _resolve_model(self, hint: str = "auto", task_context: dict | None = None) -> str:
+        """
+        返回 Router model group alias ("fast" or "smart").
+        研究: 保留此方法供旧调用路径使用，但现在只是返回 group alias
+        让 litellm.Router 处理实际模型选择和 fallback。
+        """
+        if hint in ("fast", "smart"):
+            return hint
+        # auto routing
+        if task_context:
+            if (task_context.get("file_count", 0) > 3 or
+                task_context.get("involves_architecture", False) or
+                task_context.get("previous_tier_failed", False)):
+                return "smart"
+        return "fast"
+
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        tier: str = "smart",
+        model: str | None = None,
+        system: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        task_context: dict | None = None,
+    ) -> str:
+        """
+        Non-streaming completion. Returns full text.
+        FIX-STREAM-3: 超长文本自动分块处理。
+        当 prompt 超过模型 context window 时，智能压缩而非截断。
+        """
+        resolved = model if model else self._resolve_model(hint=tier, task_context=task_context)
+        prompt = self._maybe_chunk_input(prompt, resolved)
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        # litellm.Router.acompletion() — 研究: 替代手写 litellm.acompletion()
+        # Router 处理: 重试、provider fallback、负载均衡（无需自写逻辑）
+        kwargs: dict = {
+            "model":       resolved,   # Router group alias ("fast"/"smart")
+            "messages":    messages,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+        }
+
+        log.debug("complete: tier=%s model=%s tokens=%d", tier, resolved, max_tokens)
+        try:
+            response = await self._router.acompletion(**kwargs)
+        except litellm.ContextWindowExceededError:
+            log.warning("Context window exceeded, truncating input by 50%%...")
+            messages[-1]["content"] = prompt[:len(prompt)//2] + "\n...[truncated]"
+            response = await self._router.acompletion(**kwargs)
+        except Exception as e:
+            if "context" in str(e).lower() or "length" in str(e).lower() or "tokens" in str(e).lower():
+                messages[-1]["content"] = prompt[:len(prompt)//2] + "\n...[truncated]"
+                response = await self._router.acompletion(**kwargs)
+            else:
+                raise
+        text = response.choices[0].message.content or ""
+
+        # FIX-E: 使用 litellm 内置价格表计算成本，发送给 TUI
+        try:
+            cost_usd = litellm.completion_cost(completion_response=response)
+            if cost_usd and cost_usd > 0:
+                from evocli_soul.rpc import emit_event
+                usage = response.usage or {}
+                await emit_event("cost_update", {
+                    "model":           resolved,
+                    "input_tokens":    getattr(usage, "prompt_tokens", 0),
+                    "output_tokens":   getattr(usage, "completion_tokens", 0),
+                    "cost_usd":        cost_usd,
+                })
+        except Exception as e:
+            log.debug("Cost calculation failed (non-fatal): %s", e)
+
+        return text
+
+    async def stream(
+        self,
+        prompt: str,
+        *,
+        tier: str = "smart",
+        model: str | None = None,
+        system: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        task_context: dict | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Streaming completion. Yields text chunks."""
+        resolved = model if model else self._resolve_model(hint=tier, task_context=task_context)
+        # FIX-ORACLE-3: 流式也需要截断超长输入（与 complete() 保持一致）
+        prompt = self._maybe_chunk_input(prompt, resolved)
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        kwargs: dict = {
+            "model":       resolved,
+            "messages":    messages,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+            "stream":      True,
+        }
+
+        log.debug("stream: tier=%s tokens=%d", resolved, max_tokens)
+        try:
+            response = await self._router.acompletion(**kwargs)
+        except Exception as e:
+            # Surface the error as a readable chunk then stop iteration,
+            # rather than letting an unhandled exception crash the handler.
+            log.warning("stream: acompletion failed (%s)", e)
+            yield f"\n\n⚠️ Stream error: {type(e).__name__}: {e}"
+            return
+        try:
+            async for chunk in response:
+                text = ""
+                if chunk.choices:
+                    text = chunk.choices[0].delta.content or ""
+                if text:
+                    yield text
+        except Exception as e:
+            log.warning("stream: chunk iteration failed (%s)", e)
+            yield f"\n\n⚠️ Stream interrupted: {type(e).__name__}: {e}"
+
+    async def complete_messages(
+        self,
+        messages: list[dict],
+        *,
+        tier: str = "smart",
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        task_context: dict | None = None,
+    ) -> str:
+        """Completion with full message list (for agent use). Uses Router for retries/fallback."""
+        resolved = model if model else self._resolve_model(hint=tier, task_context=task_context)
+        response = await self._router.acompletion(
+            model=resolved, messages=messages,
+            max_tokens=max_tokens, temperature=temperature,
+        )
+        return response.choices[0].message.content or ""
+
+    async def stream_messages(
+        self,
+        messages: list[dict],
+        *,
+        tier: str = "smart",
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        task_context: dict | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Streaming completion with full message list. Uses Router for retries/fallback."""
+        resolved = model if model else self._resolve_model(hint=tier, task_context=task_context)
+        response = await self._router.acompletion(
+            model=resolved, messages=messages,
+            max_tokens=max_tokens, temperature=temperature, stream=True,
+        )
+        async for chunk in response:
+            text = chunk.choices[0].delta.content or "" if chunk.choices else ""
+            if text:
+                yield text
+
+    def _maybe_chunk_input(self, prompt: str, model: str) -> str:
+        """
+        检测超长输入，智能压缩到模型 context window 的安全范围内。
+        使用 model_context.py 的三级检测策略：
+          1. API /v1/models 端点（可能含 context_length）
+          2. litellm 内置数据库（max_input_tokens，覆盖主流模型）
+          3. 模型名关键词推断 + 保守兜底
+        按行边界截断，保留代码语法完整性。
+        """
+        from evocli_soul.model_context import get_input_context
+        estimated_tokens = max(1, len(prompt) // 4)
+        # 使用正确的 max_input_tokens（而非 max_tokens/max_output_tokens）
+        max_input = get_input_context(
+            model,
+            base_url=self._base_url,
+            api_key=self._config.get("api_key"),
+        )
+        safe_limit = int(max_input * 0.75)  # 留 25% 给 system prompt 和 output
+        if estimated_tokens <= safe_limit:
+            return prompt
+        target_chars = safe_limit * 4
+        log.warning(
+            "Input too long (~%d tokens > %d safe limit of %d), chunking by line boundary",
+            estimated_tokens, safe_limit, max_input
+        )
+        lines = prompt.splitlines(keepends=True)
+        result, total = [], 0
+        for line in lines:
+            if total + len(line) > target_chars:
+                break
+            result.append(line)
+            total += len(line)
+        omitted = len(lines) - len(result)
+        return (
+            "".join(result)
+            + f"\n\n...[输入过长，已截断 {omitted} 行。"
+            f"原始约 {estimated_tokens} tokens，"
+            f"模型 '{model}' 上限 {max_input:,} tokens。"
+            f"如需分析完整内容请分段提交。]"
+        )

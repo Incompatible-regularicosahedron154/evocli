@@ -1,0 +1,36 @@
+[package]
+name    = "code_intel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace     = true
+rusqlite.workspace   = true
+chrono.workspace     = true
+uuid.workspace       = true
+regex.workspace      = true    # kept as fallback for languages without tree-sitter grammar
+ignore.workspace     = true    # .gitignore-aware walker (replaces walkdir)
+notify.workspace     = true    # OS-native file events (ReadDirectoryChangesW / inotify / FSEvents)
+tracing.workspace    = true    # structured logging for file_watcher / lsp
+# tree-sitter: AST-based symbol extraction
+# Research: Aider replaced ctags with tree-sitter for "richer, more accurate" symbol data
+# tree-sitter is used by GitHub, Neovim, VS Code — industry standard for code parsing
+tree-sitter.workspace            = true
+tree-sitter-rust.workspace       = true
+tree-sitter-python.workspace     = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tokio.workspace      = true
+serde.workspace      = true
+serde_json.workspace = true
+# Optional: async-lsp provides a type-safe LSP client
+# replacing the 584-line hand-rolled JSON-RPC in lsp_client.rs.
+# Enable with: cargo build --features code_intel/use-async-lsp
+async-lsp = { version = "0.2", optional = true }
+
+[features]
+# Future: migrate lsp_client.rs to async-lsp for lower maintenance cost
+use-async-lsp = ["dep:async-lsp"]
+
+[dev-dependencies]
+tempfile = "3.10"   # FIX-1: 测试需要临时目录

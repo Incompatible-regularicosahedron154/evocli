@@ -1,0 +1,45 @@
+[skill]
+id          = "fix_compile_error"
+name        = "修复编译错误"
+version     = "1.0.0"
+status      = "trusted"
+description = "运行编译命令，捕获错误，分析原因并生成修复 diff"
+
+[skill.trigger]
+keywords = ["编译错误", "compile error", "build error", "cargo check failed", "修复错误"]
+
+[[skill.steps]]
+id     = "snapshot"
+action = "git.snapshot"
+params = {}
+
+[[skill.steps]]
+id     = "compile"
+action = "shell.run"
+params = { cmd = "cargo check", timeout_s = 60 }
+
+[[skill.steps]]
+id     = "analyze"
+action = "llm.analyze"
+params = { prompt_template = "fix_error", input = "${steps.compile.result.stderr}", output_format = "diff", tier = "smart" }
+
+[[skill.steps]]
+id                = "apply"
+action            = "fs.apply_diff"
+params            = { diff = "${steps.analyze.result}", dry_run = false }
+requires_approval = true
+
+[[skill.steps]]
+id     = "verify"
+action = "shell.run"
+params = { cmd = "cargo check", timeout_s = 60 }
+
+[[skill.steps]]
+id                = "commit"
+action            = "git.commit"
+params            = { message = "fix: resolve compile errors" }
+requires_approval = true
+
+[skill.on_failure]
+action = "git.restore"
+notify = "修复失败，已回滚。错误：${error}"

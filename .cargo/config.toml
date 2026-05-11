@@ -1,0 +1,16 @@
+# .cargo/config.toml — EvoCLI Cargo configuration
+# Enables `cargo install evocli` support
+
+[alias]
+# Install EvoCLI to ~/.cargo/bin
+install-evocli = ["install", "--path", "crates/host", "--bin", "evocli"]
+
+[build]
+# Optimize for release builds
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+# Optimize for size in distribution builds
+opt-level = "z"
+lto = "thin"
+strip = true

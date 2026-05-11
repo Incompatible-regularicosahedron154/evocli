@@ -1,0 +1,41 @@
+[skill]
+id          = "generate_tests"
+name        = "为函数生成单元测试"
+version     = "1.0.0"
+status      = "trusted"
+description = "为指定函数生成完整单元测试，覆盖正常路径、边界情况和错误路径"
+
+[skill.trigger]
+keywords = ["生成测试", "写测试", "add tests", "generate tests", "test coverage", "单元测试"]
+
+[[skill.steps]]
+id     = "find_target"
+action = "search.code"
+params = { query = "${input.target}", path = "." }
+
+[[skill.steps]]
+id     = "read_source"
+action = "fs.read"
+params = { path = "${steps.find_target.result[0].file}" }
+
+[[skill.steps]]
+id     = "generate"
+action = "llm.generate"
+params = { prompt = "为以下代码生成完整单元测试（正常/边界/错误路径）：\n\n${steps.read_source.result}", tier = "smart" }
+
+[[skill.steps]]
+id                = "write_test_file"
+action            = "fs.apply_diff"
+params            = { diff = "${steps.generate.result}", dry_run = false }
+requires_approval = true
+
+[[skill.steps]]
+id     = "run_tests"
+action = "shell.run"
+params = { cmd = "cargo test", timeout_s = 120 }
+
+[[skill.steps]]
+id                = "commit"
+action            = "git.commit"
+params            = { message = "test: add unit tests for ${input.target}" }
+requires_approval = true

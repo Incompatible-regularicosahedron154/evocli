@@ -1,0 +1,24 @@
+[skill]
+id          = "explain_code"
+name        = "解释代码"
+version     = "1.0.0"
+status      = "trusted"
+description = "读取指定文件，用中文详细解释其功能、设计思路和关键细节，并记录到记忆系统"
+
+[skill.trigger]
+keywords = ["解释", "explain", "分析代码", "这是什么", "怎么工作", "how does"]
+
+[[skill.steps]]
+id     = "read"
+action = "fs.read"
+params = { path = "${input.file}" }
+
+[[skill.steps]]
+id     = "explain"
+action = "llm.analyze"
+params = { prompt_template = "explain_code", input = "${steps.read.result}", output_format = "text", tier = "smart" }
+
+[[skill.steps]]
+id     = "memorize"
+action = "memory.write"
+params = { priority_scope = "project", memory_type = "insight", title = "代码解释: ${input.file}", body = "${steps.explain.result}", tags = ["explanation"] }

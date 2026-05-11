@@ -1,0 +1,19 @@
+[skill]
+id          = "review_pr_diff"
+name        = "审查代码变更"
+version     = "1.0.0"
+status      = "trusted"
+description = "审查当前 git diff，从安全性、正确性、性能、可维护性四个维度给出审查意见"
+
+[skill.trigger]
+keywords = ["审查", "review", "code review", "代码审查", "检查变更"]
+
+[[skill.steps]]
+id     = "get_diff"
+action = "git.diff"
+params = {}
+
+[[skill.steps]]
+id     = "review"
+action = "llm.analyze"
+params = { prompt_template = "review_diff", input = "${steps.get_diff.result}", output_format = "text", tier = "smart" }

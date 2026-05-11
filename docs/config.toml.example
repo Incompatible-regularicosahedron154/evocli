@@ -1,0 +1,135 @@
+# EvoCLI Configuration — Example & Reference
+# ============================================
+# 复制此文件到 ~/.evocli/config.toml 开始使用
+# 或运行 evocli init 交互式配置
+#
+# 优先级（高到低）：
+#   1. 环境变量（ANTHROPIC_API_KEY 等）
+#   2. 项目配置 <project>/.evocli/config.toml
+#   3. 全局配置 ~/.evocli/config.toml（本文件）
+#   4. 内置默认值
+#
+# 字段说明：运行 evocli config explain
+
+# ──────────────────────────────────────────────────────────────
+# [llm] — LLM 提供商与模型配置
+# ──────────────────────────────────────────────────────────────
+[llm]
+
+# LLM 提供商（影响 API 端点和认证方式）
+# 选项：anthropic | openai | deepseek | ollama
+provider = "anthropic"
+
+# API Key（可选，推荐用 evocli init 写入系统密钥链）
+# 也可以通过环境变量设置：
+#   Anthropic: export ANTHROPIC_API_KEY="sk-ant-..."
+#   OpenAI:    export OPENAI_API_KEY="sk-..."
+#   DeepSeek:  export DEEPSEEK_API_KEY="..."
+# api_key = "sk-ant-..."
+
+# Ollama 本地服务 URL（仅 Ollama 提供商需要）
+# base_url = "http://localhost:11434"
+
+[llm.tiers]
+# ── 快速层（Tier 2）：用于搜索、简短生成、代码分析 ──
+# 优先选择小而快的模型，降低延迟和成本
+#
+# Anthropic 选项：claude-3-5-haiku-latest（推荐）
+# OpenAI 选项：  gpt-4o-mini
+# DeepSeek 选项：deepseek-chat
+# Ollama 选项：  qwen2.5-coder:7b
+fast = "claude-3-5-haiku-latest"
+
+# ── 智能层（Tier 3）：用于复杂推理、重构、架构决策 ──
+# 优先选择能力强的模型，质量优先于速度
+#
+# Anthropic 选项：claude-sonnet-4-5-20250514（推荐）
+# OpenAI 选项：  gpt-4o
+# DeepSeek 选项：deepseek-reasoner
+# Ollama 选项：  qwen2.5-coder:32b
+smart = "claude-sonnet-4-5-20250514"
+
+# ──────────────────────────────────────────────────────────────
+# [context] — Token 预算管理
+# ──────────────────────────────────────────────────────────────
+[context]
+
+# 每次请求的总 token 预算
+# 分配方式：P1 记忆(4000) + P2 工具(2000) + P3 全局(1500)
+#           + 代码(16000) + diff(3000) + 历史(1500) + 系统(3000)
+# 建议：普通使用 32000，长上下文任务 128000
+max_total = 128000
+
+# 代码上下文的最大 token 数
+# 当前文件 + PageRank 相关符号共用此预算
+max_code = 32000
+
+# ──────────────────────────────────────────────────────────────
+# [safety] — 安全与权限控制
+# ──────────────────────────────────────────────────────────────
+[safety]
+
+# AI 写入文件是否需要用户确认
+# false（推荐）：AI 每次写文件前请求确认
+# true（自动化环境）：AI 可自主修改文件，无需确认
+auto_approve_writes = false
+
+# Shell 命令白名单
+# AI 只能执行以这些前缀开头的命令
+# 格式：前缀 + 通配符 * 匹配任意参数
+#       例："cargo *" 允许所有 cargo 子命令
+shell_whitelist = [
+    # Rust 工具链
+    "cargo *",
+    "rustc *",
+    "rustup *",
+    "rustfmt *",
+
+    # Node.js 生态
+    "npm *",
+    "npx *",
+    "node *",
+    "pnpm *",
+    "bun *",
+
+    # Python 生态
+    "python *",
+    "python3 *",
+    "pip *",
+    "uv *",
+    "pytest *",
+    "ruff *",
+
+    # Go
+    "go *",
+
+    # 构建工具
+    "make *",
+    "cmake *",
+
+    # 版本控制
+    "git *",
+
+    # 文件操作（只读）
+    "cat *",
+    "ls *",
+    "find *",
+    "grep *",
+    "rg *",
+
+    # 项目自定义（取消注释并按需修改）
+    # "docker *",
+    # "kubectl *",
+    # "./scripts/*",
+    # "make *",
+]
+
+# ──────────────────────────────────────────────────────────────
+# [memory] — 记忆系统参数
+# ──────────────────────────────────────────────────────────────
+[memory]
+
+# 保留的最大 episodic 记忆条数
+# 超过此数量时，较老的记忆会被自动裁剪
+# 大型长期项目建议设置更高值（如 5000）
+max_episodes = 1000

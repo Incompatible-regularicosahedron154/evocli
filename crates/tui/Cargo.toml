@@ -1,0 +1,20 @@
+[package]
+name    = "evocli-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ratatui.workspace     = true
+crossterm.workspace   = true
+tokio.workspace       = true
+anyhow.workspace      = true
+tracing.workspace     = true
+serde_json.workspace  = true
+
+# Soul Bridge (streaming AI responses)
+soul_bridge.workspace = true
+
+# Multi-line input widget
+tui-textarea = "0.7"
+# Home directory resolution (for debug log path)
+dirs.workspace = true

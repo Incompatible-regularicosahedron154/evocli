@@ -1,0 +1,65 @@
+[project]
+name        = "evocli-soul"
+version     = "0.1.0"
+description = "EvoCLI Python Soul — AI coding runtime"
+requires-python = ">=3.10"
+
+# ── 全量依赖（所有功能，无可选项）──────────────────────────────────────────────
+# 策略：只写下限版本，不写上限——由 preflight.py 的功能测试兜底兼容性检查。
+# 安装命令：uv pip install -e "."  （或 pip install -e "."）
+dependencies = [
+    # ── LLM 调用 ────────────────────────────────────────────────────────────
+    "litellm>=1.83",
+    "tiktoken>=0.7",
+    "pydantic-ai>=0.0.46",
+    "instructor>=1.15",
+    "jinja2>=3.1",
+    "anyio>=4.6",
+    "httpx>=0.27",
+
+    # ── 向量记忆（LanceDB + fastembed 本地嵌入）─────────────────────────────
+    "lancedb>=0.5",
+    "fastembed>=0.4",
+    "numpy>=1.26",
+    "onnxruntime>=1.19",
+    "scipy>=1.11",              # networkx pagerank sparse matrix 加速
+
+    # ── 代码智能（tree-sitter + grep-ast + PageRank）─────────────────────────
+    "jedi>=0.19",
+    "grep-ast>=0.8",
+    "tree-sitter-language-pack>=0.0.1",
+    "networkx>=3.0",
+    "diskcache>=5.6",
+    "pathspec>=0.12",
+    "gitpython>=3.1",
+    "whatthepatch>=1.0",
+    "watchfiles>=0.21",
+
+    # ── Skill + Evolution + Workflow ─────────────────────────────────────────
+    "smolagents>=1.15",
+    "prefixspan>=0.4",
+    "rocketry>=0.9",
+    "langgraph>=0.3",
+    "langgraph-checkpoint-sqlite>=2.0",
+
+    # ── Context 优化 ──────────────────────────────────────────────────────────
+    "tokenizers>=0.20",
+    "tokenpruner>=1.0",
+
+    # ── 网页抓取 ──────────────────────────────────────────────────────────────
+    "readability-lxml>=0.9",
+    "html2text>=2024.2",
+]
+
+[build-system]
+requires      = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["evocli_soul"]
+
+[project.scripts]
+evocli-soul = "evocli_soul.main:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

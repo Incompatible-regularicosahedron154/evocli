@@ -1,0 +1,83 @@
+# ── Rust build artifacts ──────────────────────────────────────────
+/target/
+**/*.pdb
+
+# ── Compiled distributions (publish via GitHub Releases) ─────────
+/dist/
+
+# ── EvoCLI runtime data — any depth (never commit) ────────────────
+**/.evocli/
+*.fast
+*.fieldnorm
+*.idx
+*.pos
+*.store
+*.term
+.tantivy-meta.lock
+.tantivy-writer.lock
+
+# ── Backup / temp files ────────────────────────────────────────────
+*.bak
+*.orig
+*.tmp
+
+# ── Debug / trace output files ────────────────────────────────────
+tracer_*.txt
+
+# ── SQLite databases ───────────────────────────────────────────────
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ── Python cache ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+build/
+.eggs/
+
+# ── IDE / editor ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Secrets — never commit API keys ───────────────────────────────
+*.env
+.env*
+secrets.toml
+
+# ── Large binary assets ────────────────────────────────────────────
+*.exe
+*.bin
+*.so
+*.dylib
+*.dll
+
+# ── AI tool context / plugin files (not needed for development) ───
+# These are specific to individual AI coding assistants and contain
+# session context, plugin configs, or internal progress tracking.
+# Reference: docs/config.toml.example for actual configuration.
+STATUS.md
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+**/AGENTS.md
+opencode.json
+package.json
+plugin.json
+.claude-plugin/
+.codex-plugin/
+.cursor-plugin/
+docs/GAP_ANALYSIS.md
+

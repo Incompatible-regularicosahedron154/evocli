@@ -1,0 +1,45 @@
+[skill]
+id          = "fix_rust_unwrap"
+name        = "修复 Rust unwrap() 风险"
+version     = "1.0.0"
+status      = "trusted"
+description = "扫描 .unwrap() 调用，生成将高风险 unwrap 替换为 ? 运算符的 diff"
+
+[skill.trigger]
+keywords = ["unwrap", "修复 unwrap", "fix unwrap", "panic", "错误处理"]
+
+[[skill.steps]]
+id     = "snapshot"
+action = "git.snapshot"
+params = {}
+
+[[skill.steps]]
+id     = "scan"
+action = "search.code"
+params = { query = ".unwrap()", path = "." }
+
+[[skill.steps]]
+id     = "analyze"
+action = "llm.analyze"
+params = { prompt_template = "analyze_unwrap_usage", input = "${steps.scan.result}", output_format = "diff", tier = "smart" }
+
+[[skill.steps]]
+id                = "apply"
+action            = "fs.apply_diff"
+params            = { diff = "${steps.analyze.result}", dry_run = false }
+requires_approval = true
+
+[[skill.steps]]
+id     = "test"
+action = "shell.run"
+params = { cmd = "cargo check", timeout_s = 60 }
+
+[[skill.steps]]
+id                = "commit"
+action            = "git.commit"
+params            = { message = "refactor: replace high-risk .unwrap() with proper error handling" }
+requires_approval = true
+
+[skill.on_failure]
+action = "git.restore"
+notify = "修复失败，已回滚。错误：${error}"

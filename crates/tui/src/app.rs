@@ -1,0 +1,507 @@
+//! TUI Application state machine
+//!
+//! Performance architecture:
+//!   - `line_cache`: Pre-rendered `Vec<Line<'static>>` for all messages.
+//!     Built ONCE when dirty, used on every frame. Virtual scrolling slices this vec.
+//!   - `cache_dirty`: Set true when messages change. Cleared after rebuild.
+//!   - `stream_skip_frames`: Throttle redraws during streaming (every 3rd token).
+
+use ratatui::text::Line;
+
+/// Current application state
+#[derive(Debug, Clone)]
+pub enum AppState {
+    Idle,
+    Thinking,
+    Streaming { tokens_received: usize },
+    SkillRunning {
+        skill_id:     String,
+        skill_name:   String,
+        current_step: usize,
+        total_steps:  usize,
+        step_name:    String,
+        step_status:  StepStatus,
+    },
+    CallingTool { tool: String, display: String },
+    WaitingApproval { message: String },
+    /// Interactive choice prompt — AI presents N options, user picks one
+    /// or enters custom text (when allow_custom = true).
+    WaitingChoice {
+        title:        String,
+        options:      Vec<ChoiceItem>,
+        selected_idx: usize,
+        allow_custom: bool,
+        custom_input: String,
+        custom_mode:  bool,   // true = user typing custom answer
+    },
+    Error(String),
+}
+
+/// A single option in a WaitingChoice prompt.
+#[derive(Debug, Clone)]
+pub struct ChoiceItem {
+    pub id:    String,
+    pub label: String,
+}
+
+/// P1-5: 单步执行状态
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepStatus {
+    Running,
+    WaitingApproval,
+    Done,
+    Failed(String),
+}
+
+/// A single chat message
+#[derive(Debug, Clone)]
+pub enum ChatMessage {
+    User(String),
+    Assistant {
+        content: String,
+        model:   String,
+        tokens:  usize,
+    },
+    System(String),
+    /// P1-5: Skill 执行结果摘要
+    SkillResult {
+        skill_id: String,
+        ok:       bool,
+        steps:    usize,
+        summary:  String,
+    },
+    /// P3-1: 调用链面板
+    CallChain {
+        symbol:   String,
+        file:     String,
+        line:     u32,
+        incoming: Vec<String>,
+        outgoing: Vec<String>,
+    },
+    /// FIX-B: 工具调用通知（内联显示在对话中）
+    ToolCall {
+        tool:    String,
+        display: String,
+        ok:      Option<bool>,   // None=进行中, Some(true)=成功, Some(false)=失败
+    },
+}
+
+/// Main application state
+pub struct App {
+    pub messages:       Vec<ChatMessage>,
+    pub state:          AppState,
+    pub tokens_used:    usize,
+    pub tokens_input:   usize,
+    pub tokens_output:  usize,
+    pub session_cost_usd: f64,
+    pub model_name:     String,
+    pub project_dir:    String,
+    /// Scroll offset in lines. 0=top (oldest), usize::MAX=bottom (clamped in ui.rs).
+    /// Using usize (not u16) to support >65535 total cached lines without overflow.
+    pub scroll:         usize,
+    pub should_quit:    bool,
+    pub cursor_visible: bool,
+    /// Spinner frame counter — incremented each blink tick for smooth animation.
+    /// Used by status bar to render animated spinner: ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏
+    pub spinner_tick:   u8,
+    /// 命令联想：当输入 / 开头时激活
+    pub suggestions:    Vec<(&'static str, &'static str)>,
+    pub suggestion_idx: usize,
+    pub show_suggestions: bool,
+
+    // ── 性能优化：渲染缓存 ──────────────────────────────────────
+    /// Pre-computed lines for all messages. Rebuilt only when dirty.
+    pub line_cache:   Option<(u16, Vec<Line<'static>>)>,
+    /// True when messages changed and cache must be rebuilt before next render.
+    pub cache_dirty:  bool,
+    /// Streaming throttle: skip redraws for N frames to reduce CPU during fast token emission.
+    pub stream_skip_frames: u8,
+
+    // ── Debug overlay (F12) ──────────────────────────────────────
+    pub show_debug:       bool,
+    pub debug_log_lines:  Vec<String>,
+    pub debug_log_path:   String,
+
+    // ── Message queue ────────────────────────────────────────────
+    pub message_queue: std::collections::VecDeque<String>,
+
+    // ── Request timer ────────────────────────────────────────────
+    pub request_start: Option<std::time::Instant>,
+
+    // ── Context window capacity ───────────────────────────────────
+    pub max_context_tokens: usize,
+
+    // ── Toast notification ────────────────────────────────────────
+    /// Transient 1-line notification shown between chat and input areas.
+    /// Auto-expires after NOTIF_TTL_SECS; does NOT go into chat history.
+    pub notification: Option<Notification>,
+}
+
+/// Notification urgency level — controls icon and colour.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NotifLevel { Info, Warn, Error }
+
+/// A transient notification shown in the 1-line notification bar.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub message: String,
+    pub level:   NotifLevel,
+    pub born:    std::time::Instant,
+}
+
+/// How long (seconds) a notification stays visible before auto-dismissing.
+pub const NOTIF_TTL_SECS: u64 = 6;
+
+/// During streaming, redraw every N tokens instead of every single token.
+pub const STREAM_REDRAW_EVERY: u8 = 3;
+
+/// 所有支持的 / 命令
+pub const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/chain <symbol>", "Show call chain for a code symbol"),
+    ("/help",           "Show all available commands"),
+    ("/skills",         "List available skills"),
+    ("/skill <name>",   "Run a skill by name"),
+    ("/cost",           "Show session cost and token usage"),
+    ("/index",          "Re-index current project"),
+    ("/memory <query>", "Search project memory"),
+    ("/clear",          "Clear chat history"),
+    ("/log [N]",        "Show last N lines from the log file (default 30)"),
+];
+
+impl App {
+    pub fn new(model_name: String, max_context_tokens: usize) -> Self {
+        // Store the full path with ~ substitution for home directory.
+        // The title bar will truncate dynamically based on available space.
+        let project_dir = std::env::current_dir()
+            .ok()
+            .map(|p| {
+                // Replace home dir prefix with ~ (standard Unix convention)
+                if let Some(home) = dirs::home_dir() {
+                    if let Ok(rel) = p.strip_prefix(&home) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        return if rel_str.is_empty() {
+                            "~".to_string()
+                        } else {
+                            format!("~/{}", rel_str)
+                        };
+                    }
+                }
+                // Fallback: normalize separators
+                p.to_string_lossy().replace('\\', "/")
+            })
+            .unwrap_or_else(|| ".".to_string());
+
+        Self {
+            messages: vec![ChatMessage::System(
+                "Welcome to EvoCLI! Type a message and press Enter to send.  Type / for commands.".into(),
+            )],
+            state:            AppState::Idle,
+            tokens_used:      0,
+            tokens_input:     0,
+            tokens_output:    0,
+            session_cost_usd: 0.0,
+            model_name,
+            project_dir,
+            scroll:           0,
+            should_quit:      false,
+            cursor_visible:   true,
+            spinner_tick:     0,
+            suggestions:      vec![],
+            suggestion_idx:   0,
+            show_suggestions: false,
+            line_cache:       None,
+            cache_dirty:      true,
+            stream_skip_frames: 0,
+            show_debug:       false,
+            debug_log_lines:  vec![],
+            debug_log_path: dirs::home_dir()
+                .unwrap_or_default()
+                .join(".evocli").join("logs").join("evocli.log")
+                .to_string_lossy().to_string(),
+            message_queue: std::collections::VecDeque::new(),
+            request_start: None,
+            max_context_tokens,
+            notification: None,
+        }
+    }
+
+    pub fn update_suggestions(&mut self, input: &str) {
+        if !input.starts_with('/') {
+            self.show_suggestions = false;
+            self.suggestions.clear();
+            return;
+        }
+        let input_lower = input.to_lowercase();
+        self.suggestions = SLASH_COMMANDS.iter()
+            .filter(|(cmd, _)| cmd.to_lowercase().starts_with(&input_lower))
+            .copied()
+            .collect();
+        self.show_suggestions = !self.suggestions.is_empty();
+        if self.suggestion_idx >= self.suggestions.len() {
+            self.suggestion_idx = 0;
+        }
+    }
+
+    pub fn suggestion_next(&mut self) {
+        if !self.suggestions.is_empty() {
+            self.suggestion_idx = (self.suggestion_idx + 1) % self.suggestions.len();
+        }
+    }
+
+    pub fn suggestion_prev(&mut self) {
+        if !self.suggestions.is_empty() {
+            self.suggestion_idx = self.suggestion_idx
+                .checked_sub(1)
+                .unwrap_or(self.suggestions.len() - 1);
+        }
+    }
+
+    pub fn accept_suggestion(&mut self) -> Option<String> {
+        if self.show_suggestions && !self.suggestions.is_empty() {
+            let cmd = self.suggestions[self.suggestion_idx].0;
+            let cmd_name = cmd.split_whitespace().next().unwrap_or(cmd);
+            let text = if cmd.contains('<') {
+                format!("{} ", cmd_name)
+            } else {
+                cmd_name.to_string()
+            };
+            self.show_suggestions = false;
+            self.suggestions.clear();
+            Some(text)
+        } else {
+            None
+        }
+    }
+
+    pub fn dismiss_suggestions(&mut self) {
+        self.show_suggestions = false;
+    }
+
+    pub fn start_streaming(&mut self) {
+        self.state = AppState::Streaming { tokens_received: 0 };
+        self.messages.push(ChatMessage::Assistant {
+            content: String::new(),
+            model:   self.model_name.clone(),
+            tokens:  0,
+        });
+        self.scroll = usize::MAX;  // auto-scroll to bottom (clamped in ui.rs)
+        self.cache_dirty = true;
+        self.stream_skip_frames = 0;
+    }
+
+    pub fn append_token(&mut self, text: &str) {
+        // Search from the end for the last Assistant message.
+        // We cannot use messages.last_mut() because soul_status / event messages
+        // may be pushed AFTER start_streaming() creates the Assistant placeholder,
+        // which would make last_mut() return a System message instead.
+        if let Some(ChatMessage::Assistant { content, .. }) = self.messages
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m, ChatMessage::Assistant { .. }))
+        {
+            content.push_str(text);
+        }
+        if let AppState::Streaming { tokens_received } = &mut self.state {
+            *tokens_received += 1;
+        }
+        // Throttle: increment counter, mark dirty
+        self.stream_skip_frames = self.stream_skip_frames.wrapping_add(1);
+        self.cache_dirty = true;
+    }
+
+    /// Returns true if this token should trigger a redraw (streaming throttle).
+    pub fn should_redraw_streaming(&self) -> bool {
+        self.stream_skip_frames % STREAM_REDRAW_EVERY == 0
+    }
+
+    pub fn finish_streaming(&mut self, tokens: usize) {
+        // Same rev().find() pattern as append_token: locate the last Assistant
+        // message even if soul_status / event System messages were pushed after it.
+        let content_empty = {
+            if let Some(ChatMessage::Assistant { tokens: t, content, .. }) = self.messages
+                .iter_mut()
+                .rev()
+                .find(|m| matches!(m, ChatMessage::Assistant { .. }))
+            {
+                *t = tokens;
+                content.trim().is_empty()
+            } else {
+                false
+            }
+        };
+
+        // If we streamed tokens but the assistant content is empty, something
+        // went wrong silently (e.g. chunks routed to wrong slot).  Make it visible.
+        if content_empty && tokens > 0 {
+            self.messages.push(ChatMessage::System(
+                "⚠️  Response received but content was empty — this is a bug. \
+                 Press F12 to view logs, or try again."
+                    .into(),
+            ));
+        }
+
+        self.tokens_used   += tokens;
+        self.tokens_output += tokens;
+        self.state = AppState::Idle;
+        self.stream_skip_frames = 0;
+        self.cache_dirty = true;
+        self.request_start = None;  // clear timer
+
+        const MAX_MESSAGES: usize = 500;
+        if self.messages.len() > MAX_MESSAGES {
+            let excess = self.messages.len() - MAX_MESSAGES;
+            let mut removed = 0usize;
+            self.messages.retain(|m| {
+                if removed >= excess { return true; }
+                if matches!(m, ChatMessage::User(_) | ChatMessage::Assistant { .. }) {
+                    removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    // ── Skill management ─────────────────────────────────────────
+
+    pub fn start_skill(&mut self, skill_id: &str, skill_name: &str, total_steps: usize) {
+        self.state = AppState::SkillRunning {
+            skill_id:     skill_id.to_string(),
+            skill_name:   skill_name.to_string(),
+            current_step: 0,
+            total_steps,
+            step_name:    "initializing".to_string(),
+            step_status:  StepStatus::Running,
+        };
+    }
+
+    pub fn update_skill_step(&mut self, step_idx: usize, step_name: &str, status: StepStatus) {
+        if let AppState::SkillRunning {
+            current_step, step_name: sn, step_status, ..
+        } = &mut self.state {
+            *current_step = step_idx;
+            *sn = step_name.to_string();
+            *step_status = status;
+        }
+    }
+
+    pub fn finish_skill(&mut self, skill_id: &str, ok: bool, steps_done: usize, summary: &str) {
+        self.messages.push(ChatMessage::SkillResult {
+            skill_id: skill_id.to_string(),
+            ok,
+            steps: steps_done,
+            summary: summary.to_string(),
+        });
+        self.state = AppState::Idle;
+        self.cache_dirty = true;
+    }
+
+    // ── Scroll helpers ───────────────────────────────────────────
+
+    /// PgUp — show older messages (scroll toward top).
+    pub fn scroll_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(3);
+    }
+
+    /// PgDn — show newer messages (scroll toward bottom).
+    pub fn scroll_down(&mut self) {
+        self.scroll = self.scroll.saturating_add(3);
+    }
+
+    /// Alt+Up — fast scroll up (5 lines).
+    pub fn scroll_fast_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(5);
+    }
+
+    /// Alt+Down — fast scroll down (5 lines).
+    pub fn scroll_fast_down(&mut self) {
+        self.scroll = self.scroll.saturating_add(5);
+    }
+
+    /// Ctrl+Home / Home — scroll to top (oldest messages).
+    pub fn scroll_to_top(&mut self) {
+        self.scroll = 0;
+    }
+
+    /// Ctrl+End / End — scroll to bottom (newest messages).
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll = usize::MAX;  // clamped to max_scroll in draw_chat_area
+    }
+
+    /// Invalidate the render cache. Call after any message mutation.
+    pub fn invalidate_cache(&mut self) {
+        self.cache_dirty = true;
+    }
+
+    /// Read the last `n` lines from the log file into `debug_log_lines`.
+    /// Called when the user presses F12 to refresh the debug overlay.
+    /// Reads at most 64 KB from the end of the file to avoid blocking.
+    pub fn refresh_debug_log(&mut self, n: usize) {
+        use std::io::{Read, Seek, SeekFrom};
+        const MAX_READ: u64 = 65_536;
+        let path = std::path::Path::new(&self.debug_log_path);
+        self.debug_log_lines = match std::fs::File::open(path) {
+            Ok(mut f) => {
+                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                let offset = size.saturating_sub(MAX_READ);
+                if offset > 0 { let _ = f.seek(SeekFrom::Start(offset)); }
+                let mut buf = Vec::new();
+                let _ = f.read_to_end(&mut buf);
+                let text = String::from_utf8_lossy(&buf);
+                text.lines()
+                    .rev().take(n).collect::<Vec<_>>()
+                    .into_iter().rev()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+            Err(e) => vec![format!("(cannot read log file: {})", e)],
+        };
+    }
+
+    pub fn status_text(&self) -> String {
+        match &self.state {
+            AppState::Idle                    => "Idle".into(),
+            AppState::Thinking                => "Thinking...".into(),
+            AppState::Streaming { tokens_received } =>
+                format!("Streaming... ({tokens_received} tokens)"),
+            AppState::CallingTool { display, .. } =>
+                format!("⚙ {display}"),
+            AppState::WaitingApproval { .. }  => "🔐 Waiting for approval (y/n)...".into(),
+            AppState::WaitingChoice { .. }    => "⌨ Waiting for your choice...".into(),
+            AppState::SkillRunning { skill_name, current_step, total_steps, .. } =>
+                format!("Skill: {skill_name}  step {}/{total_steps}", current_step + 1),
+            AppState::Error(msg)              => format!("Error: {msg}"),
+        }
+    }
+
+    pub fn is_skill_running(&self) -> bool {
+        matches!(self.state, AppState::SkillRunning { .. })
+    }
+
+    pub fn queued_count(&self) -> usize {
+        self.message_queue.len()
+    }
+
+    // ── Notification helpers ─────────────────────────────────────────
+
+    /// Show a transient notification in the 1-line notification bar.
+    /// Truncates to 120 chars so it always fits on one line.
+    pub fn notify(&mut self, message: String, level: NotifLevel) {
+        let msg: String = message.chars().take(120).collect();
+        self.notification = Some(Notification {
+            message: msg,
+            level,
+            born: std::time::Instant::now(),
+        });
+    }
+
+    /// Called on each blink tick — clears expired notifications.
+    pub fn tick_notification(&mut self) {
+        if let Some(ref n) = self.notification {
+            if n.born.elapsed().as_secs() >= NOTIF_TTL_SECS {
+                self.notification = None;
+            }
+        }
+    }
+}

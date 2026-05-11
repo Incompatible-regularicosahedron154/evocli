@@ -1,0 +1,103 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/host",
+    "crates/soul_bridge",
+    "crates/protocol",
+    "crates/tui",
+
+    "crates/tools",
+    "crates/contracts",
+    "crates/code_intel",
+    "crates/knowledge_graph",   # GitNexus-inspired: BM25 + community detection + blast radius
+    "crates/mem_router",        # Self-training MemRouter: LLM labels → CPU fastembed+linfa classifier
+    "crates/mcp",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+authors      = ["EvoCLI Contributors"]
+license      = "MIT OR Apache-2.0"
+rust-version = "1.82"
+
+# ── 统一依赖版本 ────────────────────────────────────────────────
+[workspace.dependencies]
+
+# 异步运行时
+tokio        = { version = "1.41",  features = ["full"] }
+tokio-util   = { version = "0.7",   features = ["codec"] }
+
+# 序列化
+serde        = { version = "1.0",   features = ["derive"] }
+serde_json   = { version = "1.0" }
+toml         = { version = "0.8" }
+
+# 错误处理
+anyhow       = { version = "1.0" }
+thiserror    = { version = "2.0" }
+
+# 日志
+tracing            = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# TUI
+ratatui    = { version = "0.29" }
+crossterm  = { version = "0.28", features = ["event-stream"] }
+
+# 数据库 / 存储
+rusqlite   = { version = "0.32", features = ["bundled"] }
+
+# 密码学 / 哈希
+sha1       = { version = "0.10" }
+
+# CLI / 交互
+clap       = { version = "4.5", features = ["derive"] }
+dialoguer  = { version = "0.11" }
+
+# 密钥管理
+keyring    = { version = "3.6", features = ["windows-native"] }
+
+# 工具
+uuid    = { version = "1.11", features = ["v4", "serde"] }
+chrono  = { version = "0.4",  features = ["serde"] }
+dirs    = { version = "5.0" }
+regex   = { version = "1" }
+walkdir = { version = "2" }
+# ignore: .gitignore-aware directory walker (ripgrep 同款)
+ignore  = { version = "0.4" }
+# notify: OS-native file system events (replaces 500ms polling in file_watcher.rs)
+# Windows: ReadDirectoryChangesW, Linux: inotify, macOS: FSEvents
+notify  = { version = "6.1", features = ["macos_fsevent"] }
+# tree-sitter: AST-based code parsing (GitHub/Neovim/VS Code/Aider 同款)
+tree-sitter            = { version = "0.23" }
+tree-sitter-rust       = { version = "0.23" }
+tree-sitter-python     = { version = "0.23" }
+tree-sitter-javascript = { version = "0.23" }
+tree-sitter-typescript = { version = "0.23" }
+# ── GitNexus-inspired additions ────────────────────────────────────────
+# tantivy: 嵌入式 BM25 全文搜索引擎（同 GitNexus hybrid search 的 BM25 部分）
+# 无需服务器，与 SQLite 同级嵌入，代码搜索精确度大幅提升
+tantivy  = { version = "0.22", default-features = false, features = ["mmap"] }
+# petgraph: 图算法库（社区检测 Louvain + 爆炸半径 BFS/DFS）
+petgraph = { version = "0.6" }
+# ndarray: 数值数组/线性代数（mem_router 逻辑回归训练）
+# Version pinned to "0.15" to match trainer.rs API. fastembed 5 internally uses
+# ndarray 0.16+, which Cargo resolves as a separate copy (semver-incompatible).
+# To eliminate the duplicate: upgrade to "0.16" after verifying trainer.rs API compat.
+ndarray  = { version = "0.15" }
+# diffy: 纯 Rust unified diff 生成与应用（替代手写 O(n³) simple_diff）
+diffy    = { version = "0.3" }
+
+# crate 间依赖
+soul_bridge     = { path = "crates/soul_bridge" }
+protocol        = { path = "crates/protocol" }
+
+tools           = { path = "crates/tools" }
+contracts       = { path = "crates/contracts" }
+code_intel      = { path = "crates/code_intel" }
+knowledge_graph = { path = "crates/knowledge_graph" }
+mem_router      = { path = "crates/mem_router" }
+evocli-tui      = { path = "crates/tui" }
+mcp             = { path = "crates/mcp" }
+
