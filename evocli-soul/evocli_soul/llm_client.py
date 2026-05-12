@@ -240,20 +240,27 @@ class LLMClient:
                 raise
         text = response.choices[0].message.content or ""
 
-        # FIX-E: 使用 litellm 内置价格表计算成本，发送给 TUI
+        # Always emit cost_update with token counts even if cost is 0.
+        # Previously: only emitted when cost_usd > 0, which silently dropped
+        # token stats for providers without pricing data (custom endpoints, etc.).
         try:
-            cost_usd = litellm.completion_cost(completion_response=response)
-            if cost_usd and cost_usd > 0:
-                from evocli_soul.rpc import emit_event
-                usage = response.usage or {}
+            from evocli_soul.rpc import emit_event
+            usage = getattr(response, 'usage', None) or {}
+            in_tok  = int(getattr(usage, "prompt_tokens",     0))
+            out_tok = int(getattr(usage, "completion_tokens", 0))
+            if in_tok > 0 or out_tok > 0:
+                try:
+                    cost_usd = litellm.completion_cost(completion_response=response)
+                except Exception:
+                    cost_usd = 0.0
                 await emit_event("cost_update", {
-                    "model":           resolved,
-                    "input_tokens":    getattr(usage, "prompt_tokens", 0),
-                    "output_tokens":   getattr(usage, "completion_tokens", 0),
-                    "cost_usd":        cost_usd,
+                    "model":         resolved,
+                    "input_tokens":  in_tok,
+                    "output_tokens": out_tok,
+                    "cost_usd":      cost_usd or 0.0,
                 })
         except Exception as e:
-            log.debug("Cost calculation failed (non-fatal): %s", e)
+            log.debug("Cost tracking failed (non-fatal): %s", e)
 
         return text
 

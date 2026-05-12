@@ -577,9 +577,20 @@ fn handle_soul_event(app: &mut App, event: serde_json::Value) {
             app.tokens_input     += in_tok;
             app.tokens_output    += out_tok;
             // Update the progress bar value: total = input + output
-            // Previously tokens_used was only updated from streaming (output only),
-            // missing the full input token count. Now cost_update keeps it accurate.
             app.tokens_used = app.tokens_input + app.tokens_output;
+
+            // Update the LAST assistant message's token display with real output count.
+            // Previously: it showed tokens_received (streaming chunk count, not token count).
+            // Now: it shows the real output token count from litellm usage data.
+            if out_tok > 0 {
+                for msg in app.messages.iter_mut().rev() {
+                    if let ChatMessage::Assistant { tokens, .. } = msg {
+                        *tokens = out_tok;
+                        app.cache_dirty = true;
+                        break;
+                    }
+                }
+            }
         }
         "tool_call_start" => {
             let tool    = event["tool"].as_str().unwrap_or("").to_string();

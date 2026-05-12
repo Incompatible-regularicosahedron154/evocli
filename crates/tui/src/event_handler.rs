@@ -1,7 +1,6 @@
 //! Keyboard event handling
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::widgets::{Block, Borders};
 use tui_textarea::TextArea;
 
 use crate::app::{App, AppState, ChatMessage};

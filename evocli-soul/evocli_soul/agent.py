@@ -1644,6 +1644,26 @@ class EvoCLIAgent:
             msg = response.choices[0].message
             conversation.append({"role": "assistant", "content": msg.content or "", "tool_calls": msg.tool_calls or None})
 
+            # Emit cost_update for every LLM call in the tool loop
+            try:
+                from evocli_soul.rpc import emit_event as _ev
+                import litellm as _ll
+                usage = getattr(response, 'usage', None) or {}
+                in_tok  = int(getattr(usage, "prompt_tokens",     0))
+                out_tok = int(getattr(usage, "completion_tokens", 0))
+                if in_tok > 0 or out_tok > 0:
+                    try:
+                        cost_usd = _ll.completion_cost(completion_response=response)
+                    except Exception:
+                        cost_usd = 0.0
+                    await _ev("cost_update", {
+                        "input_tokens":  in_tok,
+                        "output_tokens": out_tok,
+                        "cost_usd":      cost_usd or 0.0,
+                    })
+            except Exception:
+                pass  # non-fatal
+
             if not msg.tool_calls:
                 return msg.content or ""
 
@@ -1803,6 +1823,36 @@ class EvoCLIAgent:
             text = (chunk.choices[0].delta.content or "") if chunk.choices else ""
             if text:
                 yield text
+
+        # After streaming completes, emit cost_update with real token counts.
+        # litellm includes usage in the last streaming chunk when stream_options
+        # {"include_usage": True} is passed, but as a fallback we also check
+        # response.usage which some providers populate after the stream ends.
+        try:
+            from evocli_soul.rpc import emit_event as _emit_cost
+            # Collect usage from the response object (available after iteration)
+            usage = getattr(response, 'usage', None)
+            # Also try last_chunk accumulator that some litellm versions provide
+            if usage is None:
+                try:
+                    usage = response._hidden_params.get("response_cost_dict", {})
+                except Exception:
+                    pass
+            in_tok  = int(getattr(usage, "prompt_tokens",     0) if hasattr(usage, "prompt_tokens")     else 0)
+            out_tok = int(getattr(usage, "completion_tokens", 0) if hasattr(usage, "completion_tokens") else 0)
+            if in_tok > 0 or out_tok > 0:
+                try:
+                    cost_usd = litellm.completion_cost(completion_response=response)
+                except Exception:
+                    cost_usd = 0.0
+                await _emit_cost("cost_update", {
+                    "input_tokens":  in_tok,
+                    "output_tokens": out_tok,
+                    "cost_usd":      cost_usd or 0.0,
+                })
+                log.debug("_stream_litellm usage: in=%d out=%d cost=%.4f", in_tok, out_tok, cost_usd or 0)
+        except Exception as _e:
+            log.debug("_stream_litellm: cost_update failed (non-fatal): %s", _e)
     
     def _build_tool_definitions(self) -> list[dict]:
         """OpenAI function calling format tool definitions（LLM 可见的工具列表）。"""

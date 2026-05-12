@@ -537,27 +537,18 @@ async fn test_llm_connectivity(provider: &str) -> Result<()> {
         _           => { println!("⏭  Skipped"); return Ok(()); }
     };
 
-    // Build HTTP request manually (avoid reqwest dependency — use std TcpStream + rustls if available)
-    // Simpler: run a minimal curl/powershell check, or just trust the TCP succeeded.
-    // For now, use a basic HTTP/1.1 request via tokio to avoid new Cargo dependencies.
-    let auth_header = if provider == "anthropic" {
-        format!("x-api-key: {}\r\nanthropic-version: 2023-06-01", key)
-    } else {
-        format!("Authorization: Bearer {}", key)
-    };
-
     // Use Python Soul to make the actual test call (avoids adding reqwest to host)
     // We do this via a subcommand that spawns a quick Python one-liner
+    let auth_headers = if provider == "anthropic" {
+        format!("'x-api-key':'{}','anthropic-version':'2023-06-01'", key)
+    } else {
+        format!("'Authorization':'Bearer {}'", key)
+    };
     let py_check = format!(
         r#"import urllib.request, sys; req=urllib.request.Request('{}',headers={{{}}}); \
            resp=urllib.request.urlopen(req,timeout=8); \
            sys.exit(0 if resp.status==200 else 1)"#,
-        url,
-        if provider == "anthropic" {
-            format!("'x-api-key':'{}','anthropic-version':'2023-06-01'", key)
-        } else {
-            format!("'Authorization':'Bearer {}'", key)
-        }
+        url, auth_headers
     );
 
     let result = tokio::process::Command::new("python3")
