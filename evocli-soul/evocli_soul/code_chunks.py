@@ -38,10 +38,12 @@ log = logging.getLogger("evocli.code_chunks")
 
 # LanceDB collection name (separate from memories to avoid schema conflict)
 COLLECTION = "code_chunks"
-# Max function body lines to embed (避免超长类/文件爆内存)
+# Max function body lines to embed
 MAX_BODY_LINES = 150
-# Min body lines — 1 allows single-line functions (e.g. dispatch stubs, trait impls)
+# Min body lines — 1 allows single-line functions
 MIN_BODY_LINES = 1
+# Embedding dimension (jina-v2-base-code = 768-dim)
+EMBED_DIM = 768
 
 
 class CodeChunkIndex:
@@ -64,33 +66,16 @@ class CodeChunkIndex:
     # ── 内部工具 ──────────────────────────────────────────────────────────
 
     def _get_embedder(self):
+        """使用中央 embedder 配置的代码专用模型（jina-v2-base-code）。"""
         if self._embedder is not None:
             return self._embedder
-        try:
-            import warnings
-            from fastembed import TextEmbedding
-            cache_dir = str(Path.home() / ".evocli" / "models")
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=UserWarning)
-                self._embedder = TextEmbedding(
-                    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-                    cache_dir=cache_dir,
-                )
-            return self._embedder
-        except Exception as e:
-            log.debug("code_chunks: embedder init failed: %s", e)
-            return None
+        from evocli_soul.embedder import get_code_embedder
+        self._embedder = get_code_embedder()
+        return self._embedder
 
     def _embed(self, text: str) -> list[float] | None:
-        emb = self._get_embedder()
-        if emb is None:
-            return None
-        try:
-            vecs = list(emb.embed([text]))
-            return list(vecs[0]) if vecs else None
-        except Exception as e:
-            log.debug("code_chunks: embed failed: %s", e)
-            return None
+        from evocli_soul.embedder import embed_code
+        return embed_code(text)
 
     def _get_table(self):
         """Get or create LanceDB code_chunks table."""
@@ -114,7 +99,7 @@ class CodeChunkIndex:
                 "line_end":   0,
                 "body_hash":  "",
                 "indexed_at": 0.0,
-                "vector":     [0.0] * 384,  # MiniLM-L12 = 384 dim
+                "vector":     [0.0] * EMBED_DIM,  # jina-v2-base-code = 768-dim
             }
 
             if COLLECTION in self._db.table_names():
@@ -219,7 +204,7 @@ class CodeChunkIndex:
         # Build existing hash map to detect unchanged symbols
         # Hash key format: "{chunk_id}:{embed_version}" — bumping version forces re-embed
         # when embedding strategy changes (e.g. we now include filename+signature).
-        EMBED_VERSION = "v2"  # bump when embedding text format changes
+        EMBED_VERSION = "v3"  # v3: switched to jina-v2-base-code (768-dim, code-specific)  # bump when embedding text format changes
         existing_hashes: dict[str, str] = {}
         if not force:
             try:
@@ -293,11 +278,9 @@ class CodeChunkIndex:
                 errors += 1
                 continue
 
-            # Make vector exactly 384 dims (MiniLM)
-            if len(vec) > 384:
-                vec = vec[:384]
-            elif len(vec) < 384:
-                vec = vec + [0.0] * (384 - len(vec))
+            # Normalize to EMBED_DIM
+            from evocli_soul.embedder import normalize_vector
+            vec = normalize_vector(vec, EMBED_DIM)
 
             batch.append({
                 "id":         chunk_id,
@@ -368,8 +351,8 @@ class CodeChunkIndex:
             log.debug("code_chunks: search embed failed, returning []")
             return []
 
-        if len(vec) > 384: vec = vec[:384]
-        elif len(vec) < 384: vec = vec + [0.0] * (384 - len(vec))
+        from evocli_soul.embedder import normalize_vector
+        vec = normalize_vector(vec, EMBED_DIM)
 
         pid = project_id or self.project_id
 
@@ -571,3 +554,5 @@ def get_index(project_id: str = ".") -> CodeChunkIndex:
     if _index is None:
         _index = CodeChunkIndex(project_id)
     return _index
+
+

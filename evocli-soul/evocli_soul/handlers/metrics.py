@@ -24,29 +24,23 @@ _MODEL_FILE  = Path.home() / ".evocli" / "mem_router" / "model.json"
 TRAIN_THRESHOLD_PER_CLASS = 200    # 每类达到 200 条触发初次训练，随后 delta 增量重训
                                     # 原 4000 过高导致模型永不激活——修复为可达阈值
 
-# ── 模块级嵌入模型缓存（避免每次推理重载模型，保证 < 5ms 推理延迟）────────────────
-# 使用小写以避免 basedpyright 把大写变量当 const 处理
+# ── 模块级嵌入模型缓存（通过 embedder.py 中央配置获取 jina-zh）────────────────
 _embedder_cache: Optional[Any] = None   # fastembed.TextEmbedding 实例缓存
 
 def _get_embedder():
-    """懒加载并缓存 fastembed 嵌入模型（只初始化一次，进程内复用）。"""
+    """懒加载并缓存文本嵌入模型（jina-embeddings-v2-base-zh, 768维）。
+    通过 embedder.py 中央配置，与 memory_client + local_classifier 共用同一模型实例。
+    """
     global _embedder_cache  # noqa: PLW0603
     if _embedder_cache is not None:
         return _embedder_cache
-    import importlib.util
-    if not importlib.util.find_spec("fastembed"):
-        return None
     try:
-        from fastembed import TextEmbedding
-        cache_dir = str(Path.home() / ".evocli" / "models")
-        _embedder_cache = TextEmbedding(
-            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-            cache_dir=cache_dir,
-        )
-        log.info("fastembed TextEmbedding (paraphrase-multilingual-MiniLM-L12-v2) loaded and cached")
+        from evocli_soul.embedder import get_text_embedder
+        _embedder_cache = get_text_embedder()
+        log.info("MemRouter embedder: jina-embeddings-v2-base-zh (768-dim) loaded via embedder.py")
         return _embedder_cache
     except Exception as e:
-        log.debug("fastembed load failed: %s", e)
+        log.debug("embedder load failed: %s", e)
         return None
 
 
@@ -484,7 +478,7 @@ def _train_sklearn_classifier() -> dict:
 
         # 生成嵌入向量（使用缓存模型，不需要 E5 前缀）
         embs     = list(embedder.embed(texts))  # type: ignore[union-attr]
-        dim      = len(embs[0]) if embs else 384
+        dim      = len(embs[0]) if embs else 768  # jina-v2-base-zh = 768-dim
 
         # numpy 加速的逻辑回归训练（比 Python 循环快 100x）
         try:

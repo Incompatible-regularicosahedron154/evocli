@@ -1,21 +1,19 @@
 """
 local_classifier.py — 基于本地嵌入模型的零样本文本分类器
 
-替代所有硬编码关键词路由。使用 fastembed paraphrase-multilingual-MiniLM-L12-v2（已在
-MemRouter 中缓存）做 cosine similarity 零样本分类，随使用自动积累标签
-供 Phase 1 逻辑回归训练。
+使用 jinaai/jina-embeddings-v2-base-zh（768维，中英双语）做 cosine similarity
+零样本分类，随使用自动积累标签供 Phase 1 逻辑回归训练。
 
-架构与 crates/mem_router/ 完全一致：
-  Phase 0: 零样本 cosine similarity （无需训练数据，立即可用）
+模型选型说明：
+  - jina-embeddings-v2-base-zh: 768维，中英双语，jina-v2 系列
+  - 比原 MiniLM-L12 (384维) 更高维度，分类精度更高
+  - 与 memory_client.py 使用同一模型 → 进程内复用，无额外开销
+  - 配置在 embedder.py，通过 config.toml [embedder] 可覆盖
+
+架构：
+  Phase 0: 零样本 cosine similarity（无需训练数据，立即可用）
   Phase 1: 积累 4000条/类后 → 逻辑回归（metrics.py 触发训练）
-  Fallback: fastembed 不可用时退回关键词匹配
-
-训练阈值：4000条/类（200太少，泛化差；4000保证模型有足够覆盖度）
-
-覆盖的原硬编码：
-  orchestrator.py  _INTENT_ROUTES         → classify_agent_intent()
-  handlers/agent.py COMPLEX_KEYWORDS       → needs_orchestration()
-  skill_engine.py  _STOPWORDS + 关键词提取 → rank_guidance_skills()
+  Fallback: 模型不可用时退回关键词匹配
 """
 from __future__ import annotations
 
@@ -31,15 +29,14 @@ log = logging.getLogger("evocli.local_classifier")
 # ── 标签积累路径（供 Phase 1 重训使用）────────────────────────────────────────
 _INTENT_LABELS_FILE = Path.home() / ".evocli" / "intent_router" / "labels.jsonl"
 
-# ── 嵌入模型缓存（进程级，与 MemRouter 共用生命周期）────────────────────────────
+# ── 嵌入模型缓存（进程级，与 memory_client + metrics 共用同一 jina-zh 模型）──────
 _embedder_cache: Any = None
 
 
 def get_shared_embedder():
     """
-    获取 fastembed TextEmbedding 实例（paraphrase-multilingual-MiniLM-L12-v2, 384维）。
-    与 handlers/metrics.py 的 _get_embedder() 使用相同模型，但独立缓存
-    避免 circular import。
+    获取文本嵌入模型实例（jina-embeddings-v2-base-zh, 768维，中英双语）。
+    通过 embedder.py 中央配置获取，与 memory_client / metrics 共用同一实例。
     """
     global _embedder_cache
     if _embedder_cache is not None:
@@ -47,25 +44,12 @@ def get_shared_embedder():
     if not importlib.util.find_spec("fastembed"):
         return None
     try:
-        import warnings
-        from fastembed import TextEmbedding
-        cache_dir = str(Path.home() / ".evocli" / "models")
-        # fastembed >= 0.5.2 changed paraphrase-multilingual-MiniLM-L12-v2 from CLS
-        # to mean pooling — suppress the UserWarning about the behaviour change.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=".*mean pooling.*",
-                category=UserWarning,
-            )
-            _embedder_cache = TextEmbedding(
-                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-                cache_dir=cache_dir,
-            )
-        log.debug("local_classifier: fastembed paraphrase-multilingual-MiniLM-L12-v2 loaded")
+        from evocli_soul.embedder import get_text_embedder
+        _embedder_cache = get_text_embedder()
+        log.debug("local_classifier: jina-embeddings-v2-base-zh (768-dim) loaded via embedder.py")
         return _embedder_cache
     except Exception as e:
-        log.debug("local_classifier: fastembed load failed: %s", e)
+        log.debug("local_classifier: embedder load failed: %s", e)
         return None
 
 

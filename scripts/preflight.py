@@ -29,10 +29,20 @@ SEP = "-" * 60
 def _check_model_cached() -> None:
     import pathlib
     cache = pathlib.Path.home() / ".evocli" / "models"
-    if not any(cache.rglob("*.onnx")):
+    # Check for both required models
+    onnx_files = list(cache.rglob("*.onnx"))
+    if not onnx_files:
         raise FileNotFoundError(
-            f"Embedding model not cached in {cache}. "
+            f"Embedding models not cached in {cache}. "
             "Run: python download_models.py"
+        )
+    # Warn if code model specifically is missing (text model may exist from older installs)
+    model_dirs = [p.parent.name for p in onnx_files]
+    has_code_model = any("code" in d for d in model_dirs)
+    if not has_code_model:
+        raise FileNotFoundError(
+            f"Code embedding model (jina-v2-base-code) not found in {cache}. "
+            "Run: python download_models.py  (adds ~160MB for code search)"
         )
 
 def _check_scipy() -> None:

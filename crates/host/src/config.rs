@@ -21,6 +21,8 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub tui: TuiConfig,
+    #[serde(default)]
+    pub embedder: EmbedderConfig,
     /// Python Soul 脚本路径（evocli init 时自动检测并保存；优先级低于 EVOCLI_SOUL 环境变量）
     #[serde(default)]
     pub soul_script: Option<String>,
@@ -721,7 +723,45 @@ fn default_vector_weight() -> f32 {
     0.6
 }
 
+/// Embedding model configuration (config.toml [embedder] section)
+///
+/// ```toml
+/// [embedder]
+/// # Code semantic search model (specialized for 30+ programming languages)
+/// code_model = "jinaai/jina-embeddings-v2-base-code"   # default ~160MB ONNX
+///
+/// # Text memory + tool routing model (Chinese + English bilingual)
+/// text_model = "jinaai/jina-embeddings-v2-base-zh"      # default ~137MB ONNX
+///
+/// # Alternative smaller models (less accurate but faster on weak CPUs):
+/// # code_model = "BAAI/bge-small-en-v1.5"   # 67MB, English only
+/// # text_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # 220MB, multilingual
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedderConfig {
+    /// Code embedding model — used for code_semantic_search tool.
+    #[serde(default = "default_code_model")]
+    pub code_model: String,
+
+    /// Text embedding model — used for memory recall, tool routing, intent classification.
+    #[serde(default = "default_text_model")]
+    pub text_model: String,
+}
+
+fn default_code_model() -> String { "jinaai/jina-embeddings-v2-base-code".into() }
+fn default_text_model() -> String { "jinaai/jina-embeddings-v2-base-zh".into() }
+
+impl Default for EmbedderConfig {
+    fn default() -> Self {
+        Self {
+            code_model: default_code_model(),
+            text_model: default_text_model(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::doc_lazy_continuation)]
 pub struct GraphConfig {
     /// Max iterations for Label Propagation community detection (default: 20)
     #[serde(default = "default_lpa_max_iter")]
@@ -800,10 +840,11 @@ impl Default for Config {
             safety: SafetyConfig::default(),
             security: SecurityConfig::default(),
             memory: MemoryConfig::default(),
-            agent: AgentConfig::default(),
-            tui: TuiConfig::default(),
+            agent:    AgentConfig::default(),
+            tui:      TuiConfig::default(),
+            embedder: EmbedderConfig::default(),
             soul_script: None,
-            graph: GraphConfig::default(),
+            graph:    GraphConfig::default(),
         }
     }
 }
