@@ -183,8 +183,24 @@ async fn run_tui(_debug: bool) -> Result<()> {
     let bridge = soul_bridge::SoulBridge::spawn(&soul_path).await?;
     match bridge.ping().await {
         Ok(true)  => println!("  Soul connected ✓"),
-        Ok(false) => eprintln!("  Soul ping failed"),
-        Err(e)    => eprintln!("  Soul error: {e}"),
+        Ok(false) => {
+            // Soul responded but returned something other than "pong" — fatal.
+            // Starting the TUI in this state means all agent.stream calls will fail
+            // silently, leaving the user staring at a frozen interface.
+            eprintln!("\n[E501] Python Soul ping returned unexpected response.");
+            eprintln!("  This usually means the Python environment is broken.");
+            eprintln!("  Run: evocli doctor   to diagnose the issue.\n");
+            anyhow::bail!("Soul process did not respond correctly to ping");
+        }
+        Err(e) => {
+            eprintln!("\n[E500] Python Soul failed to start: {e}");
+            eprintln!("  Possible causes:");
+            eprintln!("    • Python venv not set up   →  run setup.sh / setup.ps1");
+            eprintln!("    • evocli-soul not installed →  run: pip install evocli-soul[full]");
+            eprintln!("    • Soul script missing       →  check EVOCLI_SOUL env var");
+            eprintln!("  Run: evocli doctor   for full diagnostics.\n");
+            anyhow::bail!("Soul process ping failed: {e}");
+        }
     }
     println!();
 

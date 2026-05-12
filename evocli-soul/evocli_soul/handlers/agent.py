@@ -173,9 +173,18 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
 
     # ── Session identity + turn counter ──────────────────────────────────────
     import evocli_soul.state as _st
-    # Use session_id from params if provided; else use a stable per-process default.
-    # This allows Rust TUI to identify sessions even before full session tracking.
-    session_id = params.get("session_id") or "default"
+    # Derive session_id from the current working directory when Rust TUI doesn't
+    # provide one. This prevents multi-project history pollution where two separate
+    # project folders would share the same "default" history bucket.
+    # cwd-hash is stable per project: same project → same session bucket across restarts.
+    _explicit_sid = params.get("session_id")
+    if _explicit_sid:
+        session_id = _explicit_sid
+    else:
+        import os as _os, hashlib as _hashlib
+        _cwd = _os.getcwd()
+        # Short hex digest: deterministic per-project, collision-resistant enough
+        session_id = "cwd_" + _hashlib.md5(_cwd.encode(), usedforsecurity=False).hexdigest()[:12]
     _st.increment_turn(session_id)
 
     # ── Load persistent conversation history (multi-turn continuity) ─────────

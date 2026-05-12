@@ -342,11 +342,20 @@ impl SoulBridge {
             pending_r.lock().await.drain();
 
             // 清理 stream map: 向所有活跃流注入 done-chunk，TUI 退出 Streaming 状态
+            // Message includes actionable steps — "Please restart" was unclear about HOW.
             let mut smap = streams_r.lock().await;
             for (id, tx) in smap.drain() {
                 let _ = tx.send(StreamChunk {
                     id:   id,
-                    text: "\n\n⚠️  EvoCLI Soul process has terminated. Please restart EvoCLI.".to_string(),
+                    text: concat!(
+                        "\n\n⚠️  **Python Soul process has crashed or exited.**\n\n",
+                        "**To recover:**\n",
+                        "1. Press `Ctrl+C` to exit EvoCLI\n",
+                        "2. Check the error log: `evocli doctor` or `F12` for details\n",
+                        "3. Restart: run `evocli` again\n\n",
+                        "Your conversation history is preserved in `~/.evocli/` and will",
+                        " be restored on next startup."
+                    ).to_string(),
                     done: true,
                 });
             }

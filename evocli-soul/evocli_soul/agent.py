@@ -1473,8 +1473,19 @@ class EvoCLIAgent:
                             )
                     except Exception:
                         pass  # Non-fatal: never break the tool loop
-        
-        return "Error: Max tool iterations reached"
+
+        # Tool iteration limit reached — give the user actionable context.
+        # This usually means the AI got stuck in a reflection/retry loop, or
+        # the task is too complex for a single agent invocation.
+        log.warning("_run_litellm: max tool iterations (10) reached. reflection_count=%d", reflection_count)
+        return (
+            "⚠️ **Reached the maximum tool call limit (10 iterations).**\n\n"
+            "This usually means:\n"
+            "1. The task is complex and needs to be broken into smaller steps\n"
+            "2. A tool kept failing and the reflection loop exhausted retries\n"
+            "3. Try rephrasing the request or using `/compress` to start fresh\n\n"
+            "Check `F12` logs for details on which tools were called."
+        )
     
     async def _stream_litellm(self, user_input: str, ctx: dict,
                                prior_history: list[dict] | None = None) -> AsyncGenerator[str, None]:

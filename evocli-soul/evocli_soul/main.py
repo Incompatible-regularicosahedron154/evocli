@@ -67,6 +67,23 @@ async def _serve(router) -> None:
 
     threading.Thread(target=_read_stdin, daemon=True).start()
 
+    # ── Graceful SIGTERM handler ──────────────────────────────────────────────
+    # When Rust host sends SIGTERM (e.g., on Ctrl+C), flush pending work and exit
+    # cleanly so background distillation tasks complete.
+    import signal as _signal
+
+    def _handle_sigterm(signum, frame) -> None:
+        log = logging.getLogger("evocli.soul")
+        log.info("SIGTERM received — Soul shutting down gracefully")
+        # Push EOF sentinel into the queue to break the main loop
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(q.put_nowait, "")
+
+    try:
+        _signal.signal(_signal.SIGTERM, _handle_sigterm)
+    except (OSError, ValueError):
+        pass  # Not available on all platforms (Windows signal constraints)
+
     while True:
         line = await q.get()
         if not line:

@@ -224,7 +224,11 @@ class DaemonWorkerManager:
             log.debug("Evolution scan: failed to read events.db: %s", e)
 
         try:
-            from evocli_soul.evolution_engine import EvolutionEngine
+            # Use the active evolution package (evocli_soul.evolution.__init__.py),
+            # NOT the deprecated evocli_soul.evolution_engine module.
+            # multi_agent.py was still importing from the old path, causing the daemon
+            # to use stale evolution logic while handlers/system.py used the new path.
+            from evocli_soul.evolution import EvolutionEngine
             engine = EvolutionEngine(self.bridge)
             result = await engine.observe({"events": events, "project_id": "."})
             if result.get("drafts"):
