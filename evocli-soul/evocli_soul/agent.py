@@ -918,7 +918,8 @@ class EvoCLIAgent:
         if _require_preview and name in _EDIT_TOOLS:
             preview_result = await self._diff_preview_and_confirm(name, args)
             if preview_result == "rejected":
-                return _json.dumps({
+                import json as _json_preview
+                return _json_preview.dumps({
                     "ok": False,
                     "error": "User rejected the change preview. Try a different approach.",
                 }, ensure_ascii=False)
@@ -1142,19 +1143,24 @@ class EvoCLIAgent:
                 if skip_failed:
                     # skip_failed=True: DON'T rollback successful edits.
                     # Write the successful ones, skip the failures, report both.
-                    for r in results:
+                    actually_written = 0
+                    for i, r in enumerate(results):
                         if r.get("ok") and r.get("_new_content") is not None:
                             try:
                                 await self.bridge.call("fs.write", {"path": r["path"], "content": r["_new_content"]})
+                                actually_written += 1
                             except Exception as _we:
+                                # Write failed: update result to reflect actual failure
                                 log.warning("fs_apply_batch skip_failed write error %s: %s", r["path"], _we)
-                    log.info("fs_apply_batch(skip_failed=True): %d ok, %d failed — keeping successes",
-                             sum(1 for r in results if r.get("ok")),
-                             sum(1 for r in results if not r.get("ok")))
+                                results[i] = {**r, "ok": False, "error": f"write failed: {_we}"}
+                    # Recompute clean_results after potential status updates
+                    clean_results = [{k: v for k, v in r.items() if k != "_new_content"} for r in results]
+                    log.info("fs_apply_batch(skip_failed=True): %d written, %d failed",
+                             actually_written, sum(1 for r in results if not r.get("ok")))
                     await emit_event("tool_call_done", {"tool": "fs.apply_batch", "ok": False})
                     return _json.dumps({
                         "ok": False, "rolled_back": False, "partial": True,
-                        "applied": sum(1 for r in results if r.get("ok")),
+                        "applied": actually_written,
                         "failed":  sum(1 for r in results if not r.get("ok")),
                         "error": "Some edits failed (skip_failed=True: successes written). Fix the failed ones individually.",
                         "results": clean_results,
@@ -1454,16 +1460,21 @@ class EvoCLIAgent:
     async def run(self, user_input: str, context_params: dict | None = None) -> str:
         """Run agent with context injection."""
         await self._emit_fallback_warning_once()
-        ctx          = await self._build_context(user_input, context_params)
-        full_input   = await self._inject_context(user_input, ctx)
-        
+        # Thread session_id so history/anchored_summary are correctly loaded
+        ctx = await self._build_context(
+            user_input, context_params,
+            history=None,               # _build_context loads from state by session_id
+            session_id=self._session_id,
+        )
+        full_input = await self._inject_context(user_input, ctx)
+
         if self._agent is not None:
             try:
                 result = await self._agent.run(full_input)
                 return str(getattr(result, "output", None) or getattr(result, "data", "") or "")
             except Exception as e:
                 log.warning("Pydantic AI run failed (%s), falling back", e)
-        
+
         return await self._run_litellm(full_input, ctx)
 
     async def run_architect_mode(
@@ -1891,7 +1902,6 @@ class EvoCLIAgent:
             )
 
         # Build messages: [system] + [prior history] + [current user turn]
-        # This is the Aider pattern — history accumulates, model sees prior turns
         messages: list[dict] = [{"role": "system", "content": system}]
         if prior_history:
             messages.extend(prior_history)
@@ -1899,16 +1909,17 @@ class EvoCLIAgent:
         messages.append({"role": "user", "content": user_input})
         # Read stream timeout from config [agent] section (default 30s)
         _stream_timeout = float((self.config or {}).get("agent", {}).get("stream_timeout_s", 30))
-        # Build tool definitions so the streaming path can also call tools.
-        # Without this, the LiteLLM streaming fallback generates text-only responses
-        # and cannot execute any tools, making "CALL THE TOOL NOW" a false promise.
-        _tools = self._build_tool_definitions()
+
+        # Try streaming WITHOUT tools first — many providers handle stream+tools
+        # poorly or not at all. If the model requests tools in the stream (finish_reason="tool_calls"),
+        # we detect it and fall back to _run_litellm which has a proper tool loop.
+        # This avoids both: (a) broken partial-delta tool calls, and (b) providers
+        # rejecting stream=True+tools entirely.
         try:
             response = await asyncio.wait_for(
                 llm._router.acompletion(
                     model=tier,
-                    messages=messages,   # [system] + [history] + [user]
-                    tools=_tools,        # enable tool calling in streaming path
+                    messages=messages,
                     stream=True, max_tokens=2048,
                 ),
                 timeout=_stream_timeout,
@@ -1917,40 +1928,30 @@ class EvoCLIAgent:
             log.error("_stream_litellm: LLM API call timed out after %.0fs (model=%s)", _stream_timeout, tier)
             yield f"\n\n⚠️ LLM API timed out ({_stream_timeout:.0f}s). Check your API key and network, then try again."
             return
+
+        text_yielded = False
+        finish_reason = None
         async for chunk in response:
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta
-            text = delta.content or ""
+            choice = chunk.choices[0]
+            text = (choice.delta.content or "") if hasattr(choice, 'delta') else ""
             if text:
                 yield text
+                text_yielded = True
+            # Track finish reason to detect tool-call requests
+            if hasattr(choice, 'finish_reason') and choice.finish_reason:
+                finish_reason = choice.finish_reason
 
-            # Handle streaming tool calls — collect tool_call deltas and execute them.
-            # Without this, the streaming path silently ignores tool requests, making
-            # "CALL THE TOOL NOW" a false promise.
-            if hasattr(delta, 'tool_calls') and delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    if not hasattr(tc_delta, 'function') or not tc_delta.function:
-                        continue
-                    tool_name  = getattr(tc_delta.function, 'name',      "") or ""
-                    tool_args  = getattr(tc_delta.function, 'arguments', "") or ""
-                    tool_id    = getattr(tc_delta, 'id', "") or ""
-                    if not tool_name:
-                        continue
-                    try:
-                        import json as _stj
-                        targs = _stj.loads(tool_args) if tool_args.strip() else {}
-                    except Exception:
-                        targs = {}
-                    # Notify TUI about tool execution
-                    try:
-                        from evocli_soul.rpc import emit_event as _se
-                        await _se("tool_call_start", {"tool": tool_name, "display": f"⟳ {tool_name}"})
-                    except Exception:
-                        pass
-                    tool_result = await self._execute_tool(tool_name, targs)
-                    # Yield a formatted tool result to the stream so user sees it
-                    yield f"\n\n**`{tool_name}`** → {str(tool_result)[:500]}\n"
+        # If the model wanted to call tools but we ran in text-only stream mode,
+        # fall back to _run_litellm which has a proper tool-calling loop.
+        # The user sees a brief indicator, then the tool-augmented response.
+        if finish_reason in ("tool_calls", "function_call") and not text_yielded:
+            log.info("_stream_litellm: model requested tools (finish_reason=%s), routing to _run_litellm", finish_reason)
+            yield "\n\n"
+            tool_result = await self._run_litellm(user_input, ctx)
+            if tool_result:
+                yield tool_result
 
         # After streaming completes, emit cost_update with real token counts.
         # litellm includes usage in the last streaming chunk when stream_options

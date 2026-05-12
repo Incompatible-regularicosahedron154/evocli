@@ -244,6 +244,11 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
                 f"Be concise. Focus on engineering decisions and state."
             )
             summary = await llm.complete(compress_prompt, tier="fast", max_tokens=600)
+
+            # CRITICAL: save the anchored summary BEFORE clearing history.
+            # The summary IS the session memory after compression.
+            _st_compress.set_anchored_summary(summary, session_id)
+
             await send.stream_chunk(req_id,
                 f"**Session compressed.**\n\n{summary}\n\n"
                 f"*Context anchored. Continue working — history preserved.*",
@@ -254,12 +259,13 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
                 "chars":                  len(summary),
                 "original_event_count":   len(events),
             })
+            # Only clear history AFTER successfully saving the summary
+            _st_compress.clear_history(session_id)
         except Exception as e:
             log.warning("GAP-2 /compress failed: %s", e)
             await send.stream_chunk(req_id, f"Compression failed: {e}", done=True)
-        finally:
-            # Clear history for this session — /compress starts fresh
-            _st_compress.clear_history(session_id)
+            # DO NOT clear history if compression failed — data would be lost
+            return
         return
 
     # Track whether we actually sent any content chunks so we can detect silent failures.
@@ -352,15 +358,23 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
         # ── LiteLLM fallback ─────────────────────────────────────────────────
         if primary_err is not None or chunks_sent == 0:
             if primary_err is not None:
-                # Show only the first line of the error so TUI doesn't get flooded.
-                # Full details are in ~/.evocli/logs/evocli.log (F12 to view).
                 first_line = str(primary_err).splitlines()[0] if str(primary_err) else repr(primary_err)
                 await emit_event("soul_status", {
                     "status":  "error",
                     "message": f"Primary path failed: {first_line} — retrying…  (F12 for full log)",
                 })
             try:
-                async for chunk in agent._stream_litellm(prompt, {}, prior_history=prior_history):
+                # Build context for fallback so it has system_prompt, anchored_summary etc.
+                # Previously passed empty {} which lost all context-engine built context.
+                try:
+                    fallback_ctx = await agent._build_context(
+                        prompt,
+                        history=prior_history,
+                        session_id=session_id,
+                    )
+                except Exception:
+                    fallback_ctx = {}
+                async for chunk in agent._stream_litellm(prompt, fallback_ctx, prior_history=prior_history):
                     if chunk:
                         await send.stream_chunk(req_id, chunk, done=False)
                         chunks_sent += 1
