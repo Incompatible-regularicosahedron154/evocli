@@ -213,6 +213,11 @@ async fn run_tui(_debug: bool) -> Result<()> {
     let session_id = format!("ses_{}", uuid::Uuid::new_v4().simple());
     let session_id_dispatch = session_id.clone();
 
+    // ── 启动 Python Soul 自动重启看门狗 ──────────────────────────
+    // 当 Python Soul 崩溃时（stdout EOF），watchdog 自动重启 Python 进程。
+    // Rust TUI 和所有 channel 保持不变——用户不会感知到崩溃。
+    soul_bridge::spawn_restart_watchdog(std::sync::Arc::clone(&bridge_arc));
+
     tokio::spawn(async move {
         // Fix H2: 并行工具调度
         // - while let 一次性取出全部待处理请求（原 if let 只处理一个）

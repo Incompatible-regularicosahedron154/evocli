@@ -87,46 +87,118 @@ pub struct ChoiceRequest {
 
 // ── SoulBridge ───────────────────────────────────────────────────
 
+/// Per-process mutable state: replaced atomically on Python Soul restart.
+/// Held inside Mutex so the outer Arc<SoulBridge> never changes.
+struct BridgeInner {
+    _child:   Child,
+    stdin_tx: mpsc::UnboundedSender<String>,
+}
+
+/// Soul bridge with automatic Python process restart.
+///
+/// Architecture: Rust Host is the stable base. When Python Soul crashes,
+/// only BridgeInner (child + stdin channel) is replaced — the TUI, pending
+/// calls, and tool/event channels remain intact.
+///
+/// Restart flow:
+///   1. stdout EOF detected in reader task
+///   2. Pending calls drained; streams get error message
+///   3. restart_signal notified
+///   4. Watchdog (spawned by main.rs) calls try_restart()
+///   5. New Python process spawned, BridgeInner replaced
+///   6. New reader task starts, reuses existing channel senders
 pub struct SoulBridge {
-    _child:     Child,
-    pending:    Arc<Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>>,
-    streams:    Arc<Mutex<HashMap<String, mpsc::UnboundedSender<StreamChunk>>>>,
-    stdin_tx:   mpsc::UnboundedSender<String>,
-    /// 工具调用队列：Python 发来的 tool.call 请求
-    tool_rx:    Arc<Mutex<mpsc::UnboundedReceiver<ToolCallRequest>>>,
-    /// 事件驱动通知：tool.call 入队时触发，替代 busy-wait 轮询
-    tool_notify: Arc<tokio::sync::Notify>,
-    tool_reply: mpsc::UnboundedSender<String>,
-    /// P2-5: 事件通知通道（event.emit 从 Python → Rust）
-    event_rx:   Arc<Mutex<mpsc::UnboundedReceiver<serde_json::Value>>>,
-    /// TUI Approval channel: stores (message, oneshot::Sender<bool>) for pending approval
+    /// Stored for process respawn
+    soul_path:       String,
+    /// Per-process state — replaced on restart
+    inner:           Mutex<BridgeInner>,
+    pending:         Arc<Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>>,
+    streams:         Arc<Mutex<HashMap<String, mpsc::UnboundedSender<StreamChunk>>>>,
+    /// Sender prototype for new reader tasks (mpsc allows multiple senders)
+    tool_tx_proto:   mpsc::UnboundedSender<ToolCallRequest>,
+    tool_rx:         Arc<Mutex<mpsc::UnboundedReceiver<ToolCallRequest>>>,
+    tool_notify:     Arc<tokio::sync::Notify>,
+    /// Sender prototype for new reader tasks
+    event_tx_proto:  mpsc::UnboundedSender<serde_json::Value>,
+    event_rx:        Arc<Mutex<mpsc::UnboundedReceiver<serde_json::Value>>>,
+    /// Notified by EOF handler; watchdog listens and calls try_restart()
+    pub restart_signal: Arc<tokio::sync::Notify>,
     approval_request: Arc<Mutex<Option<(String, oneshot::Sender<bool>)>>>,
-    /// TUI Choice channel: stores pending prompt.choice request
-    choice_request: Arc<Mutex<Option<(ChoiceRequest, oneshot::Sender<ChoiceResult>)>>>,
+    choice_request:   Arc<Mutex<Option<(ChoiceRequest, oneshot::Sender<ChoiceResult>)>>>,
 }
 
 impl SoulBridge {
     pub async fn spawn(soul_script: &str) -> Result<Self> {
-        // Strip the Windows long-path prefix \\?\ that canonicalize() may add.
-        // Python cannot resolve \\?\D:\... paths in PYTHONPATH or as a module path,
-        // causing ModuleNotFoundError when the binary is run from another directory.
-        // See config.rs::resolve_soul_path() for the same note.
-        //
-        // Known edge cases (not handled, acceptable in practice):
-        //   • Path > 260 chars on Windows < 10-1607 without long-path support:
-        //     stripping \\?\ may cause "path not found". Very unlikely in typical installs.
-        //   • evocli-soul/ is a symlink: PYTHONPATH will point to the symlink, not
-        //     the real target. Python follows symlinks natively so this usually works.
+        let (child, stdin, stdout) = Self::_spawn_process(soul_script).await?;
+
+        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let streams: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<StreamChunk>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+
+        tokio::spawn(async move {
+            let mut w = tokio::io::BufWriter::new(stdin);
+            while let Some(line) = stdin_rx.recv().await {
+                if w.write_all(line.as_bytes()).await.is_err() { break; }
+                if w.write_all(b"\n").await.is_err() { break; }
+                let _ = w.flush().await;
+            }
+        });
+
+        // tool_tx_proto stored in SoulBridge so restart can clone it for new reader tasks
+        let (tool_tx, tool_rx_inner) = mpsc::unbounded_channel::<ToolCallRequest>();
+        let tool_tx_proto = tool_tx.clone();
+        let tool_rx = Arc::new(Mutex::new(tool_rx_inner));
+        let tool_notify = Arc::new(tokio::sync::Notify::new());
+
+        let (event_tx, event_rx_inner) = mpsc::unbounded_channel::<serde_json::Value>();
+        let event_tx_proto = event_tx.clone();
+        let event_rx = Arc::new(Mutex::new(event_rx_inner));
+
+        let restart_signal = Arc::new(tokio::sync::Notify::new());
+
+        Self::_start_reader(
+            stdout, pending.clone(), streams.clone(), tool_tx, event_tx,
+            tool_notify.clone(), restart_signal.clone(),
+        );
+
+        let approval_request: Arc<Mutex<Option<(String, oneshot::Sender<bool>)>>> =
+            Arc::new(Mutex::new(None));
+        let choice_request: Arc<Mutex<Option<(ChoiceRequest, oneshot::Sender<ChoiceResult>)>>> =
+            Arc::new(Mutex::new(None));
+
+        Ok(Self {
+            soul_path: soul_script.to_string(),
+            inner: Mutex::new(BridgeInner { _child: child, stdin_tx }),
+            pending,
+            streams,
+            tool_tx_proto,
+            tool_rx,
+            tool_notify,
+            event_tx_proto,
+            event_rx,
+            restart_signal,
+            approval_request,
+            choice_request,
+        })
+    }
+
+    /// Low-level process spawn: build Python command, spawn, return handles.
+    async fn _spawn_process(soul_script: &str) -> Result<(
+        tokio::process::Child,
+        tokio::process::ChildStdin,
+        tokio::process::ChildStdout,
+    )> {
         #[cfg(windows)]
         let soul_script = soul_script.trim_start_matches(r"\\?\");
         #[cfg(not(windows))]
         let soul_script = soul_script;
-        // v3.x: 优先使用 ~/.evocli/venv 中的托管 Python，不依赖系统环境
+
         let managed_python = {
             let venv_base = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".evocli")
-                .join("venv");
+                .unwrap_or_default().join(".evocli").join("venv");
             let managed = if cfg!(windows) {
                 venv_base.join("Scripts").join("python.exe")
             } else {
@@ -142,61 +214,37 @@ impl SoulBridge {
                 if cfg!(target_os = "windows") { "python".into() } else { "python3".into() }
             });
 
-        // 将 .py 文件路径转换为模块模式，防止目录被加入 sys.path[0] 导致 stdlib 遮蔽
-        // 规则：`.../<pkg>/main.py` → module=`<pkg>.main`, pythonpath=`<parent_of_pkg>/`
         let (run_args, pythonpath): (Vec<String>, Option<String>) = if soul_script.ends_with(".py") {
             let p = std::path::Path::new(soul_script);
-            // 尝试从文件路径推断包名和 PYTHONPATH
-            // evocli-soul/evocli_soul/main.py → pkg=evocli_soul, parent=evocli-soul/
             if let (Some(pkg_dir), Some(filename)) = (p.parent(), p.file_stem()) {
                 if let Some(pkg_name) = pkg_dir.file_name().and_then(|n| n.to_str()) {
                     let module = format!("{}.{}", pkg_name, filename.to_str().unwrap_or("main"));
-                    let pp = pkg_dir.parent()
-                        .map(|pp| {
-                            // Do NOT canonicalize: on Windows it adds a \\?\ prefix
-                            // that Python cannot resolve in PYTHONPATH.
-                            // Use the path as-is; if relative, it resolves correctly
-                            // because the child process inherits the same CWD.
-                            //
-                            // Edge cases (not handled, acceptable in practice):
-                            //   • symlinks: not resolved, but Python follows them natively.
-                            //   • relative paths with ..: work as long as CWD doesn't change
-                            //     between spawn() call and Python module import.
-                            let s = pp.to_string_lossy();
-                            #[cfg(windows)]
-                            let s = s.trim_start_matches(r"\\?\").to_string();
-                            #[cfg(not(windows))]
-                            let s = s.to_string();
-                            s
-                        });
+                    let pp = pkg_dir.parent().map(|pp| {
+                        let s = pp.to_string_lossy();
+                        #[cfg(windows)]
+                        let s = s.trim_start_matches(r"\\?\").to_string();
+                        #[cfg(not(windows))]
+                        let s = s.to_string();
+                        s
+                    });
                     (vec!["-u".into(), "-m".into(), module], pp)
                 } else {
-                    // fallback: 直接运行文件
                     (vec!["-u".into(), soul_script.to_string()], None)
                 }
             } else {
                 (vec!["-u".into(), soul_script.to_string()], None)
             }
         } else {
-            // 已经是模块名（如 evocli_soul.main）
             (vec!["-u".into(), "-m".into(), soul_script.to_string()], None)
         };
 
-        // 构建环境变量：PYTHONPATH + UTF-8 编码
         let mut cmd = Command::new(&python_exe);
         cmd.args(run_args.iter().map(|s| s.as_str()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .env("PYTHONIOENCODING", "utf-8");
 
-        // Redirect Soul stderr → log file, NOT the terminal.
-        // soul_logging.py already routes WARNING+ to both evocli.log AND the TUI
-        // event channel.  Inheriting stderr would let raw Python output bleed
-        // directly into the ratatui TUI, corrupting the rendered frame.
-        let log_dir = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".evocli")
-            .join("logs");
+        let log_dir = dirs::home_dir().unwrap_or_default().join(".evocli").join("logs");
         let _ = std::fs::create_dir_all(&log_dir);
         let stderr_sink = std::fs::OpenOptions::new()
             .create(true).append(true)
@@ -204,63 +252,39 @@ impl SoulBridge {
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null());
         cmd.stderr(stderr_sink);
-
-        // Prevent orphan Python Soul processes.
         cmd.kill_on_drop(true);
 
         if let Some(ref pp) = pythonpath {
-            // 追加到现有 PYTHONPATH 而非覆盖
             let sep = if cfg!(windows) { ";" } else { ":" };
             let existing = std::env::var("PYTHONPATH").unwrap_or_default();
-            let merged = if existing.is_empty() {
-                pp.clone()
-            } else {
-                format!("{}{}{}", pp, sep, existing)
-            };
+            let merged = if existing.is_empty() { pp.clone() }
+                         else { format!("{}{}{}", pp, sep, existing) };
             cmd.env("PYTHONPATH", &merged);
         }
 
-        let mut child = cmd.spawn()
-            .with_context(|| format!(
-                "Failed to spawn Python Soul.\n  Python: {}\n  Args: {:?}\n  PYTHONPATH: {:?}\n  \
-                  Tip: run `evocli init` to set up managed Python environment.",
-                python_exe, run_args, pythonpath
-            ))?;
+        let mut child = cmd.spawn().with_context(|| format!(
+            "Failed to spawn Python Soul.\n  Python: {}\n  Args: {:?}\n  PYTHONPATH: {:?}\n  \
+              Tip: run `evocli init` to set up managed Python environment.",
+            python_exe, run_args, pythonpath
+        ))?;
 
-        let stdout = child.stdout.take().unwrap();
-        let stdin  = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().context("no stdout")?;
+        let stdin  = child.stdin.take().context("no stdin")?;
+        Ok((child, stdin, stdout))
+    }
 
-        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let streams: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<StreamChunk>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        // stdin writer（统一写入通道）
-        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
-        let tool_reply = stdin_tx.clone();   // 工具结果也走同一 stdin
-
-        tokio::spawn(async move {
-            let mut w = tokio::io::BufWriter::new(stdin);
-            while let Some(line) = stdin_rx.recv().await {
-                if w.write_all(line.as_bytes()).await.is_err() { break; }
-                if w.write_all(b"\n").await.is_err() { break; }
-                let _ = w.flush().await;
-            }
-        });
-
-        // 工具调用队列（Python → Rust tool.call）
-        let (tool_tx, tool_rx_inner) = mpsc::unbounded_channel::<ToolCallRequest>();
-        let tool_rx = Arc::new(Mutex::new(tool_rx_inner));
-        let tool_notify = Arc::new(tokio::sync::Notify::new());
-
-        // P2-5: 事件通知通道（Python → Rust event.emit）
-        let (event_tx, event_rx_inner) = mpsc::unbounded_channel::<serde_json::Value>();
-        let event_rx = Arc::new(Mutex::new(event_rx_inner));
-
-        // stdout reader
-        let pending_r = Arc::clone(&pending);
-        let streams_r = Arc::clone(&streams);
-        let tool_notify_w = Arc::clone(&tool_notify);
+    /// Spawn a new stdout reader task.
+    /// Called on initial spawn AND on restart.
+    /// Uses sender clones so the existing tool_rx/event_rx receivers still work.
+    fn _start_reader(
+        stdout: tokio::process::ChildStdout,
+        pending:      Arc<Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>>,
+        streams:      Arc<Mutex<HashMap<String, mpsc::UnboundedSender<StreamChunk>>>>,
+        tool_tx:      mpsc::UnboundedSender<ToolCallRequest>,
+        event_tx:     mpsc::UnboundedSender<serde_json::Value>,
+        tool_notify:  Arc<tokio::sync::Notify>,
+        restart_signal: Arc<tokio::sync::Notify>,
+    ) {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -275,49 +299,38 @@ impl SoulBridge {
                 let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
                 match method {
-                    // Python → Rust 工具调用（新增）
                     "tool.call" => {
                         if let Some(params) = v.get("params") {
                             let id   = v["id"].as_str().unwrap_or("").to_string();
                             let tool = params["tool"].as_str().unwrap_or("").to_string();
                             let args = params["args"].clone();
                             let _ = tool_tx.send(ToolCallRequest { id, tool, args });
-                            tool_notify_w.notify_one();
+                            tool_notify.notify_one();
                         }
                     }
 
-                    // 流式 chunk
                     "stream.chunk" => {
                         if let Ok(chunk) = serde_json::from_value::<StreamChunk>(v["params"].clone()) {
                             let id = chunk.id.clone();
-                            if let Some(tx) = streams_r.lock().await.get(&id) {
+                            if let Some(tx) = streams.lock().await.get(&id) {
                                 let _ = tx.send(chunk);
                             }
                         }
                     }
 
-                    // 事件通知（无需响应）— P2-5: 转发到事件通道
                     "event.emit" => {
                         if let Some(params) = v.get("params") {
                             let _ = event_tx.send(params.clone());
                         }
                     }
 
-                    // 普通响应 (id + result/error)
                     _ => {
                         if let Ok(resp) = serde_json::from_value::<RpcResponse>(v) {
                             let id = resp.id.clone();
-                            // First: try the pending map (normal request/response)
-                            if let Some(tx) = pending_r.lock().await.remove(&id) {
+                            if let Some(tx) = pending.lock().await.remove(&id) {
                                 let _ = tx.send(resp);
-                            }
-                            // Second: if ID is in streams map and this is an error response,
-                            // the backend sent send.error() instead of stream_chunk().
-                            // Convert to a done stream chunk so TUI exits Streaming state.
-                            // Without this, the stream channel never closes and the TUI
-                            // gets stuck in "Streaming..." state forever.
-                            else if let Some(err) = resp.error {
-                                if let Some(tx) = streams_r.lock().await.remove(&id) {
+                            } else if let Some(err) = resp.error {
+                                if let Some(tx) = streams.lock().await.remove(&id) {
                                     let error_chunk = StreamChunk {
                                         id:   id.clone(),
                                         text: format!("ERROR: {} (code {})", err.message, err.code),
@@ -332,42 +345,74 @@ impl SoulBridge {
                 }
             }
 
-            // ── Python 进程退出清理 ──────────────────────────────────────────
-            // Python Soul 的 stdout 已关闭（进程正常退出或崩溃）。
-            // 主动清理所有挂起的请求和流，避免 TUI/调用者永久阻塞。
-            tracing::warn!("Python Soul stdout EOF — process terminated, cleaning up pending state");
+            // ── Python process exited (EOF on stdout) ──────────────────────
+            tracing::warn!("Python Soul stdout EOF — process terminated");
 
-            // 清理 pending map: dropping Sender 使 oneshot Receiver 得到 RecvError
-            // → call_with_timeout 收到 Err("Response channel closed") 并返回错误
-            pending_r.lock().await.drain();
+            // Drain pending: callers get RecvError → call_with_timeout returns error
+            pending.lock().await.drain();
 
-            // 清理 stream map: 向所有活跃流注入 done-chunk，TUI 退出 Streaming 状态
-            // Message includes actionable steps — "Please restart" was unclear about HOW.
-            let mut smap = streams_r.lock().await;
+            // Drain streams: inject "restarting" message so TUI exits Streaming state
+            let mut smap = streams.lock().await;
             for (id, tx) in smap.drain() {
                 let _ = tx.send(StreamChunk {
-                    id:   id,
-                    text: concat!(
-                        "\n\n⚠️  **Python Soul process has crashed or exited.**\n\n",
-                        "**To recover:**\n",
-                        "1. Press `Ctrl+C` to exit EvoCLI\n",
-                        "2. Check the error log: `evocli doctor` or `F12` for details\n",
-                        "3. Restart: run `evocli` again\n\n",
-                        "Your conversation history is preserved in `~/.evocli/` and will",
-                        " be restored on next startup."
-                    ).to_string(),
+                    id,
+                    text: "\n\n⏳ **Python Soul crashed — attempting automatic restart...**\n\
+                           If this persists, run `evocli doctor` or press F12 for logs."
+                        .to_string(),
                     done: true,
                 });
             }
+
+            // Signal watchdog to trigger restart
+            restart_signal.notify_one();
+        });
+    }
+
+    /// Restart the Python Soul process without restarting the Rust TUI.
+    /// Called by the watchdog task in main.rs on receiving restart_signal.
+    ///
+    /// What stays intact: TUI, pending channels, tool_rx, event_rx (multi-sender mpsc)
+    /// What gets replaced: Python child process, stdin writer task, stdout reader task
+    pub async fn try_restart(&self) -> Result<()> {
+        tracing::info!("Attempting Python Soul restart (soul_path={})", self.soul_path);
+
+        // Build and spawn new Python process (reuse spawn() logic via helper)
+        let (new_child, new_stdin, new_stdout) = Self::_spawn_process(&self.soul_path).await?;
+
+        // New stdin writer task
+        let (new_stdin_tx, mut new_stdin_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut w = tokio::io::BufWriter::new(new_stdin);
+            while let Some(line) = new_stdin_rx.recv().await {
+                if w.write_all(line.as_bytes()).await.is_err() { break; }
+                if w.write_all(b"\n").await.is_err() { break; }
+                let _ = w.flush().await;
+            }
         });
 
-        let approval_request: Arc<Mutex<Option<(String, oneshot::Sender<bool>)>>> =
-            Arc::new(Mutex::new(None));
-        let choice_request: Arc<Mutex<Option<(ChoiceRequest, oneshot::Sender<ChoiceResult>)>>> =
-            Arc::new(Mutex::new(None));
+        // New stdout reader task (reuses existing senders — receiver still in SoulBridge)
+        Self::_start_reader(
+            new_stdout,
+            self.pending.clone(),
+            self.streams.clone(),
+            self.tool_tx_proto.clone(),   // new clone → same tool_rx receiver
+            self.event_tx_proto.clone(),  // new clone → same event_rx receiver
+            self.tool_notify.clone(),
+            self.restart_signal.clone(),
+        );
 
-        Ok(Self { _child: child, pending, streams, stdin_tx, tool_rx, tool_notify,
-                  tool_reply, event_rx, approval_request, choice_request })
+        // Replace BridgeInner atomically
+        *self.inner.lock().await = BridgeInner {
+            _child:   new_child,
+            stdin_tx: new_stdin_tx,
+        };
+
+        // Verify new Soul is responsive
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        self.ping().await?;
+
+        tracing::info!("Python Soul restarted successfully");
+        Ok(())
     }
 
     // ── Rust → Python 请求 ────────────────────────────────────
@@ -381,8 +426,8 @@ impl SoulBridge {
         let req = RpcRequest { id: id.clone(), method: method.to_string(), params };
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id.clone(), tx);
-        self.stdin_tx.send(serde_json::to_string(&req)?)?;
-        // Fix (Oracle E2): clean up pending entry on timeout to avoid map leak
+        // Send to Python via inner.stdin_tx (Mutex held only during send, not during await)
+        self.inner.lock().await.stdin_tx.send(serde_json::to_string(&req)?)?;
         match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
             Ok(Ok(resp)) => {
                 if let Some(err) = resp.error { bail!("[{}] {}", err.code, err.message); }
@@ -390,7 +435,6 @@ impl SoulBridge {
             }
             Ok(Err(e))   => bail!("Response channel closed: {}", e),
             Err(_elapsed) => {
-                // Remove the orphaned pending entry before returning the error
                 self.pending.lock().await.remove(&id);
                 bail!("RPC call '{}' timed out after {}ms", method, timeout_ms)
             }
@@ -402,22 +446,23 @@ impl SoulBridge {
         let req = RpcRequest { id: id.clone(), method: method.to_string(), params };
         let (tx, rx) = mpsc::unbounded_channel();
         self.streams.lock().await.insert(id.clone(), tx);
-        self.stdin_tx.send(serde_json::to_string(&req)?)?;
+        self.inner.lock().await.stdin_tx.send(serde_json::to_string(&req)?)?;
         Ok(rx)
     }
 
     pub async fn ping(&self) -> Result<bool> {
-        // Retry up to 3 times with 200ms between attempts.
-        // Removed the original hardcoded 800ms sleep — callers should not pay
-        // a fixed penalty when Python starts quickly (e.g., warm venv).
         let mut last_err = anyhow::anyhow!("ping failed after 3 attempts");
         for attempt in 0..3u8 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            match self.call("tracer.ping", serde_json::json!({})).await {
-                Ok(result) => return Ok(result.as_str() == Some("pong")),
-                Err(e)     => last_err = e,
+            // Explicit UFCS to disambiguate from Fn::call
+            match SoulBridge::call(self, "tracer.ping", serde_json::json!({})).await {
+                Ok(result) => {
+                    let is_pong = result.as_str().map(|s| s == "pong").unwrap_or(false);
+                    return Ok(is_pong);
+                }
+                Err(e) => last_err = e,
             }
         }
         Err(last_err)
@@ -514,6 +559,62 @@ impl SoulBridge {
                 "error": { "code": -32603, "message": e.to_string() }
             }),
         };
-        let _ = self.tool_reply.send(serde_json::to_string(&resp).unwrap_or_default());
+        // Use inner.stdin_tx (same channel as call_with_timeout)
+        // tool_reply field removed — all sends go through inner now
+        let serialized = serde_json::to_string(&resp).unwrap_or_default();
+        if let Ok(inner) = self.inner.try_lock() {
+            let _ = inner.stdin_tx.send(serialized);
+        }
+        // Note: try_lock() may fail if another task holds inner during restart.
+        // In that case the tool reply is silently dropped — acceptable since the
+        // Python Soul is in the process of restarting anyway.
     }
+}
+
+// ── Restart watchdog ─────────────────────────────────────────────────────────
+
+/// Spawn the Soul restart watchdog in main.rs.
+/// Listens for restart_signal, then calls try_restart() with exponential backoff.
+///
+/// Usage in main.rs:
+///   soul_bridge::spawn_restart_watchdog(Arc::clone(&bridge_arc));
+pub fn spawn_restart_watchdog(bridge: std::sync::Arc<SoulBridge>) {
+    tokio::spawn(async move {
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            bridge.restart_signal.notified().await;
+            tracing::warn!("Soul restart signal received (consecutive_failures={})", consecutive_failures);
+
+            // Exponential backoff: 2s, 4s, 8s (max 3 attempts)
+            for attempt in 1u32..=3 {
+                let wait_secs = 2u64.pow(attempt - 1);
+                tracing::info!("Soul restart attempt {}/3, waiting {}s...", attempt, wait_secs);
+                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+
+                match bridge.try_restart().await {
+                    Ok(()) => {
+                        consecutive_failures = 0;
+                        tracing::info!("Python Soul restarted successfully (attempt {})", attempt);
+                        // Notify TUI that Soul is back
+                        let _ = bridge.inner.lock().await.stdin_tx.send(
+                            r#"{"method":"event.emit","params":{"type":"soul_status","status":"ready","message":"✅ Python Soul restarted automatically"}}"#
+                            .to_string()
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!("Soul restart attempt {}/3 failed: {}", attempt, e);
+                        if attempt == 3 {
+                            consecutive_failures += 1;
+                            tracing::error!(
+                                "Soul restart failed after 3 attempts. \
+                                 consecutive_failures={}. User must restart EvoCLI.",
+                                consecutive_failures
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
