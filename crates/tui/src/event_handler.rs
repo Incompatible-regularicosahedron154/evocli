@@ -198,10 +198,14 @@ pub fn handle_key_event(
                 return EventAction::None;
             }
             KeyCode::Enter => {
-                // 接受建议：填入输入框
+                // 接受建议：用建议命令替换当前输入（保留光标行为）
                 if let Some(text) = app.accept_suggestion() {
-                    // 清空 textarea 并填入建议命令
-                    *textarea = create_textarea();
+                    // Clear the current line without resetting textarea state.
+                    // Ctrl+U kills from cursor to line start; Ctrl+K kills to line end.
+                    // Together they clear the current line's content.
+                    // Then insert the suggestion text directly.
+                    textarea.move_cursor(tui_textarea::CursorMove::Head);
+                    textarea.delete_line_by_end();
                     for ch in text.chars() {
                         textarea.input(crossterm::event::KeyEvent::new(
                             KeyCode::Char(ch),

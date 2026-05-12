@@ -14,6 +14,7 @@ use anyhow::Result;
 use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -29,7 +30,11 @@ struct CleanupGuard;
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+        );
     }
 }
 
@@ -42,7 +47,11 @@ pub async fn run(bridge: Arc<SoulBridge>, model_name: &str, resume_session: Opti
     // ── Setup terminal ──────────────────────────────────
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,      // mouse scroll support
+        EnableBracketedPaste,    // prevent paste lag (batch paste as single event)
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let _guard = CleanupGuard;
@@ -122,10 +131,14 @@ pub async fn run(bridge: Arc<SoulBridge>, model_name: &str, resume_session: Opti
             last_input_mode = current_mode;
         }
 
-        // Draw on EVERY event — the natural event rate is the throttle
-        // Blink fires at 500ms, stream chunks at ~100ms → 10-12 draws/sec max
-        // No token-count throttle: it caused spinner to freeze and text to not appear
-        terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
+        // Draw — event-driven, with one exception: during streaming we only draw
+        // when the blink timer fires (every 500ms) OR when a chunk batch completes.
+        // This prevents burning CPU at token-emission rate (~100+ draws/sec).
+        // All other events (key press, resize, soul events) draw unconditionally.
+        let is_streaming = matches!(app.state, AppState::Streaming { .. });
+        if !is_streaming || app.cache_dirty {
+            terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
+        }
 
         // Wait for next event
         tokio::select! {
@@ -256,37 +269,68 @@ pub async fn run(bridge: Arc<SoulBridge>, model_name: &str, resume_session: Opti
                             }
                         }
                     }
-                    // 终端尺寸改变事件：重新创建自适应 textarea
+                    // 终端尺寸改变事件：重新创建自适应 textarea（O(lines) 不是 O(chars)）
                     crossterm::event::Event::Resize(new_width, _new_height) => {
-                        // 根据新终端宽度重新创建 textarea（保留当前内容）
-                        let current_text = textarea.lines().join("\n");
+                        // Preserve text by re-using existing lines directly.
+                        // tui-textarea supports From<Vec<String>> — O(lines) not O(chars).
+                        let current_lines: Vec<String> = textarea.lines().to_vec();
                         textarea = event_handler::create_textarea_for_width(new_width);
-                        // 恢复之前输入的文本
-                        if !current_text.is_empty() {
-                            for ch in current_text.chars() {
-                                if ch == '\n' {
-                                    textarea.input(crossterm::event::KeyEvent::new(
-                                        crossterm::event::KeyCode::Enter,
-                                        crossterm::event::KeyModifiers::NONE,
-                                    ));
-                                } else {
-                                    textarea.input(crossterm::event::KeyEvent::new(
-                                        crossterm::event::KeyCode::Char(ch),
-                                        crossterm::event::KeyModifiers::NONE,
-                                    ));
-                                }
-                            }
+                        if !current_lines.is_empty() && current_lines != [""] {
+                            // Replay using From<Vec<String>> trait — much faster than char replay
+                            use tui_textarea::TextArea;
+                            let mut new_ta = TextArea::from(current_lines);
+                            // Move cursor to end
+                            new_ta.move_cursor(tui_textarea::CursorMove::End);
+                            // Reapply style
+                            event_handler::apply_input_style(&mut new_ta, &app.state, app.queued_count());
+                            textarea = new_ta;
                         }
-                        // 强制重绘
+                        // Invalidate cache: width changed, all line wrapping recalculated
+                        app.cache_dirty = true;
                         terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
                     }
-                    _ => {} // 其他事件（鼠标等）暂时忽略
+
+                    // Mouse scroll wheel — enables natural scrolling without key presses
+                    crossterm::event::Event::Mouse(mouse) => {
+                        use crossterm::event::MouseEventKind;
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp   => { app.scroll_up();   }
+                            MouseEventKind::ScrollDown => { app.scroll_down(); }
+                            _ => {}
+                        }
+                    }
+
+                    // Bracketed paste — the entire pasted block arrives as one event.
+                    // Without this, every pasted character triggered a separate Key event
+                    // and a full terminal.draw() call, causing visible lag on large pastes.
+                    crossterm::event::Event::Paste(pasted_text) => {
+                        // Insert pasted text into textarea as a single operation
+                        for ch in pasted_text.chars() {
+                            if ch == '\n' {
+                                textarea.input(crossterm::event::KeyEvent::new(
+                                    crossterm::event::KeyCode::Enter,
+                                    crossterm::event::KeyModifiers::NONE,
+                                ));
+                            } else {
+                                textarea.input(crossterm::event::KeyEvent::new(
+                                    crossterm::event::KeyCode::Char(ch),
+                                    crossterm::event::KeyModifiers::NONE,
+                                ));
+                            }
+                        }
+                        // Single draw after the entire paste — not one per character
+                        terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
+                    }
+
+                    _ => {} // 其他事件忽略
                 }
             }
-            // AI stream chunks
+            // AI stream chunks — batch process to reduce redundant redraws.
+            // During fast streaming (100+ tokens/sec), many chunks may arrive
+            // between event loop iterations. Processing them all in one pass
+            // means one draw per batch instead of one draw per token.
             Some(chunk) = chunk_rx.recv() => {
                 if chunk.done {
-                    // If the final chunk has text (e.g., an error message), append it first
                     if !chunk.text.is_empty() {
                         app.append_token(&chunk.text);
                     }
@@ -295,9 +339,7 @@ pub async fn run(bridge: Arc<SoulBridge>, model_name: &str, resume_session: Opti
                         _ => 0,
                     };
                     app.finish_streaming(tokens);
-                    // Refresh input style now that we're Idle (shows correct border).
                     event_handler::apply_input_style(&mut textarea, &app.state, app.queued_count());
-                    // Force a draw on stream completion regardless of throttle.
                     terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
 
                     // ── Auto-drain message queue ──────────────────────────
@@ -351,9 +393,28 @@ pub async fn run(bridge: Arc<SoulBridge>, model_name: &str, resume_session: Opti
                         });
                     }
                 } else {
+                    // Non-final chunk: append text and drain any already-queued chunks
+                    // in one pass. This batches multiple tokens into a single draw.
                     app.append_token(&chunk.text);
-                    // Draw is handled by the throttled main draw at loop top.
-                    // No extra draw here to avoid double-drawing.
+                    let mut did_finish = false;
+                    while let Ok(extra) = chunk_rx.try_recv() {
+                        if extra.done {
+                            if !extra.text.is_empty() { app.append_token(&extra.text); }
+                            let tokens = match app.state {
+                                AppState::Streaming { tokens_received } => tokens_received,
+                                _ => 0,
+                            };
+                            app.finish_streaming(tokens);
+                            event_handler::apply_input_style(&mut textarea, &app.state, app.queued_count());
+                            did_finish = true;
+                            break;
+                        }
+                        app.append_token(&extra.text);
+                    }
+                    if did_finish {
+                        terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
+                    }
+                    // Non-final: draw is handled at the TOP of the event loop.
                 }
             }
             // P3-1: Call chain results (via tokio::spawn, non-blocking)
@@ -393,6 +454,8 @@ pub async fn run(bridge: Arc<SoulBridge>, model_name: &str, resume_session: Opti
                 app.cursor_visible = !app.cursor_visible;
                 app.spinner_tick = app.spinner_tick.wrapping_add(1);
                 app.tick_notification();  // auto-expire transient notifications
+                // Mark dirty so streaming draw at loop top fires for spinner/cursor update
+                app.cache_dirty = true;
             }
         }
 

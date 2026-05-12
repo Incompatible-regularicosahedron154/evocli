@@ -425,17 +425,28 @@ fn draw_chat_area(f: &mut Frame, app: &mut App, area: Rect, mode: LayoutMode) {
     let slice = if n == 0 { &all[..] } else { &all[start_idx..end_idx] };
 
     // ── Streaming cursor ──────────────────────────────────────────────────────
+    // Show a blinking dot at the end of the last streaming line.
+    // Guard: if the last line is already at (or near) full width, appending " ·"
+    // would cause ratatui's Wrap to push it onto a new line, looking disconnected.
+    // In that case we push the cursor as a dedicated new line instead.
     let ci = slice.len().saturating_sub(1);
-    let cursor_line: Option<Line<'static>> =
-        if streaming && app.cursor_visible && at_bottom && !slice.is_empty() {
+    let mut render: Vec<Line<'static>> = if streaming && app.cursor_visible && at_bottom && !slice.is_empty() {
+        let last_line_chars: usize = slice[ci].spans.iter()
+            .map(|s| s.content.chars().count()).sum();
+        let cursor_fits = content_width > 2 && last_line_chars + 2 < content_width;
+        if cursor_fits {
             let mut last = slice[ci].clone();
             last.spans.push(Span::styled(" ·", Style::default().fg(C_PURPLE)));
-            Some(last)
-        } else { None };
-
-    let mut render: Vec<Line<'static>> = if let Some(cl) = cursor_line {
-        let mut v = slice[..ci].to_vec(); v.push(cl); v
-    } else { slice.to_vec() };
+            let mut v = slice[..ci].to_vec(); v.push(last); v
+        } else {
+            // Cursor on its own line — avoids ratatui Wrap pushing it to unexpected position
+            let mut v = slice.to_vec();
+            v.push(Line::from(Span::styled("  ·", Style::default().fg(C_PURPLE))));
+            v
+        }
+    } else {
+        slice.to_vec()
+    };
 
     // ── Thinking animation ────────────────────────────────────────────────────
     // When the AI hasn't started streaming yet (Thinking state), show a spinner
