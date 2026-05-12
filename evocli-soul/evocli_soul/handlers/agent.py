@@ -13,6 +13,12 @@ log = logging.getLogger("evocli.handlers.agent")
 
 _INSTRUCTOR_AVAILABLE = importlib.util.find_spec("instructor") is not None
 
+# ── History compression thresholds (Aider Head/Tail pattern) ─────────────
+# Compress when history exceeds either threshold to prevent context bloat.
+_HISTORY_COMPRESS_TURNS   = 10   # compress after 10 exchanges (20 messages)
+_HISTORY_COMPRESS_TOKENS  = 8_000  # or when estimated tokens exceed this
+_HISTORY_TAIL_MESSAGES    = 10   # preserve last 5 exchanges (10 messages) verbatim
+
 
 def register(router) -> None:
     router.add("agent.run",           handle_agent_run)
@@ -118,6 +124,8 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
     # currently knows: memory constraints + recent session events + goal.
     # This avoids the dependency on Rust passing history (which it currently doesn't).
     if prompt.strip().lower() in ("/compress", "/compact"):
+        import evocli_soul.state as _st_compress
+        session_id = params.get("session_id") or "default"
         try:
             await send.stream_chunk(req_id, "⏳ Compressing session context…\n\n", done=False)
             import evocli_soul.state as _st_compress
@@ -155,18 +163,32 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
         except Exception as e:
             log.warning("GAP-2 /compress failed: %s", e)
             await send.stream_chunk(req_id, f"Compression failed: {e}", done=True)
+        finally:
+            # Clear history for this session — /compress starts fresh
+            _st_compress.clear_history(session_id)
         return
 
     # Track whether we actually sent any content chunks so we can detect silent failures.
     chunks_sent = 0
 
+    # ── Session identity + turn counter ──────────────────────────────────────
+    import evocli_soul.state as _st
+    # Use session_id from params if provided; else use a stable per-process default.
+    # This allows Rust TUI to identify sessions even before full session tracking.
+    session_id = params.get("session_id") or "default"
+    _st.increment_turn(session_id)
+
+    # ── Load persistent conversation history (multi-turn continuity) ─────────
+    # History is stored server-side in state.py — Rust TUI does NOT need to send it.
+    # Each turn appends user+assistant messages after completion.
+    prior_history = _st.get_history(session_id)
+
     try:
         from evocli_soul.agent import EvoCLIAgent, _PROVIDER_ENV
         cfg = state.get_config()
-        import evocli_soul.state as _st
         memory = _st.get_memory_if_ready()
 
-        agent = EvoCLIAgent(state.get_bridge(), memory, cfg)
+        agent = EvoCLIAgent(state.get_bridge(), memory, cfg, session_id=session_id)
 
         # ── Fast-fail: no API key configured ─────────────────────────────────
         # Without this check the code falls through to _stream_litellm, which
@@ -207,12 +229,15 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
         })
 
         # ── Primary path (pydantic-ai → LiteLLM fallback) ────────────────────
+        collected_chunks: list[str] = []   # accumulate for history
         primary_err: Exception | None = None
         try:
-            async for chunk in agent.stream(prompt):
+            async for chunk in agent.stream(prompt, prior_history=prior_history,
+                                             session_id=session_id):
                 if chunk:  # skip empty keep-alive chunks
                     await send.stream_chunk(req_id, chunk, done=False)
                     chunks_sent += 1
+                    collected_chunks.append(chunk)
         except Exception as e:
             primary_err = e
             # Full traceback to file; concise 1-line summary to TUI.
@@ -232,10 +257,11 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
                     "message": f"Primary path failed: {first_line} — retrying…  (F12 for full log)",
                 })
             try:
-                async for chunk in agent._stream_litellm(prompt, {}):
+                async for chunk in agent._stream_litellm(prompt, {}, prior_history=prior_history):
                     if chunk:
                         await send.stream_chunk(req_id, chunk, done=False)
                         chunks_sent += 1
+                        collected_chunks.append(chunk)
             except Exception as fallback_err:
                 log.error("LiteLLM fallback also failed: %s\n%s", fallback_err, _tb.format_exc())
                 await send.stream_chunk(
@@ -263,6 +289,18 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
 
         await send.stream_chunk(req_id, "", done=True)
 
+        # ── Persist this turn to history ──────────────────────────────────────
+        # Store user + assistant messages so next turn has full context.
+        # Only store if we actually got a response (no-op on errors).
+        if collected_chunks:
+            assistant_reply = "".join(collected_chunks)
+            _st.append_history([
+                {"role": "user",      "content": prompt},
+                {"role": "assistant", "content": assistant_reply},
+            ], session_id)
+            # Non-blocking Head/Tail compression check
+            asyncio.create_task(_maybe_compress_history(session_id))
+
     except Exception as e:
         log.error("agent.stream handler crashed: %s\n%s", e, _tb.format_exc())
         await send.stream_chunk(
@@ -276,6 +314,47 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
         # create_task() schedules distillation to run after this handler returns,
         # so it never blocks the TUI response.
         asyncio.create_task(_distill_session())
+
+
+async def _maybe_compress_history(session_id: str) -> None:
+    """Head/Tail split summarization when history grows too large (Aider pattern).
+
+    When history exceeds the threshold:
+    - Head (older messages) → LLM-compressed to an Anchored Summary
+    - Tail (last _HISTORY_TAIL_MESSAGES) → kept verbatim
+    - Next turn sees: [summary_injection] + [tail]
+
+    Non-blocking: called via create_task() after history append.
+    Uses compact_session_to_anchor() from context_engine (already implemented).
+    """
+    import evocli_soul.state as _st
+    history = _st.get_history(session_id)
+    # Check thresholds
+    if len(history) < _HISTORY_COMPRESS_TURNS * 2:
+        return
+    token_est = _st.get_history_token_estimate(session_id)
+    if token_est < _HISTORY_COMPRESS_TOKENS:
+        return
+
+    head = history[:-_HISTORY_TAIL_MESSAGES]
+    tail = history[-_HISTORY_TAIL_MESSAGES:]
+    try:
+        from evocli_soul.context_engine import compact_session_to_anchor
+        existing_summary = _st.get_anchored_summary(session_id)
+        llm = _st.get_llm_client()
+        new_summary = await compact_session_to_anchor(head, llm, existing_summary)
+        _st.set_anchored_summary(new_summary, session_id)
+        # Replace history: 2-message summary anchor + verbatim tail
+        summary_msgs = [
+            {"role": "user",      "content": f"[Session Summary — previous context]\n{new_summary}"},
+            {"role": "assistant", "content": "Understood. I have context from our previous work."},
+        ]
+        _st.clear_history(session_id)
+        _st.append_history(summary_msgs + tail, session_id)
+        log.info("History compressed: %d msgs → anchor + %d tail (session=%s)",
+                 len(head), _HISTORY_TAIL_MESSAGES, session_id)
+    except Exception as e:
+        log.debug("_maybe_compress_history failed (non-fatal, session=%s): %s", session_id, e)
 
 
 async def _distill_session() -> None:

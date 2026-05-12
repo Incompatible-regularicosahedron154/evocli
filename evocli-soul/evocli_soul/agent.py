@@ -78,13 +78,14 @@ class EvoCLIAgent:
     若 pydantic_ai 未安装，fallback 到 raw LiteLLM。
     """
     
-    def __init__(self, bridge, memory=None, config: dict | None = None, read_only: bool = False, role: str = "orchestrator", role_instructions: str = ""):
+    def __init__(self, bridge, memory=None, config: dict | None = None, read_only: bool = False, role: str = "orchestrator", role_instructions: str = "", session_id: str = "default"):
         self.bridge    = bridge
         self.memory    = memory
         self.config    = config or {}
         self.read_only = read_only   # G-10: 只读分析模式
         self.role      = role
         self.role_instructions = role_instructions
+        self._session_id = session_id   # for context cache + file dedup keying
         self._agent    = None
         self._init_agent()
     
@@ -1036,6 +1037,26 @@ class EvoCLIAgent:
 
             result = await self.bridge.call(rpc_method, rpc_args)
 
+            # C6: Duplicate file read deduplication (Cline pattern)
+            # When the same file is read multiple times in a session, annotate the
+            # result so the LLM knows it already saw this content. Prevents history
+            # from bloating with redundant large file copies across turns.
+            if rpc_method == "fs.read" and isinstance(result, str):
+                path = rpc_args.get("path", "")
+                if path:
+                    try:
+                        import evocli_soul.state as _st_dr
+                        read_count = _st_dr.record_file_read(path, self._session_id)
+                        if read_count >= 2:
+                            first_turn = _st_dr.get_file_first_read_turn(path, self._session_id)
+                            note = (
+                                f"\n\n[Note: {path} was also read in turn {first_turn}. "
+                                f"Content may be identical if unchanged since then.]"
+                            )
+                            result = result + note
+                    except Exception:
+                        pass  # never let dedup annotation break file reads
+
             # FIX-B: 工具执行完成 → TUI 更新状态
             await emit_event("tool_call_done", {"tool": rpc_method, "ok": True})
 
@@ -1072,18 +1093,21 @@ class EvoCLIAgent:
             log.exception("Tool %s failed", name)
             return f"Error: {e}"
 
-    async def _build_context(self, user_input: str, context_params: dict | None = None) -> dict:
+    async def _build_context(self, user_input: str, context_params: dict | None = None,
+                              history: list[dict] | None = None,
+                              session_id: str = "default") -> dict:
         """Build context via ContextEngine."""
         try:
             from evocli_soul.context_engine import ContextEngine
             ctx_engine = ContextEngine(self.bridge)
             return await ctx_engine.build({
-                "goal":         user_input,
-                "project_id":   (context_params or {}).get("project_id", "."),
-                "current_file": (context_params or {}).get("current_file"),
-                "git_diff":     (context_params or {}).get("git_diff", ""),
-                "history":      [],
-                "active_tools": list(self._TOOL_TO_RPC.keys()),
+                "goal":             user_input,
+                "project_id":       (context_params or {}).get("project_id", "."),
+                "current_file":     (context_params or {}).get("current_file"),
+                "git_diff":         (context_params or {}).get("git_diff", ""),
+                "history":          history or [],   # real history, not hardcoded []
+                "active_tools":     list(self._TOOL_TO_RPC.keys()),
+                "session_id":       session_id,      # for context cache keying
             })
         except Exception as e:
             log.debug("Context build failed: %s", e)
@@ -1267,30 +1291,49 @@ class EvoCLIAgent:
             "rolled_back":     failed and checkpoint_ref is not None,
         }
     
-    async def stream(self, user_input: str, context_params: dict | None = None) -> AsyncGenerator[str, None]:
-        """Stream agent response."""
+    async def stream(self, user_input: str, context_params: dict | None = None,
+                     prior_history: list[dict] | None = None,
+                     session_id: str = "default") -> AsyncGenerator[str, None]:
+        """Stream agent response with multi-turn history support."""
         import asyncio
         try:
             ctx = await asyncio.wait_for(
-                self._build_context(user_input, context_params),
+                self._build_context(user_input, context_params,
+                                    history=prior_history, session_id=session_id),
                 timeout=15.0,  # Context build shouldn't block — memory is pre-warmed
             )
         except asyncio.TimeoutError:
             log.debug("_build_context timed out (15s) — using minimal context")
             ctx = {}
         full_input = await self._inject_context(user_input, ctx)
-        
+
         if self._agent is not None:
             try:
-                async with self._agent.run_stream(full_input) as result:
+                # pydantic-ai: inject message_history for multi-turn continuity
+                # message_history accepts list of ModelMessage objects;
+                # simple dict list is accepted as-is in pydantic-ai >= 0.0.30
+                import importlib.util as _iu
+                pydantic_ai_history = None
+                if prior_history and _iu.find_spec("pydantic_ai"):
+                    try:
+                        from pydantic_ai.messages import ModelMessage  # type: ignore
+                        pydantic_ai_history = prior_history  # passed through if compatible
+                    except Exception:
+                        pass  # older pydantic-ai — skip history injection
+
+                run_kwargs = {}
+                if pydantic_ai_history:
+                    run_kwargs["message_history"] = pydantic_ai_history
+
+                async with self._agent.run_stream(full_input, **run_kwargs) as result:
                     async for chunk in result.stream_text(delta=True):
                         yield chunk
                 return
             except Exception as e:
                 log.warning("Pydantic AI stream failed (%s), falling back", e)
-        
-        # Fallback
-        async for chunk in self._stream_litellm(full_input, ctx):
+
+        # Fallback: pass history to _stream_litellm for proper multi-turn context
+        async for chunk in self._stream_litellm(full_input, ctx, prior_history=prior_history):
             yield chunk
     
     async def _run_litellm(self, user_input: str, ctx: dict) -> str:
@@ -1410,12 +1453,13 @@ class EvoCLIAgent:
         
         return "Error: Max tool iterations reached"
     
-    async def _stream_litellm(self, user_input: str, ctx: dict) -> AsyncGenerator[str, None]:
-        """Streaming LiteLLM fallback."""
+    async def _stream_litellm(self, user_input: str, ctx: dict,
+                               prior_history: list[dict] | None = None) -> AsyncGenerator[str, None]:
+        """Streaming LiteLLM fallback with multi-turn history support."""
         import asyncio
         import litellm
         from evocli_soul.llm_client import LLMClient
-        
+
         llm   = LLMClient(self.config)
         tier  = llm._resolve_model("auto")   # Router alias ("fast"/"smart")
 
@@ -1441,6 +1485,14 @@ class EvoCLIAgent:
                 read_only=self.read_only,
                 compact=True,
             )
+
+        # Build messages: [system] + [prior history] + [current user turn]
+        # This is the Aider pattern — history accumulates, model sees prior turns
+        messages: list[dict] = [{"role": "system", "content": system}]
+        if prior_history:
+            messages.extend(prior_history)
+            log.debug("_stream_litellm: injecting %d history messages", len(prior_history))
+        messages.append({"role": "user", "content": user_input})
         # 20-second timeout on the initial API connection.
         # 90s was too long — on blocked/misconfigured networks it means the user
         # stares at a frozen "Streaming..." screen for 90s before seeing any error.
@@ -1449,7 +1501,7 @@ class EvoCLIAgent:
             response = await asyncio.wait_for(
                 llm._router.acompletion(
                     model=tier,
-                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user_input}],
+                    messages=messages,   # [system] + [history] + [user]
                     stream=True, max_tokens=2048,
                 ),
                 timeout=20.0,

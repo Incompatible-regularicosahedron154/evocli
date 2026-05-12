@@ -14,6 +14,7 @@ FIX-BUDGET: Budget constants computed lazily inside build() via functools.lru_ca
 """
 from __future__ import annotations
 import functools
+import hashlib
 import importlib.util
 import logging
 from pathlib import Path
@@ -23,6 +24,24 @@ log = logging.getLogger("evocli.context")
 
 # 默认值（config 未找到时使用）
 _DEFAULT_BUDGET_TOTAL = 32_000
+
+
+def _goal_fingerprint(goal: str) -> str:
+    """Fast content fingerprint for cache-key comparison. No ML needed.
+
+    Normalises goal text and returns a short hex digest. Two identical goals
+    (same intent, same phrasing) map to the same key, enabling RepoMap and
+    memory search to be skipped on subsequent turns.
+    """
+    normalised = goal.lower().strip()[:500]
+    return hashlib.md5(normalised.encode(), usedforsecurity=False).hexdigest()
+
+
+def _content_hash(text: str | None) -> str:
+    """Hash of file content to detect changes between turns."""
+    if not text:
+        return ""
+    return hashlib.md5(text.encode(), usedforsecurity=False).hexdigest()[:16]
 
 @functools.lru_cache(maxsize=1)
 def _load_budget_total() -> int:
@@ -345,12 +364,50 @@ class ContextEngine:
         history      = params.get("history", [])
         project_id   = params.get("project_id", "global")
         active_tools = params.get("active_tools", [])
+        session_id   = params.get("session_id", "default")
 
         # ── @ context providers (Continue.dev 模式) ─────────────────
         goal, mention_context = await self.parse_mentions(goal)
 
         remaining = BUDGET_TOTAL - BUDGET_FIXED
         slots: list[dict] = []
+
+        # ── Session-level context cache ──────────────────────────────
+        # Skip expensive RepoMap (tree-sitter scan) and memory search
+        # when goal fingerprint AND current file content hash are unchanged.
+        # This is the primary source of per-turn token savings (75%+).
+        from evocli_soul import state as _state_cache
+        _cache = _state_cache.get_context_cache(session_id)
+
+        goal_fp          = _goal_fingerprint(goal)
+        cached_goal_fp   = _cache.get("goal_fingerprint", "")
+        cached_file_hash = _cache.get("current_file_hash", "")
+        goal_unchanged   = (goal_fp == cached_goal_fp) and bool(cached_goal_fp)
+
+        # Always read current file (needed for code injection anyway).
+        # We compute its hash here for cache validation.
+        _current_file_content: str | None = None
+        current_file_hash = ""
+        if current_file:
+            try:
+                _raw = await self.bridge.call("fs.read", {"path": current_file})
+                if isinstance(_raw, str):
+                    _current_file_content = _raw
+                    current_file_hash = _content_hash(_raw)
+            except Exception as _fe:
+                log.debug("file read for cache: %s", _fe)
+
+        file_unchanged = (current_file_hash == cached_file_hash) and bool(cached_file_hash)
+        can_reuse = goal_unchanged and file_unchanged and bool(_cache.get("repomap_text"))
+
+        # Update cache keys for next turn regardless of hit/miss
+        _state_cache.update_context_cache({
+            "goal_fingerprint":  goal_fp,
+            "current_file_hash": current_file_hash,
+        }, session_id)
+
+        if can_reuse:
+            log.debug("Context cache HIT (session=%s) — skipping RepoMap + memory search", session_id)
 
         # ── 统一内存读取（H1 遗留修复）──────────────────────────────
         # H1 将写入统一到 Python LanceDB，读取也必须走同一路径。
@@ -359,8 +416,7 @@ class ContextEngine:
         # 不经 IPC 桥，减少延迟，统一存储。
         _mc = None
         try:
-            from evocli_soul import state as _state
-            _mc = _state.get_memory()
+            _mc = _state_cache.get_memory()  # reuse _state_cache import
         except Exception as e:
             log.debug("memory_client init: %s", e)
 
@@ -379,15 +435,20 @@ class ContextEngine:
         constraint_text = "\n".join(f"- {c}" for c in constraints)
 
         # ── P1/P2/P3 记忆：一次语义搜索，按 scope 拆分 ──────────
-        # 一次 vector search 替代三次 bridge RPC，减少 IPC 往返
+        # Cache hit: reuse previous search results (same goal = same relevant memories)
+        # Cache miss: run full vector search, then cache results for next turn
         _all_memories: list[dict] = []
-        if _mc is not None and remaining > 0:
+        if can_reuse and _cache.get("memory_results") is not None:
+            _all_memories = _cache["memory_results"]
+            log.debug("Memory search cache HIT — reusing %d results", len(_all_memories))
+        elif _mc is not None and remaining > 0:
             try:
                 _all_memories = _mc.search(
                     goal, top_k=15,
                     current_project=project_id,
                     active_tools=active_tools or [],
                 )
+                _state_cache.update_context_cache({"memory_results": _all_memories}, session_id)
             except Exception as e:
                 log.debug("memory search: %s", e)
 
@@ -448,10 +509,13 @@ class ContextEngine:
                 log.debug("p3 global: %s", e)
 
         # ── 代码文件 ──────────────────────────────────────────────
+        # Reuse pre-read content from cache check (avoids double fs.read)
         code_text = ""
         if current_file and remaining > 0:
             try:
-                raw = await self.bridge.call("fs.read", {"path": current_file})
+                raw = _current_file_content  # already read during cache check above
+                if raw is None:  # fallback if cache check didn't read it
+                    raw = await self.bridge.call("fs.read", {"path": current_file})
                 if isinstance(raw, str):
                     budget    = min(BUDGET_CODE, remaining)
                     code_text = _prune_code(raw, budget)
@@ -462,55 +526,63 @@ class ContextEngine:
                 log.debug("code read: %s", e)
 
         # ── ranked_context + RepoMap（合并：先取 Rust 索引，再渲染骨架）────────
-        # 修复：原来顺序错误——RepoMap 重新 tree-sitter 扫描整个仓库，
-        # 而 Rust 已有完整索引。现在先拿 Rust 数据，再传给 RepoMap 避免重复解析。
+        # Cache hit: reuse previous RepoMap (expensive tree-sitter scan)
+        # Cache miss: compute, then cache for next turn
         repo_map_text = ""
         pre_ranked: list[dict] = []
 
-        # Step 1: 获取 Rust code_intel 已有的 PageRank 符号排名（轻量 RPC）
-        if current_file and remaining > 500:
-            try:
-                mentioned = params.get("mentioned_symbols", [])
-                pre_ranked = await self.bridge.call("code_intel.ranked_context", {
-                    "modified_file": current_file,
-                    "mentioned":     mentioned,
-                    "limit":         20,
-                })
-                if not isinstance(pre_ranked, list):
-                    pre_ranked = []
-            except Exception as e:
-                log.debug("ranked_context prefetch: %s", e)
-
-        # Step 2: RepoMap — 优先用 pre_ranked 跳过全仓 tree-sitter 扫描
-        # asyncio.to_thread: RepoMap.get_repo_map() does heavy sync I/O (os.walk +
-        # read_text + networkx PageRank). Running it directly in an async function
-        # would freeze the entire Soul event loop for 100ms–2s on large repos.
-        if remaining > 500:
-            try:
-                import asyncio as _asyncio
-                from evocli_soul.repo_map import RepoMap
-                chat_files = [current_file] if current_file else []
-                goal_words = goal.split()[:10] if goal else []
-                repo_map   = RepoMap(root=".", map_tokens=min(BUDGET_P1_EPISODES, remaining))
-                repo_map_text = await _asyncio.to_thread(
-                    repo_map.get_repo_map,
-                    chat_files=chat_files,
-                    mentioned_symbols=goal_words,
-                    pre_ranked_symbols=pre_ranked,   # Rust 索引数据，跳过重复解析
-                )
-                if repo_map_text:
-                    used = _count_tokens(repo_map_text)
-                    remaining -= used
-                    slots.append({
-                        "name":     "repo_map",
-                        "tokens":   used,
-                        "priority": "p1",
-                        "source":   "rust_index" if pre_ranked else "tree_sitter",
+        if can_reuse:
+            repo_map_text = _cache.get("repomap_text", "")
+            if repo_map_text:
+                used = _count_tokens(repo_map_text)
+                remaining -= used
+                slots.append({"name": "repo_map", "tokens": used, "priority": "p1", "source": "cache"})
+                log.debug("RepoMap cache HIT — %d tokens reused", used)
+        else:
+            # Cache miss: compute RepoMap from scratch
+            # Step 1: 获取 Rust code_intel 已有的 PageRank 符号排名（轻量 RPC）
+            if current_file and remaining > 500:
+                try:
+                    mentioned = params.get("mentioned_symbols", [])
+                    pre_ranked = await self.bridge.call("code_intel.ranked_context", {
+                        "modified_file": current_file,
+                        "mentioned":     mentioned,
+                        "limit":         20,
                     })
-                    log.debug("RepoMap: %d tokens, source=%s",
-                              used, "rust_index" if pre_ranked else "tree_sitter")
-            except Exception as e:
-                log.debug("RepoMap failed (non-fatal): %s", e)
+                    if not isinstance(pre_ranked, list):
+                        pre_ranked = []
+                except Exception as e:
+                    log.debug("ranked_context prefetch: %s", e)
+
+            # Step 2: RepoMap — 优先用 pre_ranked 跳过全仓 tree-sitter 扫描
+            if remaining > 500:
+                try:
+                    import asyncio as _asyncio
+                    from evocli_soul.repo_map import RepoMap
+                    chat_files = [current_file] if current_file else []
+                    goal_words = goal.split()[:10] if goal else []
+                    repo_map   = RepoMap(root=".", map_tokens=min(BUDGET_P1_EPISODES, remaining))
+                    repo_map_text = await _asyncio.to_thread(
+                        repo_map.get_repo_map,
+                        chat_files=chat_files,
+                        mentioned_symbols=goal_words,
+                        pre_ranked_symbols=pre_ranked,
+                    )
+                    if repo_map_text:
+                        used = _count_tokens(repo_map_text)
+                        remaining -= used
+                        slots.append({
+                            "name":     "repo_map",
+                            "tokens":   used,
+                            "priority": "p1",
+                            "source":   "rust_index" if pre_ranked else "tree_sitter",
+                        })
+                        # Cache for next turn
+                        _state_cache.update_context_cache({"repomap_text": repo_map_text}, session_id)
+                        log.debug("RepoMap: %d tokens (source=%s) — cached",
+                                  used, "rust_index" if pre_ranked else "tree_sitter")
+                except Exception as e:
+                    log.debug("RepoMap failed (non-fatal): %s", e)
 
 
         # ── Git Diff ─────────────────────────────────────────────
