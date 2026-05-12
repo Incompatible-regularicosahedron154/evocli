@@ -427,6 +427,66 @@ class EvoCLIAgent:
             return str(result)
 
         @agent.tool_plain
+        async def fs_read_symbol(symbol_name: str, path: str = "", context_lines: int = 10) -> str:
+            """
+            Read the source code of a specific function, class, or symbol by name.
+
+            PREFER over fs_read_range when you know the symbol name but not the line number.
+            Looks up the symbol in the code index, then reads that section of the file.
+
+            Args:
+              symbol_name:   exact name (e.g. "authenticate", "UserService", "handle_login")
+              path:          optional file path hint to narrow search (leave empty to search all)
+              context_lines: how many lines before/after the symbol to include (default 10)
+
+            Returns the function/class body with surrounding context.
+            Much more efficient than fs_read when you only need one symbol from a large file.
+            """
+            try:
+                # Step 1: Find symbol location via code index
+                search_params = {"name": symbol_name}
+                if path:
+                    search_params["file"] = path
+                symbols = await bridge.call("symbol.lookup", search_params)
+                if not isinstance(symbols, list) or not symbols:
+                    # Fallback: text search
+                    grep_result = await bridge.call("shell.grep", {
+                        "pattern": rf"\b{symbol_name}\b",
+                        "path": path or ".",
+                    })
+                    return _json.dumps({
+                        "symbol":  symbol_name,
+                        "found":   False,
+                        "fallback": str(grep_result)[:1000],
+                        "note": "Symbol not in index — showing grep results. Run 'evocli index' for better results.",
+                    }, ensure_ascii=False)
+
+                sym = symbols[0]
+                sym_file = sym.get("file", path)
+                sym_line = int(sym.get("line", 0))
+
+                if not sym_file or sym_line == 0:
+                    return _json.dumps({"symbol": symbol_name, "found": False,
+                                        "error": "Symbol found but no file/line info"}, ensure_ascii=False)
+
+                # Step 2: Read the file section around the symbol
+                start = max(1, sym_line - context_lines)
+                end   = sym_line + 80 + context_lines  # 80 lines covers most functions
+                range_result = await bridge.call("fs.read_range", {
+                    "path":       sym_file,
+                    "start_line": start,
+                    "end_line":   end,
+                })
+                if isinstance(range_result, dict):
+                    range_result["symbol"] = symbol_name
+                    range_result["symbol_line"] = sym_line
+                    range_result["symbol_kind"] = sym.get("kind", "unknown")
+                    return _json.dumps(range_result, ensure_ascii=False)
+                return str(range_result)
+            except Exception as e:
+                return _json.dumps({"symbol": symbol_name, "error": str(e)}, ensure_ascii=False)
+
+        @agent.tool_plain
         async def fs_lint_file(path: str) -> str:
             """
             Run a linter on a file after making edits. Returns errors with line numbers.
@@ -751,6 +811,77 @@ class EvoCLIAgent:
         "tool_run_user":  ("tool.run_user",  lambda args: {"name": args["name"], "args": args.get("args", ""), "dry_run": args.get("dry_run", False)}),
     }
 
+    async def _diff_preview_and_confirm(self, tool_name: str, args: dict) -> str:
+        """Show a unified diff of proposed changes and wait for user approval.
+
+        Returns 'approved', 'rejected', or 'skipped' (if preview failed).
+        Called when config [safety] require_diff_preview = true.
+        """
+        from evocli_soul.rpc import emit_event
+        try:
+            # Build preview diff
+            if tool_name == "fs_apply_search_replace":
+                path    = args.get("path", "")
+                search  = args.get("search", "")
+                replace = args.get("replace", "")
+                if not path or not search:
+                    return "skipped"
+                original = await self.bridge.call("fs.read", {"path": path})
+                if not isinstance(original, str):
+                    return "skipped"
+                preview = original.replace(search, replace, 1)
+                diff_result = await self.bridge.call("fs.diff", {"old": original, "new": preview, "path": path})
+                diff_text = str(diff_result) if diff_result else ""
+            elif tool_name == "fs_write":
+                path = args.get("path", "")
+                try:
+                    original = await self.bridge.call("fs.read", {"path": path})
+                    original = str(original) if isinstance(original, str) else ""
+                except Exception:
+                    original = ""
+                diff_result = await self.bridge.call("fs.diff", {
+                    "old": original, "new": args.get("content", ""), "path": path
+                })
+                diff_text = str(diff_result) if diff_result else ""
+            else:
+                # fs_apply_batch — compute per-file diffs
+                import json as _pj
+                edits = _pj.loads(args.get("edits_json", "[]"))
+                diff_parts = []
+                for edit in edits[:3]:  # preview first 3 files
+                    try:
+                        orig = await self.bridge.call("fs.read", {"path": edit["path"]})
+                        if isinstance(orig, str):
+                            new = orig.replace(edit["search"], edit["replace"], 1)
+                            d = await self.bridge.call("fs.diff", {"old": orig, "new": new, "path": edit["path"]})
+                            diff_parts.append(str(d))
+                    except Exception:
+                        pass
+                diff_text = "\n".join(diff_parts)
+
+            if not diff_text or diff_text.strip() == "--- \n+++ \n":
+                return "skipped"  # No actual changes
+
+            # Send preview to TUI
+            await emit_event("soul_status", {
+                "status":  "ready",
+                "message": (
+                    f"**Proposed changes preview** (require_diff_preview=true):\n"
+                    f"```diff\n{diff_text[:2000]}\n```\n"
+                    f"Type `yes` to approve, anything else to reject."
+                ),
+            })
+
+            # Request approval via the standard approval modal
+            approved = await self.bridge.request_approval(
+                f"Apply changes to {args.get('path', 'files')}? (see diff above)"
+            )
+            return "approved" if approved else "rejected"
+
+        except Exception as e:
+            log.debug("_diff_preview_and_confirm failed (non-fatal): %s", e)
+            return "skipped"  # Never block actual edits due to preview failure
+
     async def _execute_tool(self, name: str, args: dict) -> str:
         """
         Execute a tool call. Handles two categories:
@@ -759,6 +890,21 @@ class EvoCLIAgent:
         2. Standard tools — look up in _TOOL_TO_RPC and call bridge.call()
         """
         from evocli_soul.rpc import emit_event
+
+        # require_diff_preview: show a diff and ask approval before any file edit.
+        # Enabled via config.toml [safety] require_diff_preview = true.
+        # Mirrors Cursor's "preview before apply" — prevents surprise changes.
+        _safety = (self.config or {}).get("safety", {})
+        _require_preview = bool(_safety.get("require_diff_preview", False))
+        _EDIT_TOOLS = {"fs_apply_search_replace", "fs_apply_batch", "fs_write"}
+        if _require_preview and name in _EDIT_TOOLS:
+            preview_result = await self._diff_preview_and_confirm(name, args)
+            if preview_result == "rejected":
+                return _json.dumps({
+                    "ok": False,
+                    "error": "User rejected the change preview. Try a different approach.",
+                }, ensure_ascii=False)
+            # If approved or preview failed gracefully, continue with actual edit
         import json as _json
 
         # GAP-3: Record tool call to session event buffer for memory distillation.
@@ -1178,14 +1324,30 @@ class EvoCLIAgent:
         try:
             from evocli_soul.context_engine import ContextEngine
             ctx_engine = ContextEngine(self.bridge)
+
+            # Inject /add-ed files into context params (Aider /add pattern)
+            try:
+                import evocli_soul.state as _st_add
+                added_files = _st_add.get_added_files(session_id)
+                if added_files:
+                    # Build a "@file:path" prefix for each added file so context_engine
+                    # picks them up as @mention providers (highest priority context)
+                    add_prefix = " ".join(f"@file:{f}" for f in added_files[:5])  # max 5
+                    enriched_goal = f"{add_prefix}\n\n{user_input}"
+                    log.debug("_build_context: injecting %d /add-ed files", len(added_files))
+                else:
+                    enriched_goal = user_input
+            except Exception:
+                enriched_goal = user_input
+
             return await ctx_engine.build({
-                "goal":             user_input,
+                "goal":             enriched_goal,
                 "project_id":       (context_params or {}).get("project_id", "."),
                 "current_file":     (context_params or {}).get("current_file"),
                 "git_diff":         (context_params or {}).get("git_diff", ""),
-                "history":          history or [],   # real history, not hardcoded []
+                "history":          history or [],
                 "active_tools":     list(self._TOOL_TO_RPC.keys()),
-                "session_id":       session_id,      # for context cache keying
+                "session_id":       session_id,
             })
         except Exception as e:
             log.debug("Context build failed: %s", e)
@@ -1539,17 +1701,48 @@ class EvoCLIAgent:
                         pass  # Non-fatal: never break the tool loop
 
         # Tool iteration limit reached — give the user actionable context.
-        # This usually means the AI got stuck in a reflection/retry loop, or
-        # the task is too complex for a single agent invocation.
-        log.warning("_run_litellm: max tool iterations (10) reached. reflection_count=%d", reflection_count)
+        # Check if tests/lint were still failing when we hit the limit.
+        last_test_status = "unknown"
+        for msg in reversed(conversation):
+            c = str(msg.get("content", ""))
+            if "FAILED" in c or "✗" in c or "test_failed" in c.lower():
+                last_test_status = "failing"
+                break
+            if "✓" in c or "passed" in c.lower() or "All tests" in c:
+                last_test_status = "passing"
+                break
+
+        log.warning("_run_litellm: max tool iterations (%d) reached. reflections=%d last_test=%s",
+                    MAX_TOOL_CALLS, reflection_count, last_test_status)
+
+        if last_test_status == "failing":
+            return (
+                f"⚠️ **Reached the tool call limit ({MAX_TOOL_CALLS} iterations) "
+                f"but tests/checks are STILL FAILING.**\n\n"
+                f"**Do not treat this as complete** — the code changes may be broken.\n\n"
+                f"Next steps:\n"
+                f"1. Run `{self._detect_test_cmd()}` manually to see current errors\n"
+                f"2. Break the task into smaller steps and try again\n"
+                f"3. Use `/compress` then describe the specific failing test\n\n"
+                f"Reflection retries exhausted: {reflection_count}/{MAX_REFLECTIONS}"
+            )
         return (
-            "⚠️ **Reached the maximum tool call limit (10 iterations).**\n\n"
-            "This usually means:\n"
-            "1. The task is complex and needs to be broken into smaller steps\n"
-            "2. A tool kept failing and the reflection loop exhausted retries\n"
-            "3. Try rephrasing the request or using `/compress` to start fresh\n\n"
-            "Check `F12` logs for details on which tools were called."
+            f"⚠️ **Reached the maximum tool call limit ({MAX_TOOL_CALLS} iterations).**\n\n"
+            f"This usually means the task is too complex for one invocation.\n"
+            f"Try breaking it into smaller steps or using `/compress` to free context."
         )
+
+    def _detect_test_cmd(self) -> str:
+        """Guess the test command from project files (best-effort)."""
+        import os
+        cwd = os.getcwd()
+        if os.path.exists(os.path.join(cwd, "Cargo.toml")):
+            return "cargo test"
+        if os.path.exists(os.path.join(cwd, "package.json")):
+            return "npm test"
+        if os.path.exists(os.path.join(cwd, "pyproject.toml")) or os.path.exists(os.path.join(cwd, "setup.py")):
+            return "pytest"
+        return "your test command"
     
     async def _stream_litellm(self, user_input: str, ctx: dict,
                                prior_history: list[dict] | None = None) -> AsyncGenerator[str, None]:
@@ -1628,6 +1821,20 @@ class EvoCLIAgent:
                     "start_line": {"type": "integer", "description": "First line (1-indexed). Omit or 0 = start of file."},
                     "end_line":   {"type": "integer", "description": "Last line inclusive (1-indexed). Omit or 0 = end of file."},
                 }, "required": ["path"]},
+            }},
+            {"type": "function", "function": {
+                "name": "fs_read_symbol",
+                "description": (
+                    "Read the source code of a specific function/class/symbol by name. "
+                    "PREFER over fs_read_range when you know the symbol name. "
+                    "Much faster than reading entire files — finds the symbol via code index "
+                    "and returns just that section with surrounding context."
+                ),
+                "parameters": {"type": "object", "properties": {
+                    "symbol_name":   {"type": "string", "description": "Function/class/variable name to find"},
+                    "path":          {"type": "string", "description": "Optional file path hint to narrow search"},
+                    "context_lines": {"type": "integer", "description": "Lines of context around the symbol (default 10)"},
+                }, "required": ["symbol_name"]},
             }},
             {"type": "function", "function": {"name": "fs_apply_diff", "description": "Apply unified diff to a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "diff": {"type": "string"}, "dry_run": {"type": "boolean"}}, "required": ["path", "diff"]}}},
             {"type": "function", "function": {"name": "shell_run", "description": "Run a shell command (restricted whitelist)", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}, "cwd": {"type": "string"}, "timeout_s": {"type": "integer"}}, "required": ["cmd"]}}},

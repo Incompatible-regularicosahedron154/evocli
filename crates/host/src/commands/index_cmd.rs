@@ -72,6 +72,9 @@ fn index_with_progress(
     total_files: usize,
 ) -> Result<usize> {
     use ignore::Walk;
+    use crate::tool_dispatch::load_evocliignore;
+
+    let ignore_patterns = load_evocliignore();
 
     let mut index = code_intel::CodeIndex::new(db_path)?;
     let mut symbols = 0usize;
@@ -84,10 +87,12 @@ fn index_with_progress(
         let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or("");
         if !extensions.contains(&ext) { continue; }
 
+        // Respect .evocliignore
+        if crate::tool_dispatch::is_ignored(entry.path(), &ignore_patterns) { continue; }
+
         symbols += index.index_file(entry.path()).unwrap_or(0);
         files_done += 1;
 
-        // Print progress every 100 files or every 3 seconds
         if files_done % 100 == 0 || last_print.elapsed().as_secs() >= 3 {
             if total_files > 0 {
                 let pct = files_done * 100 / total_files;
@@ -101,7 +106,6 @@ fn index_with_progress(
         }
     }
 
-    // Clear the progress line
     if files_done > 0 {
         print!("\r");
         use std::io::Write;

@@ -67,6 +67,16 @@ pub struct SafetyConfig {
     /// Shell command whitelist patterns (legacy field, now merged into security.extra_allowed)
     #[serde(default = "default_shell_whitelist")]
     pub shell_whitelist: Vec<String>,
+    /// Show a unified diff and ask for confirmation before applying any file edit.
+    /// Prevents surprise changes. Mirrors Cursor's "preview before apply" behavior.
+    ///
+    /// Example config.toml:
+    /// ```toml
+    /// [safety]
+    /// require_diff_preview = true
+    /// ```
+    #[serde(default)]
+    pub require_diff_preview: bool,
 }
 
 /// 安全策略配置（config.toml [security] 节）
@@ -311,8 +321,9 @@ impl Default for SecurityConfig {
 impl Default for SafetyConfig {
     fn default() -> Self {
         Self {
-            auto_approve_writes: false,
-            shell_whitelist: default_shell_whitelist(),
+            auto_approve_writes:  false,
+            shell_whitelist:      default_shell_whitelist(),
+            require_diff_preview: false,
         }
     }
 }

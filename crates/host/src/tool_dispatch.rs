@@ -122,9 +122,12 @@ pub async fn dispatch(req: &ToolCallRequest, bridge: Option<&SoulBridge>, cfg: &
 
         // ── 搜索工具 ─────────────────────────────────────────
         "search.code" => {
-            let query = args["query"].as_str().unwrap_or("");
-            let path  = args["path"].as_str().map(PathBuf::from).unwrap_or(cwd.clone());
-            let results = search_code(query, &path)?;
+            let query    = args["query"].as_str().unwrap_or("");
+            let path     = args["path"].as_str().map(PathBuf::from).unwrap_or(cwd.clone());
+            let ignore   = load_evocliignore();
+            let mut results = search_code(query, &path)?;
+            // Filter out paths matching .evocliignore patterns
+            results.retain(|m| !is_ignored(std::path::Path::new(&m.file), &ignore));
             Ok(serde_json::to_value(results)?)
         }
 
@@ -838,6 +841,70 @@ fn search_code(query: &str, root: &std::path::Path) -> Result<Vec<SearchMatch>> 
 }
 
 // ── FIX-5: 单元测试 ──────────────────────────────────────────────────────────
+
+/// Load ignore patterns from .evocliignore (project) and ~/.evocli/ignore (global).
+/// Returns a pathspec-compatible list of glob patterns to exclude.
+///
+/// File format: same as .gitignore — one pattern per line, # for comments.
+/// This is used by search.code, shell.grep, and index to filter out noise
+/// (node_modules, build artifacts, generated code, etc.).
+pub fn load_evocliignore() -> Vec<String> {
+    let mut patterns: Vec<String> = Vec::new();
+
+    // Built-in always-ignored paths (saves users from having to list them)
+    let builtins = [
+        "node_modules/", "target/", ".git/", "dist/", "build/",
+        "__pycache__/", ".pytest_cache/", ".mypy_cache/",
+        "*.pyc", "*.pyo", "*.class", "*.min.js", "*.min.css",
+    ];
+    for p in &builtins { patterns.push(p.to_string()); }
+
+    // Project-level .evocliignore
+    let project_ignore = std::path::Path::new(".evocliignore");
+    if let Ok(content) = std::fs::read_to_string(project_ignore) {
+        for line in content.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                patterns.push(line.to_string());
+            }
+        }
+    }
+
+    // Global ~/.evocli/ignore
+    if let Some(home) = dirs::home_dir() {
+        let global_ignore = home.join(".evocli").join("ignore");
+        if let Ok(content) = std::fs::read_to_string(global_ignore) {
+            for line in content.lines() {
+                let line = line.trim();
+                if !line.is_empty() && !line.starts_with('#') {
+                    patterns.push(line.to_string());
+                }
+            }
+        }
+    }
+
+    patterns
+}
+
+/// Check if a path should be excluded based on evocliignore patterns.
+pub fn is_ignored(path: &std::path::Path, patterns: &[String]) -> bool {
+    let path_str = path.to_string_lossy();
+    let path_str_fwd = path_str.replace('\\', "/");
+    for pattern in patterns {
+        let pat = pattern.trim_end_matches('/');
+        // Simple glob: check if path contains the pattern segment or matches suffix
+        if path_str_fwd.contains(pat) || path_str_fwd.ends_with(pat) {
+            return true;
+        }
+        // Wildcard extension patterns (e.g. *.pyc)
+        if pat.starts_with("*.") {
+            let ext = &pat[1..]; // ".pyc"
+            if path_str_fwd.ends_with(ext) { return true; }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

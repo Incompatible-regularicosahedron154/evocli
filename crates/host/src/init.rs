@@ -15,6 +15,67 @@ use crate::keystore::KeyStore;
 /// Available LLM providers
 const PROVIDERS: &[&str] = &["Anthropic", "OpenAI", "DeepSeek", "Ollama"];
 
+/// Generate a starter AGENTS.md template for the current project.
+/// The AI reads this file automatically at the start of every session.
+fn generate_agents_md_template() -> String {
+    // Try to detect project type for a more helpful template
+    let is_rust   = std::path::Path::new("Cargo.toml").exists();
+    let is_python = std::path::Path::new("pyproject.toml").exists()
+                 || std::path::Path::new("setup.py").exists();
+    let is_node   = std::path::Path::new("package.json").exists();
+
+    let lang_rules = if is_rust {
+        "- Always use `anyhow::Result` for error handling\n\
+         - Never use `.unwrap()` — use `?` or `.context()`\n\
+         - Prefer `Arc<T>` over `Rc<T>` for shared ownership\n\
+         - Run `cargo clippy` after every change\n"
+    } else if is_python {
+        "- Use type hints on all function signatures\n\
+         - Prefer `pathlib.Path` over `os.path`\n\
+         - Use `logging` not `print()` in library code\n\
+         - All async functions must be properly awaited\n"
+    } else if is_node {
+        "- Use `const` and `let`, never `var`\n\
+         - Prefer `async/await` over callbacks\n\
+         - Use TypeScript strict mode\n\
+         - Run `npm run lint` after every change\n"
+    } else {
+        "- Follow existing code style\n\
+         - Run tests after every change\n"
+    };
+
+    format!(
+        "# AGENTS.md — Project Rules for EvoCLI\n\
+         #\n\
+         # This file is read by the AI at the start of every session.\n\
+         # Add project-specific rules, conventions, and constraints here.\n\
+         # The more specific, the better.\n\
+         \n\
+         ## Code Style\n\
+         {}\n\
+         ## Architecture\n\
+         - (Describe key architectural decisions here)\n\
+         - (E.g.: \"This project uses repository pattern — no direct DB calls in services\")\n\
+         \n\
+         ## Forbidden\n\
+         - Never commit directly to main/master\n\
+         - Never delete tests to make builds pass\n\
+         - Never use `TODO` comments without a linked issue\n\
+         \n\
+         ## Testing\n\
+         - Always run tests before declaring a task complete\n\
+         - Test command: {}\n\
+         \n\
+         ## Naming Conventions\n\
+         - (Describe naming conventions here)\n\
+         \n\
+         ## Notes\n\
+         - (Add any other context the AI should know about this project)\n",
+        lang_rules,
+        if is_rust { "cargo test" } else if is_python { "pytest" } else if is_node { "npm test" } else { "see README" }
+    )
+}
+
 /// Run the init wizard
 pub async fn run_init() -> Result<()> {
     println!();
@@ -154,7 +215,45 @@ pub async fn run_init() -> Result<()> {
     println!("  ✓ Config saved to {}", Config::path()?.display());
     println!();
 
-    // ── FIX-3: 首次验证流程 ──────────────────────────────
+    // ── Step 6: AGENTS.md project rules ─────────────────────────────
+    // AGENTS.md is the most impactful single config a user can create.
+    // It tells the AI what NOT to do, naming conventions, forbidden libs, etc.
+    // Without it, the AI guesses conventions and often gets them wrong.
+    println!("Step 6/6 — Project rules (AGENTS.md)");
+    let agents_md = std::path::Path::new("AGENTS.md");
+    if agents_md.exists() {
+        println!("  ✓ AGENTS.md already exists — AI will read it automatically.");
+    } else {
+        println!("  AGENTS.md tells the AI about your project's conventions.");
+        println!("  Example rules: 'Always use anyhow::Result', 'No unwrap()', 'Follow SOLID principles'.");
+        println!();
+
+        let create = dialoguer::Confirm::new()
+            .with_prompt("  Create AGENTS.md template now? (recommended)")
+            .default(true)
+            .interact()
+            .unwrap_or(true);
+
+        if create {
+            let template = generate_agents_md_template();
+            match std::fs::write("AGENTS.md", &template) {
+                Ok(()) => {
+                    println!("  ✓ Created AGENTS.md — edit it to add your project rules.");
+                    println!("  → Location: {}", std::env::current_dir().map(|d| d.join("AGENTS.md").display().to_string()).unwrap_or("AGENTS.md".into()));
+                }
+                Err(e) => {
+                    println!("  ⚠ Could not create AGENTS.md: {}", e);
+                    println!("  → Create it manually — see docs/AGENTS.md.example for template.");
+                }
+            }
+        } else {
+            println!("  Skipped. Create AGENTS.md later to improve AI code quality.");
+            println!("  → Template: docs/AGENTS.md.example");
+        }
+    }
+    println!();
+
+    // ── FIX-3: 首次验证流程 ──────────────────────────────────────
     println!("  Verifying installation...");
     let soul_path = crate::config::resolve_soul_path();
     let verification_ok = run_verification_check(&soul_path);

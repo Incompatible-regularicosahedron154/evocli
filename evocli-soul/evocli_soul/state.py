@@ -45,13 +45,38 @@ _files_read: dict[str, dict[str, int]] = {}  # session_id -> {path: turn}
 # ── Current turn counter (keyed by session_id) ────────────────────────────
 _current_turns: dict[str, int] = {}  # session_id -> turn_number
 
-# threading.Lock is intentionally used (not asyncio.Lock) because:
-# 1. asyncio runs in a single thread — no true preemption between tasks.
-# 2. The double-checked locking pattern prevents redundant initialization.
-# 3. The critical section only runs pure-Python imports/construction (no awaitable I/O).
-# 4. If initialization were ever made async (e.g., await LanceDB.connect()), this MUST
-#    be changed to asyncio.Lock to avoid event-loop blocking.
+# ── Explicitly added files (keyed by session_id) ──────────────────────────
+# Aider /add pattern: files pinned by user persist for the whole session.
+# They're injected into every turn's context automatically.
+_added_files: dict[str, list[str]] = {}  # session_id → [path, ...]
+
 _init_lock = threading.Lock()
+
+# ── Added files API ───────────────────────────────────────────────────────
+
+def add_file(path: str, session_id: str = "default") -> None:
+    """Pin a file to session context (Aider /add pattern)."""
+    if session_id not in _added_files:
+        _added_files[session_id] = []
+    if path not in _added_files[session_id]:
+        _added_files[session_id].append(path)
+
+
+def get_added_files(session_id: str = "default") -> list[str]:
+    """Return all pinned files for a session."""
+    return list(_added_files.get(session_id, []))
+
+
+def remove_added_files(session_id: str, paths: list[str]) -> list[str]:
+    """Remove specific files from pinned context. Returns actually removed paths."""
+    existing = _added_files.get(session_id, [])
+    removed = [p for p in paths if p in existing]
+    _added_files[session_id] = [p for p in existing if p not in paths]
+    return removed
+
+
+def clear_added_files(session_id: str = "default") -> None:
+    _added_files.pop(session_id, None)
 
 # ── History API ───────────────────────────────────────────────────────────
 
@@ -62,13 +87,43 @@ def get_history(session_id: str = "default") -> list[dict]:
 
 def append_history(messages: list[dict], session_id: str = "default") -> None:
     """Append user+assistant messages to session history.
-    
+
     Only call with user/assistant role messages — not tool messages.
-    Tool messages bloat history without adding recall value for future turns.
+
+    Large content (e.g. assistant replies with embedded code blocks) is
+    automatically summarised to keep history lean:
+    - user messages    > TOOL_RESULT_PRUNE_CHARS: truncated to first 400 chars
+    - assistant messages > TOOL_RESULT_PRUNE_CHARS: kept but tail truncated
+    This prevents multi-turn history from ballooning with prior file reads
+    that the model has already processed (Cline deduplication pattern).
     """
+    _TOOL_RESULT_PRUNE_CHARS = 2000  # ~500 tokens — above this we summarise
     if session_id not in _conversation_histories:
         _conversation_histories[session_id] = []
-    _conversation_histories[session_id].extend(messages)
+
+    pruned: list[dict] = []
+    for msg in messages:
+        role    = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) > _TOOL_RESULT_PRUNE_CHARS:
+            if role == "user":
+                # User messages that are too long are usually context-injected file reads.
+                # Keep the first 400 chars (the actual user question) + a note.
+                truncated = content[:400].rstrip()
+                note = f"\n\n[Note: message truncated from {len(content)} chars — original content visible to AI in that turn only]"
+                pruned.append({**msg, "content": truncated + note})
+            elif role == "assistant":
+                # Assistant replies with large code generation: keep first + last sections
+                head = content[:600]
+                tail = content[-300:]
+                note = f"\n[... {len(content) - 900} chars omitted from history ...]\n"
+                pruned.append({**msg, "content": head + note + tail})
+            else:
+                pruned.append(msg)
+        else:
+            pruned.append(msg)
+
+    _conversation_histories[session_id].extend(pruned)
 
 
 def clear_history(session_id: str = "default") -> None:
@@ -78,6 +133,7 @@ def clear_history(session_id: str = "default") -> None:
     _anchored_summaries.pop(session_id, None)
     _files_read.pop(session_id, None)
     _current_turns.pop(session_id, None)
+    # Note: _added_files intentionally NOT cleared — user's /add persists across /compress
 
 
 def get_history_token_estimate(session_id: str = "default") -> int:
@@ -301,3 +357,4 @@ def reset_all() -> None:
     _anchored_summaries.clear()
     _files_read.clear()
     _current_turns.clear()
+    _added_files.clear()

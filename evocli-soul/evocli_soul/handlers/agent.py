@@ -118,6 +118,68 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
         await send.stream_chunk(req_id, "ERROR: prompt is required", done=True)
         return
 
+    # ── /add <file> [<file2> ...] — explicit file context loading ────────────
+    # Aider pattern: users declare which files should always be in context.
+    # Loaded files persist for the entire session (stored in state per session_id).
+    # Usage: /add src/auth.rs            → adds one file
+    #        /add src/auth.rs src/user.rs → adds multiple files
+    #        /add list                    → show currently added files
+    #        /add clear                   → remove all added files
+    _prompt_stripped = prompt.strip()
+    if _prompt_stripped.lower().startswith("/add"):
+        import evocli_soul.state as _st_add
+        import os as _os_add, hashlib as _hashlib_add
+        _add_sid = (params.get("session_id") or
+                    "cwd_" + _hashlib_add.md5(_os_add.getcwd().encode(),
+                                               usedforsecurity=False).hexdigest()[:12])
+        _add_args = _prompt_stripped.split()[1:]  # everything after /add
+
+        if not _add_args or _add_args[0].lower() == "list":
+            files = _st_add.get_added_files(_add_sid)
+            if files:
+                file_list = "\n".join(f"  • {f}" for f in files)
+                await send.stream_chunk(req_id,
+                    f"**Files in context ({len(files)}):**\n{file_list}\n\n"
+                    f"Use `/add clear` to remove all, or `/add <file>` to add more.",
+                    done=True)
+            else:
+                await send.stream_chunk(req_id,
+                    "No files explicitly added to context.\n"
+                    "Use `/add <path>` to pin files across all turns.",
+                    done=True)
+            return
+
+        if _add_args[0].lower() == "clear":
+            _st_add.clear_added_files(_add_sid)
+            await send.stream_chunk(req_id, "✓ Cleared all added files from context.", done=True)
+            return
+
+        if _add_args[0].lower() == "remove" and len(_add_args) > 1:
+            removed = _st_add.remove_added_files(_add_sid, _add_args[1:])
+            await send.stream_chunk(req_id,
+                f"✓ Removed {len(removed)} file(s) from context.", done=True)
+            return
+
+        # Add the specified files
+        added, missing = [], []
+        for f in _add_args:
+            if _os_add.path.exists(f):
+                _st_add.add_file(_add_sid, f)
+                added.append(f)
+            else:
+                missing.append(f)
+
+        all_files = _st_add.get_added_files(_add_sid)
+        msg = ""
+        if added:
+            msg += f"✓ Added to context: {', '.join(added)}\n"
+        if missing:
+            msg += f"⚠ Not found: {', '.join(missing)}\n"
+        msg += f"\n**Context files ({len(all_files)}):** {', '.join(all_files)}\n"
+        msg += "These files will be injected into every turn automatically."
+        await send.stream_chunk(req_id, msg, done=True)
+        return
+
     # ── GAP-2: /compress slash-command ───────────────────────────────────────
     # Compacts accumulated session context into an Anchored Summary.
     # Does NOT require `history` in params — instead summarizes what the agent
