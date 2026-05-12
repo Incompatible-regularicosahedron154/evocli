@@ -1718,8 +1718,9 @@ class EvoCLIAgent:
             except Exception as e:
                 log.warning("Pydantic AI stream failed (%s), falling back", e)
 
-        # Fallback: pass history to _stream_litellm for proper multi-turn context
-        async for chunk in self._stream_litellm(full_input, ctx, prior_history=prior_history):
+        # Fallback: full_input already has history embedded via _inject_context;
+        # _stream_litellm uses system+user message format (history not re-injected).
+        async for chunk in self._stream_litellm(full_input, ctx, prior_history=None):
             yield chunk
     
     async def _run_litellm(self, user_input: str, ctx: dict,
@@ -1753,9 +1754,10 @@ class EvoCLIAgent:
         conversation = [
             {"role": "system", "content": system},
         ]
-        if prior_history:
-            conversation.extend(prior_history)
-            log.debug("_run_litellm: injecting %d history messages", len(prior_history))
+        # Do NOT inject prior_history into the messages array — history is already
+        # embedded in user_input (enriched by _inject_context from _build_context).
+        # Injecting prior_history here would double the history content.
+        # (prior_history param is kept for API compatibility but intentionally unused.)
         conversation.append({"role": "user", "content": user_input})
         
         tools = self._build_tool_definitions()
@@ -1946,9 +1948,9 @@ class EvoCLIAgent:
 
         # Build messages: [system] + [prior history] + [current user turn]
         messages: list[dict] = [{"role": "system", "content": system}]
-        if prior_history:
-            messages.extend(prior_history)
-            log.debug("_stream_litellm: injecting %d history messages", len(prior_history))
+        # Do NOT extend messages with prior_history here — history is already embedded
+        # in user_input (via _inject_context / user_context). Adding it again as
+        # separate message turns would double the history in the conversation array.
         messages.append({"role": "user", "content": user_input})
         # Read stream timeout from config [agent] section (default 30s)
         _stream_timeout = float((self.config or {}).get("agent", {}).get("stream_timeout_s", 30))
@@ -2039,7 +2041,7 @@ class EvoCLIAgent:
             )
             if text_yielded:
                 yield "\n\n"  # separate any streamed preamble from tool result
-            tool_result = await self._run_litellm(user_input, ctx, prior_history=prior_history)
+            tool_result = await self._run_litellm(user_input, ctx, prior_history=None)
             if tool_result:
                 yield tool_result
 

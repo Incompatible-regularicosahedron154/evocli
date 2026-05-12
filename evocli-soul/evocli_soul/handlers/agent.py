@@ -403,7 +403,7 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
                     fallback_prompt = await agent._inject_context(prompt, fallback_ctx)
                 except Exception:
                     fallback_prompt = prompt
-                async for chunk in agent._stream_litellm(fallback_prompt, fallback_ctx, prior_history=prior_history):
+                async for chunk in agent._stream_litellm(fallback_prompt, fallback_ctx, prior_history=None):
                     if chunk:
                         await send.stream_chunk(req_id, chunk, done=False)
                         chunks_sent += 1
