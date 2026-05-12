@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Stability / Usability / Functionality (2026-05-12)
+
+**Tool use routing (critical)**
+- `_stream_litellm`: was calling `acompletion()` without `tools=`, making `finish_reason="tool_calls"` structurally unreachable. Now passes full tool schemas to streaming call. Provider compat guard retries without `tools=` on keyword-detected rejection errors (`_tools_in_stream` flag prevents dead routing after degradation).
+- `tool_call_seen`: stream loop now tracks `delta.tool_calls` in addition to `finish_reason`, so tool routing fires even when a model streams prose before requesting tools.
+
+**History — single-injection guarantee (all paths)**
+- History is now embedded in `full_input` via `_build_context` → `_inject_context` exactly once, for all LLM paths (pydantic-ai, `_stream_litellm`, `_run_litellm`).
+- Removed `messages.extend(prior_history)` from `_stream_litellm` and `conversation.extend(prior_history)` from `_run_litellm` — both were double-injecting history already present in `full_input`.
+- Removed `message_history=prior_history` from pydantic-ai `run_stream()` call — plain `{role, content}` dicts are not typed `ModelMessage` objects; passing both caused potential double-injection.
+
+**Session continuity**
+- `handle_agent_run()`: `EvoCLIAgent` now constructed with `session_id` derived from cwd-hash (matching stream path). Previously always used `"default"` session bucket.
+- `agent.run()`: loads `get_history(session_id)` from state before `_build_context` so non-streaming path has multi-turn context.
+- `agent.run()`: persists `[user, assistant]` turn in both pydantic-ai and LiteLLM paths. Removed duplicate persistence from `handlers/agent.py` (ownership now in `agent.run()` only).
+
+**`/compress` — full fix**
+- Compress prompt now uses real `prior_history` (last 20 turns) instead of the literal string `"/compress"` as the summary source.
+- `context_engine.py`: `anchored_summary` is now injected unconditionally before the history block, so it survives `clear_history()` after `/compress`. Previously it only injected inside `if history and remaining > 0`, meaning compressed sessions lost their summary on the very next turn.
+- Token double-count fixed: `_already_counted` tracks anchor tokens before the history block; `used` is now incremental only.
+- `_maybe_compress_history()`: no longer writes `summary_msgs` back into history as `[user, assistant]` pair — summary lives exclusively in `_anchored_summaries` and is injected by `context_engine` unconditionally.
+
+**`/add` command**
+- Fixed argument order: `add_file(_add_sid, f)` → `add_file(f, _add_sid)`. Was silently writing files to wrong session bucket, so pinned files were never retrieved.
+
+**Prompt pipeline — DO-NOW rules reach all LLM paths**
+- `context_engine.py` system_prompt assembly now uses `build_system_prompt()` as base, so `SYSTEM_WORKFLOW` DO-NOW rules, tool ordering, and failure recovery instructions are present in every LLM call (pydantic-ai and both LiteLLM paths). Previously the LiteLLM paths built their own inline prompt starting with `"你是 EvoCLI..."`, discarding all workflow rules.
+- `_build_context()`: passes `read_only=self.read_only` through to `ctx_engine.build()` so read-only mode uses the correct system prompt.
+
+**Stream fallback — user context not lost**
+- `handlers/agent.py` LiteLLM fallback now calls `agent._inject_context(prompt, fallback_ctx)` before `_stream_litellm`. Previously passed raw `prompt` without file contents / diff / history from `user_context`.
+
+**Per-role LLM config — hardcoded params removed**
+- `_run_litellm`: `max_tokens`/`temperature` now read from `llm.get_task_params("agent")` instead of hardcoded `4096`/`0.7`.
+- `_stream_litellm`: reads from `get_task_params("stream")`.
+- `run_architect_mode()`: architect and editor now use `complete_for_task("architect"/"editor")` instead of `complete(tier=..., max_tokens=...)`.
+
+**Python config — project-local merge**
+- `llm_client._load_config_from_disk()`: deep-merges `{cwd}/.evocli/config.toml` over `~/.evocli/config.toml`. Mirrors Rust host `config.rs` merge logic.
+- `state.get_config()`: same deep-merge so all handlers and agents see effective per-project configuration.
+
+**Auto-continue — disabled (protocol incompatibility)**
+- Auto-continue fired after `done=True` was already sent to the TUI. Rust TUI breaks its stream loop on `done=True` (lib.rs:218), so all followup chunks were silently dropped. Disabled with `if False` guard and TODO comment for proper re-implementation that defers `done=True` until the full turn completes.
+
+**Tool whitelist**
+- Added `cd`, `rust-analyzer`, `pnpm`, `yarn`, `gofmt`, `gopls`, and 25+ other common dev tools to `ALLOWED_PREFIXES` in `crates/tools/src/lib.rs`.
+
+**New tools**
+- `fs_read_range`: read a specific line range from a file (avoids loading large files for small edits).
+- `/help` and `/?` slash commands in TUI chat.
+
 ## [0.1.0] — 2026-05-12
 
 ### Added

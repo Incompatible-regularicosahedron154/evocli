@@ -4,9 +4,11 @@ All configuration options for EvoCLI. The config file lives at `~/.evocli/config
 
 **Priority** (highest to lowest):
 1. Environment variables
-2. Project config `{project}/.evocli/config.toml`
+2. Project config `{project}/.evocli/config.toml`  ← deep-merged over global
 3. Global config `~/.evocli/config.toml`
 4. Built-in defaults
+
+Both the Rust host and the Python Soul read this merged config, so project-level overrides apply to all LLM calls, routing decisions, and agent parameters.
 
 Run `evocli init` for an interactive setup wizard. See `docs/config.toml.example` for a full annotated example.
 
@@ -14,51 +16,136 @@ Run `evocli init` for an interactive setup wizard. See `docs/config.toml.example
 
 ## `[llm]` — Language Model
 
+EvoCLI uses the OpenAI-compatible protocol for all providers. There is no `provider` field — set `base_url` and `api_key` directly.
+
 ```toml
 [llm]
-provider = "anthropic"   # "anthropic" | "openai" | "deepseek" | "ollama"
+# API key — or set via environment variable (see below)
+# api_key = "sk-..."
 
-# API key (prefer system keyring via `evocli init`)
-# api_key = "sk-ant-..."
+# Base URL for your provider's API endpoint
+# OpenAI:    https://api.openai.com/v1
+# Anthropic: https://api.anthropic.com      (OpenAI-compat mode)
+# DeepSeek:  https://api.deepseek.com/v1
+# Ollama:    http://localhost:11434/v1       (no key needed)
+# base_url = "https://api.openai.com/v1"
 
-# Custom API base URL (for proxies or self-hosted)
-# base_url = "https://your-proxy.com/v1"
-
-[llm.tiers]
-# Fast tier: quick tasks, commit messages, lint fixes
-fast  = "claude-3-5-haiku-latest"   # or "gpt-4o-mini", "deepseek-chat"
-
-# Smart tier: complex reasoning, architecture, refactoring
-smart = "claude-sonnet-4-5-20250514"  # or "gpt-4o", "deepseek-reasoner"
+# Default models (used when no task/role override applies)
+fast  = "gpt-4o-mini"            # quick tasks — commit messages, Q&A, lint
+smart = "gpt-4o"                 # complex work — refactoring, architecture
 ```
 
 **Environment variable alternatives** (override `api_key`):
 ```bash
-ANTHROPIC_API_KEY="sk-ant-..."
 OPENAI_API_KEY="sk-..."
+ANTHROPIC_API_KEY="sk-ant-..."
 DEEPSEEK_API_KEY="..."
 ```
 
-**Provider notes**:
-- `anthropic`: Claude models. Requires `ANTHROPIC_API_KEY`.
-- `openai`: GPT models. Requires `OPENAI_API_KEY`. Works with any OpenAI-compatible API via `base_url`.
-- `deepseek`: DeepSeek models. Requires `DEEPSEEK_API_KEY`.
-- `ollama`: Local models. Set `base_url = "http://localhost:11434"`. No API key needed.
+---
+
+## `[llm.tasks]` — Task Routing
+
+Route specific task types to a model tier or exact model name. Falls back to the global `fast`/`smart` if not set.
+
+```toml
+[llm.tasks]
+# Values: "fast" | "smart" | any exact model name
+commit  = "fast"     # auto-commit message generation
+lint    = "fast"     # lint-fix loop
+stream  = "fast"     # streaming chat responses
+agent   = "smart"    # agent tool-calling loop
+architect = "smart"  # architect step in architect/editor mode
+editor  = "fast"     # editor step in architect/editor mode
+```
 
 ---
 
-## `[llm.tiers]` — Model Tiers
+## `[llm.params.<task>]` — Per-task Parameters
 
-EvoCLI routes requests to different models based on task complexity.
+Override `max_tokens` and `temperature` per task. Inherits global defaults if not set.
 
-| Tier | When used | Recommended |
-|---|---|---|
-| `fast` | Commit messages, lint, simple Q&A | claude-3-5-haiku, gpt-4o-mini |
-| `smart` | Refactoring, architecture, complex bugs | claude-sonnet-4-5, gpt-4o |
+```toml
+[llm.params.agent]
+max_tokens  = 4096
+temperature = 0.7
 
-Python code can specify tier explicitly:
-```python
-result = await llm.complete(prompt, tier="smart")
+[llm.params.stream]
+max_tokens  = 2048
+temperature = 0.7
+
+[llm.params.architect]
+max_tokens  = 2000
+temperature = 0.3   # lower = more deterministic plans
+
+[llm.params.editor]
+max_tokens  = 4000
+temperature = 0.2   # lower = more precise SEARCH/REPLACE blocks
+```
+
+---
+
+## `[llm.roles.<name>]` — Per-role Model Config
+
+Override model, base_url, and api_key for individual agent roles. Highest priority — overrides everything else for that role.
+
+This enables multi-provider setups, e.g. Anthropic for the architect role and DeepSeek for the editor role.
+
+```toml
+[llm.roles.architect]
+model    = "claude-opus-4-5"
+base_url = "https://api.anthropic.com"
+api_key  = "sk-ant-..."
+
+[llm.roles.editor]
+model    = "deepseek-coder"
+base_url = "https://api.deepseek.com/v1"
+api_key  = "..."
+
+[llm.roles.commit]
+model = "gpt-4o-mini"
+# inherits base_url and api_key from [llm] global
+```
+
+**Resolution order** (highest wins):
+1. `[llm.roles.<task>]` — role-specific provider/model/key
+2. `[llm.tasks.<task>]` — task tier routing
+3. `[llm.params.<task>]` — task token/temperature
+4. `[llm]` global defaults
+
+---
+
+## `[llm.global_params]` — Global LLM Defaults
+
+```toml
+[llm.global_params]
+max_tokens  = 4096
+temperature = 0.7
+```
+
+---
+
+## `[agent]` — Agent Behavior
+
+```toml
+[agent]
+# Max tool calls per request (default: 20)
+max_tool_calls = 20
+
+# Max reflection loops for lint/test failures (default: 3)
+max_reflections = 3
+
+# Context-build timeout in seconds (default: 20)
+context_build_timeout_s = 20
+
+# Streaming LLM call timeout in seconds (default: 30)
+stream_timeout_s = 30
+
+# Nudge user to /compress after this many turns (default: 15)
+history_compress_turns = 15
+
+# Nudge user to /compress after estimated token count (default: 40000)
+history_compress_tokens = 40000
 ```
 
 ---
@@ -68,7 +155,6 @@ result = await llm.complete(prompt, tier="smart")
 ```toml
 [context]
 # Total token budget per request (default: 128,000)
-# Lower this for faster/cheaper responses with less context
 max_total = 128000
 
 # Max tokens allocated to code context (symbols, current file)
@@ -79,6 +165,7 @@ max_code = 32000
 - P1 constraints: 4,000 tokens
 - P2 tool patterns: 2,000 tokens
 - P3 global prefs: 1,500 tokens
+- Anchored summary (after /compress): up to 2,000 tokens
 - Code context: up to `max_code`
 - Remaining: conversation history
 
@@ -139,8 +226,6 @@ extra_denied_paths = [
 ```toml
 [memory]
 # Maximum episodic memories to retain (default: 1,000)
-# Older memories are pruned when this limit is reached
-# Large projects benefit from higher values (e.g., 5,000)
 max_episodes = 1000
 ```
 
@@ -162,7 +247,6 @@ min_community_size = 2
 blast_radius_depth = 5
 
 # Reciprocal Rank Fusion k constant (default: 60.0)
-# Higher = more uniform ranking across BM25 and vector results
 rrf_k = 60.0
 
 # BM25 weight in hybrid search (default: 0.4)
@@ -193,26 +277,36 @@ soul_script = "/path/to/evocli-soul/evocli_soul/main.py"
 
 ## Project-local Config
 
-Create `{project}/.evocli/config.toml` to override settings for a specific project:
+Create `{project}/.evocli/config.toml` to override settings for a specific project. All sections support partial override — only fields you specify are changed.
 
 ```toml
-# .evocli/config.toml (project-level — checked into git is OK)
+# {project}/.evocli/config.toml
+# Safe to check into git (no secrets here — put api_key in global config or env)
 
-[llm.tiers]
-# Use a more powerful model for this complex project
-smart = "claude-opus-4-5"
+[llm]
+# Use a different model for this project
+fast  = "deepseek-chat"
+smart = "deepseek-reasoner"
+base_url = "https://api.deepseek.com/v1"
+
+[llm.roles.architect]
+# Use Claude for architecture on this project
+model    = "claude-opus-4-5"
+base_url = "https://api.anthropic.com"
+
+[agent]
+# This project's tool loop needs more room
+max_tool_calls = 30
 
 [context]
-# This project has a large codebase — increase budget
+# Large monorepo — increase code budget
 max_code = 64000
 
 [security]
-# This project needs Docker access
-extra_allowed_commands = ["docker", "docker-compose"]
+# This project needs Docker and kubectl
+extra_allowed_commands = ["docker", "docker-compose", "kubectl"]
 extra_denied_paths = ["/etc/", "/prod/"]
 ```
-
-Only the fields you specify are overridden. Everything else falls through to the global config.
 
 ---
 
@@ -221,8 +315,8 @@ Only the fields you specify are overridden. Everything else falls through to the
 | Variable | Purpose |
 |---|---|
 | `EVOCLI_SOUL` | Override path to Python Soul |
+| `OPENAI_API_KEY` | OpenAI / OpenAI-compatible API key |
 | `ANTHROPIC_API_KEY` | Anthropic API key |
-| `OPENAI_API_KEY` | OpenAI API key |
 | `DEEPSEEK_API_KEY` | DeepSeek API key |
 | `HF_ENDPOINT` | Hugging Face mirror URL (e.g., `https://hf-mirror.com`) |
 | `EVOCLI_RESUME_SESSION` | Session ID to resume on startup |
