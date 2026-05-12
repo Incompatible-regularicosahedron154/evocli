@@ -352,7 +352,6 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
 
         # ── Post-stream sanity check ──────────────────────────────────────────
         if chunks_sent == 0:
-            # The LLM returned a completely empty response (no content at all).
             log.warning("agent.stream completed but emitted 0 content chunks")
             await send.stream_chunk(
                 req_id,
@@ -364,6 +363,71 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
             return
 
         await send.stream_chunk(req_id, "", done=True)
+
+        # ── Auto-continue: detect "plan without execution" ────────────────────
+        # When the AI describes what it WILL do but the fallback path (_stream_litellm)
+        # ran without tool calling, we detect this pattern and automatically re-submit
+        # with a "please execute now" signal. This closes the loop so users don't have
+        # to manually say "ok go ahead" for safe read operations.
+        #
+        # Detection: response text contains future-tense planning phrases AND
+        # no tool calls were recorded this turn (no tool_called events).
+        #
+        # Only auto-continue for SAFE analysis operations (not destructive changes).
+        # Destructive operations should always wait for explicit user confirmation.
+        if collected_chunks:
+            assistant_reply = "".join(collected_chunks)
+            _PLAN_PHRASES = [
+                "我将", "我会先", "让我先", "首先我会", "我打算", "我需要先",
+                "I will", "Let me first", "I'll start", "I need to first",
+            ]
+            _SAFE_ONLY_CHECK = [
+                "删除", "重写", "重构整个", "修改所有", "清空",
+                "delete all", "rewrite all", "refactor entire",
+            ]
+            _is_planning = any(p in assistant_reply for p in _PLAN_PHRASES)
+            _is_destructive = any(d in assistant_reply for d in _SAFE_ONLY_CHECK)
+
+            # Check if any tools were actually called this turn
+            events = _st.drain_session_events()
+            _tools_called = any(e.get("type") in ("tool_called", "tool_done", "git_commit")
+                                 for e in events)
+            # Put events back since we drained them prematurely
+            for ev in events:
+                _st.append_session_event(ev)
+
+            if _is_planning and not _tools_called and not _is_destructive:
+                log.info("auto-continue: detected plan-without-execution, injecting follow-up")
+                # Emit hint to TUI
+                await emit_event("soul_status", {
+                    "status": "loading",
+                    "message": "⟳ 检测到规划但未执行，正在自动继续执行…",
+                })
+                # Inject auto-continue message into history and re-trigger
+                _st.append_history([
+                    {"role": "user",      "content": prompt},
+                    {"role": "assistant", "content": assistant_reply},
+                    {"role": "user",      "content": "好的，请现在立即执行上述分析/操作。"},
+                ], session_id)
+                # Re-submit via agent.run (non-streaming, has tool-calling loop)
+                try:
+                    followup_agent = EvoCLIAgent(state.get_bridge(), memory, cfg, session_id=session_id)
+                    followup_result = await followup_agent.run(
+                        "请现在立即执行你刚才描述的操作。",
+                        prior_history=_st.get_history(session_id),
+                    )
+                    # Stream the result to TUI
+                    if followup_result and followup_result.strip():
+                        await send.stream_chunk(req_id, "\n\n---\n\n", done=False)
+                        # Chunk the result for streaming feel
+                        chunk_size = 50
+                        for i in range(0, len(followup_result), chunk_size):
+                            await send.stream_chunk(req_id, followup_result[i:i+chunk_size], done=False)
+                        await send.stream_chunk(req_id, "", done=True)
+                        collected_chunks.append("\n\n---\n\n" + followup_result)
+                except Exception as _ac_err:
+                    log.debug("auto-continue failed (non-fatal): %s", _ac_err)
+                    # Fall through to normal history storage
 
         # ── Persist this turn to history ──────────────────────────────────────
         # Store user + assistant messages so next turn has full context.
