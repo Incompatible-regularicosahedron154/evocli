@@ -113,13 +113,7 @@ async def handle_agent_run(req_id: str, params: dict, send, state) -> None:
         cfg    = state.get_config()
         agent  = EvoCLIAgent(state.get_bridge(), state.get_memory(), cfg, session_id=_run_session_id)
         result = await agent.run(prompt)
-        # Persist this turn so subsequent calls have multi-turn context.
-        if result:
-            import evocli_soul.state as _st_run_persist
-            _st_run_persist.append_history([
-                {"role": "user",      "content": prompt},
-                {"role": "assistant", "content": str(result)},
-            ], _run_session_id)
+        # History persistence is owned by agent.run() itself — do NOT persist here.
         await send.response(req_id, {"text": str(result)})
     except Exception as e:
         log.exception("agent.run failed")

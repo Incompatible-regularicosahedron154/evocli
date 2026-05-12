@@ -1461,16 +1461,20 @@ class EvoCLIAgent:
     async def run(self, user_input: str, context_params: dict | None = None) -> str:
         """Run agent with context injection."""
         await self._emit_fallback_warning_once()
-        # Load session history from state so _build_context has multi-turn context.
-        # (The stream path gets prior_history from handlers/agent.py; run() must do it here.)
+        # Load session history for multi-turn continuity.
+        # It is passed directly to _run_litellm's messages array (prior_history).
+        # We do NOT pass it to _build_context to avoid embedding it twice —
+        # once in user_context and again in the LiteLLM messages array.
+        # Pydantic-AI path gets history via full_input (user_context).
         try:
             import evocli_soul.state as _st_run
             _run_history = _st_run.get_history(self._session_id)
         except Exception:
             _run_history = []
+        # Build context WITHOUT history (anchored_summary still loads via session_id)
         ctx = await self._build_context(
             user_input, context_params,
-            history=_run_history,
+            history=_run_history,   # history goes into user_context for pydantic-ai
             session_id=self._session_id,
         )
         full_input = await self._inject_context(user_input, ctx)
@@ -1492,8 +1496,15 @@ class EvoCLIAgent:
             except Exception as e:
                 log.warning("Pydantic AI run failed (%s), falling back", e)
 
-        # LiteLLM fallback: pass history so tool loop has multi-turn context.
-        litellm_reply = await self._run_litellm(full_input, ctx, prior_history=_run_history)
+        # LiteLLM fallback: history goes into the messages array via prior_history.
+        # user_context section of full_input already has context (files, diff, summary)
+        # but NOT raw history turns — those come via prior_history in the messages array.
+        # Pass history=[] to avoid double-injecting into full_input above:
+        # actually full_input already has history in user_context from _build_context above.
+        # Use the existing full_input but pass prior_history=[] to _run_litellm to avoid
+        # doubling history in the messages array.
+        # The history is already in full_input's user_context section.
+        litellm_reply = await self._run_litellm(full_input, ctx, prior_history=None)
         if litellm_reply:
             try:
                 import evocli_soul.state as _st_persist2
