@@ -1,0 +1,35 @@
+# Git line ending normalization
+# All text files are stored as LF in the repository (Linux/macOS standard)
+# Windows users get CRLF on checkout but commit LF
+# This prevents cargo fmt from seeing diffs due to CRLF vs LF
+
+* text=auto eol=lf
+
+# Rust source files — always LF
+*.rs text eol=lf
+
+# Python source files — always LF
+*.py text eol=lf
+
+# TOML / YAML / JSON config files — always LF
+*.toml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# Shell scripts — always LF
+*.sh   text eol=lf
+
+# PowerShell scripts — CRLF on Windows, LF on Linux (CI runs on Linux)
+*.ps1  text eol=crlf
+
+# Markdown / text docs — LF
+*.md   text eol=lf
+*.txt  text eol=lf
+
+# Binary files — no conversion
+*.exe  binary
+*.dll  binary
+*.so   binary
+*.png  binary
+*.jpg  binary
