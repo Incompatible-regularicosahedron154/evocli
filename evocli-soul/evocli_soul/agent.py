@@ -721,6 +721,39 @@ class EvoCLIAgent:
 
         # ── GitNexus-inspired knowledge graph tools ──────────────────────
         @agent.tool_plain
+        async def generate_community_summaries(max_communities: int = 20) -> str:
+            """
+            Generate LLM summaries for each code community (GraphRAG capability).
+
+            After indexing ('evocli index'), this builds a semantic understanding of
+            the codebase at the community level. Each community of related functions/classes
+            gets a natural language summary stored in project memory.
+
+            This enables answering global questions like:
+              "How does the authentication system work?"
+              "What are the main components of this codebase?"
+            without reading every file — the summaries are recalled from memory.
+
+            max_communities: number of communities to summarize (default 20)
+
+            Run once after major refactors to update the understanding.
+            """
+            try:
+                result = await bridge.call("code.generate_community_summaries", {
+                    "max_communities": max_communities,
+                })
+                if isinstance(result, dict):
+                    count = result.get("summaries_count", 0)
+                    return _json.dumps({
+                        "ok":      True,
+                        "message": f"Generated {count} community summaries. Now stored in project memory for future queries.",
+                        "count":   count,
+                    }, ensure_ascii=False)
+                return _json.dumps(result, ensure_ascii=False)
+            except Exception as e:
+                return _json.dumps({"error": str(e)}, ensure_ascii=False)
+
+        @agent.tool_plain
         async def code_hybrid_search(query: str, limit: int = 10) -> str:
             """
             Hybrid BM25 + vector search (GitNexus-style query tool).

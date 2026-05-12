@@ -53,12 +53,13 @@ CREATE TABLE IF NOT EXISTS symbols (
     line_end   INTEGER NOT NULL DEFAULT 0,
     signature  TEXT,
     language   TEXT NOT NULL,
+    body_hash  TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
 
--- Migration: add line_end if upgrading from old schema (idempotent)
+-- Migration: add line_end column if upgrading from old schema (idempotent)
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, kind);
 "#;
@@ -133,8 +134,9 @@ impl CodeIndex {
             .with_context(|| format!("Failed to open code_intel DB: {}", db_path.display()))?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(SCHEMA_EDGES)?;
-        // Migration: add line_end column if upgrading from old schema
+        // Migration: add columns for old schemas
         let _ = conn.execute_batch("ALTER TABLE symbols ADD COLUMN line_end INTEGER NOT NULL DEFAULT 0");
+        let _ = conn.execute_batch("ALTER TABLE symbols ADD COLUMN body_hash TEXT NOT NULL DEFAULT ''");
         Ok(Self { conn })
     }
 
@@ -180,29 +182,76 @@ impl CodeIndex {
             .execute("DELETE FROM symbols WHERE file = ?1", params![file_str])?;
 
         // ── Layer 1a: tree-sitter (primary, accurate AST-based) ──────
-        // Research: Aider switched ctags → tree-sitter for better symbol quality
         if let Some(ts_symbols) = crate::ts_indexer::extract_symbols(&content, ext) {
-            let tx = self.conn.transaction()?;
-            let mut count = 0usize;
-            for sym in &ts_symbols {
-                let id = Uuid::new_v4().to_string();
-                // Get signature (the full source line)
-                let line_idx = (sym.line.saturating_sub(1)) as usize;
-                let signature = content
-                    .lines()
-                    .nth(line_idx)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                tx.execute(
-                    "INSERT OR REPLACE INTO symbols (id, name, kind, file, line, line_end, signature, language, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![id, sym.name, sym.kind, file_str, sym.line, sym.line_end, signature, sym.language, now],
+            // Load existing body_hash per symbol name for this file (incremental skip)
+            let existing_hashes: std::collections::HashMap<String, (String, String)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT name, id, body_hash FROM symbols WHERE file = ?1"
                 )?;
+                let mut map = std::collections::HashMap::new();
+                let mut rows = stmt.query(params![file_str])?;
+                while let Some(row) = rows.next()? {
+                    let name: String = row.get(0)?;
+                    let id: String   = row.get(1)?;
+                    let hash: String = row.get(2).unwrap_or_default();
+                    map.insert(name, (id, hash));
+                }
+                map
+            };
+
+            let tx = self.conn.transaction()?;
+            let content_lines: Vec<&str> = content.lines().collect();
+            let mut count = 0usize;
+            let mut changed_symbols: Vec<String> = Vec::new(); // IDs needing edge rebuild
+
+            for sym in &ts_symbols {
+                let line_idx = (sym.line.saturating_sub(1)) as usize;
+                let signature = content_lines.get(line_idx).unwrap_or(&"").trim().to_string();
+
+                // Extract body for hash: from line_start to line_end (or line_start+50 estimate)
+                let body_end = if sym.line_end > sym.line {
+                    (sym.line_end as usize).min(content_lines.len())
+                } else {
+                    (line_idx + 50).min(content_lines.len())
+                };
+                let body_text = content_lines[line_idx..body_end].join("\n");
+
+                // SHA-256 of body content (use simple hash via std)
+                let body_hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    body_text.hash(&mut h);
+                    format!("{:x}", h.finish())
+                };
+
+                // Check if this symbol is unchanged (same name + same hash)
+                if let Some((existing_id, existing_hash)) = existing_hashes.get(&sym.name) {
+                    if *existing_hash == body_hash {
+                        // Symbol unchanged — skip re-insert and edge rebuild
+                        count += 1;
+                        continue;
+                    }
+                    // Changed — delete old entry so we can re-insert with new UUID
+                    tx.execute("DELETE FROM symbols WHERE id = ?1", params![existing_id])?;
+                    tx.execute("DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1", params![existing_id])?;
+                }
+
+                let id = Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT OR REPLACE INTO symbols (id, name, kind, file, line, line_end, signature, language, body_hash, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![id, sym.name, sym.kind, file_str, sym.line, sym.line_end, signature, sym.language, body_hash, now],
+                )?;
+                changed_symbols.push(sym.name.clone());
                 count += 1;
             }
             tx.commit()?;
-            self.populate_edges_for_file(file_path, &content, &file_str)?;
+
+            // Only rebuild edges for changed symbols (incremental)
+            if !changed_symbols.is_empty() {
+                self.populate_edges_for_file(file_path, &content, &file_str)?;
+            }
             return Ok(count);
         }
 
@@ -259,52 +308,102 @@ impl CodeIndex {
     }
 
     /// 填充文件中的调用边（caller → callee）。
-    /// 优化算法：先提取文件中出现的所有 symbol_name( 模式，
-    /// 再只查询这些名字对应的 symbols，避免 O(callers × all_symbols) 嵌套循环。
+    ///
+    /// 策略（优先级从高到低）：
+    ///   1. tree-sitter AST CallExpression（精确，支持 Rust/Python/JS/TS）
+    ///      → 解析真实调用节点，避免注释/字符串中的误报
+    ///   2. word-matching 启发式（fallback，覆盖不支持的语言）
+    ///      → 同之前的 Phase 1/2/3 实现
     fn populate_edges_for_file(
         &self,
         file_path: &Path,
         content: &str,
         file_str: &str,
     ) -> Result<()> {
-        // 获取当前文件中所有符号（作为潜在 caller）
         let callers = self.list_symbols(file_path)?;
         if callers.is_empty() {
             return Ok(());
         }
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-        // ── OPTIMIZATION: Two-phase approach to avoid O(N×M) complexity ──────────
-        //
-        // Old approach (O(callers × all_symbols)):
-        //   Load ALL symbols from project, then for each caller check body.contains(name)
-        //   100K symbols × 50 callers = 5M string searches per file → indexing hangs
-        //
-        // New approach (O(body_size + unique_call_names × log N)):
-        //   Phase 1: Extract all potential call sites from the file body (simple regex scan)
-        //   Phase 2: Query SQLite for only those exact symbol names — targeted lookup
-        //   This reduces the inner loop from "all project symbols" to "names that appear in file"
+        // ── Strategy A: tree-sitter AST call extraction (precise) ────────────────
+        if let Some(call_refs) = crate::ts_indexer::extract_calls(content, ext) {
+            if !call_refs.is_empty() {
+                // Collect unique callee names for targeted SQLite lookup
+                let callee_names: std::collections::HashSet<&str> =
+                    call_refs.iter().map(|c| c.callee_name.as_str()).collect();
+                let names_vec: Vec<&str> = callee_names.into_iter().collect();
 
-        // Phase 1: Collect all potential callee names from the entire file body.
-        // Pattern: alphanumeric/underscore token immediately followed by '('
-        // Use a simple character scan instead of regex to keep it dependency-free.
+                if names_vec.is_empty() {
+                    return Ok(());
+                }
+
+                // Batch lookup: only resolve names that appear as actual call targets
+                let placeholders = names_vec
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT id, name, file FROM symbols WHERE file != ?1 AND name IN ({})",
+                    placeholders
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                params.push(Box::new(file_str.to_string()));
+                for n in &names_vec {
+                    params.push(Box::new(n.to_string()));
+                }
+                let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+
+                let callee_map: std::collections::HashMap<String, String> = stmt
+                    .query_map(param_refs.as_slice(), |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, String>(0)?)) // name → id
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                if callee_map.is_empty() {
+                    return Ok(());
+                }
+
+                // Match each call_ref to a caller (by line range) and callee (by name)
+                // caller owns a call if the call line falls within [caller.line, caller.line_end or next_symbol.line)
+                let mut caller_sorted = callers.clone();
+                caller_sorted.sort_by_key(|s| s.line);
+
+                for call in &call_refs {
+                    let callee_id = match callee_map.get(&call.callee_name) {
+                        Some(id) => id,
+                        None => continue,
+                    };
+                    // Find which caller owns this call line
+                    let caller = caller_sorted.iter().rev().find(|s| s.line <= call.line);
+                    if let Some(c) = caller {
+                        let _ = self.add_edge(&c.id, callee_id, "calls", file_str, call.line);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        // ── Strategy B: word-matching fallback (for unsupported languages) ────────
+        // Phase 1: Collect all potential callee names from the file body
         let mut potential_callees: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for line in content.lines() {
-            // Find all "word(" patterns in the line
             let chars: Vec<char> = line.chars().collect();
             let mut i = 0usize;
             while i < chars.len() {
-                // Skip to start of a word (letter or underscore)
                 if chars[i].is_alphabetic() || chars[i] == '_' {
                     let start = i;
                     while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                         i += 1;
                     }
-                    // Check if followed by '('
                     if i < chars.len() && chars[i] == '(' {
                         let name: String = chars[start..i].iter().collect();
                         if name.len() >= 3 {
-                            // skip trivially short names
                             potential_callees.insert(name);
                         }
                     }
@@ -313,29 +412,21 @@ impl CodeIndex {
                 }
             }
         }
-
         if potential_callees.is_empty() {
             return Ok(());
         }
-
-        // Phase 2: Query SQLite only for the names we actually found in the file.
-        // This is a targeted lookup instead of loading all project symbols.
-        // SQLite IN clause with bound parameters handles up to 999 items safely.
         let names_vec: Vec<String> = potential_callees.into_iter().collect();
         let placeholders: String = names_vec
             .iter()
             .enumerate()
-            .map(|(i, _)| format!("?{}", i + 2)) // ?2, ?3, ... (after ?1 = file_str)
+            .map(|(i, _)| format!("?{}", i + 2))
             .collect::<Vec<_>>()
             .join(", ");
-
         let sql = format!(
             "SELECT id, name, file, line FROM symbols WHERE file != ?1 AND name IN ({})",
             placeholders
         );
-
         let mut stmt = self.conn.prepare(&sql)?;
-        // Bind file_str as ?1, then each name as ?2, ?3, ...
         let mut params_owned: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         params_owned.push(Box::new(file_str.to_string()));
         for name in &names_vec {
@@ -343,34 +434,28 @@ impl CodeIndex {
         }
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             params_owned.iter().map(|b| b.as_ref()).collect();
-
         let matched_callees: Vec<(String, String, String, u32)> = stmt
             .query_map(param_refs.as_slice(), |row| {
                 Ok((
-                    row.get::<_, String>(0)?, // id
-                    row.get::<_, String>(1)?, // name
-                    row.get::<_, String>(2)?, // file
-                    row.get::<_, u32>(3)?,    // line
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
                 ))
             })?
             .filter_map(|r| r.ok())
             .collect();
-
         if matched_callees.is_empty() {
             return Ok(());
         }
-
-        // Phase 3: For each caller, check which matched callees appear in its function body.
         for caller in &callers {
             let line_offset = caller.line.saturating_sub(1) as usize;
-            // Take up to 500 lines of function body (pragmatic limit — most functions are shorter)
             let body: String = content
                 .lines()
                 .skip(line_offset)
                 .take(500)
                 .collect::<Vec<_>>()
                 .join("\n");
-
             for (callee_id, callee_name, _callee_file, _callee_line) in &matched_callees {
                 let call_pattern = format!("{}(", callee_name);
                 if body.contains(call_pattern.as_str()) {

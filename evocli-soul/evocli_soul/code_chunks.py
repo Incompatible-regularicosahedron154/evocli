@@ -411,6 +411,122 @@ class CodeChunkIndex:
         except Exception as e:
             return {"total": 0, "error": str(e)}
 
+    async def generate_community_summaries(
+        self,
+        communities: list[dict],
+        llm_client,
+        project_id: str | None = None,
+        max_communities: int = 20,
+        max_symbols_per_community: int = 8,
+    ) -> list[dict]:
+        """
+        为每个代码社区生成 LLM 自然语言摘要（GraphRAG 的核心能力）。
+
+        communities: 来自 code_intel.communities RPC 的社区列表
+                     每项包含 {id, label, symbols: [symbol_name, ...], cohesion}
+        llm_client:  LLMClient 实例（用于生成摘要）
+        max_communities: 最多处理 N 个社区（按大小降序）
+
+        Returns: [{community_id, label, summary, symbols, stored_in_memory}, ...]
+
+        工作流程：
+          1. 取社区符号名 → 从 code_chunks 搜索对应代码体
+          2. 拼装 prompt → 发给 LLM（fast model，摘要任务）
+          3. 存入 memory_client（priority_scope="project"，memory_type="semantic"）
+             key: "社区摘要: {label}"
+          4. 返回摘要列表
+
+        这使 "这个项目的认证系统怎么工作？" 这类全局问题
+        可以直接检索到 LLM 生成的社区摘要，而不需要扫描所有代码。
+        """
+        pid = project_id or self.project_id
+        results = []
+
+        # Sort by size descending — larger communities tend to be more important
+        sorted_communities = sorted(
+            communities,
+            key=lambda c: len(c.get("symbols", [])),
+            reverse=True,
+        )[:max_communities]
+
+        for comm in sorted_communities:
+            comm_id  = comm.get("id", "")
+            label    = comm.get("label", comm_id)
+            symbols  = comm.get("symbols", [])[:max_symbols_per_community]
+
+            if not symbols:
+                continue
+
+            # Fetch code bodies for this community's symbols
+            bodies = self.get_bodies_for_symbols(symbols, project_id=pid)
+            if not bodies:
+                continue
+
+            # Build prompt with code snippets
+            snippets = []
+            for body_info in bodies[:max_symbols_per_community]:
+                sym_name = body_info.get("symbol", "")
+                file_    = body_info.get("file", "")
+                body     = (body_info.get("body", "") or "")[:500]
+                if body:
+                    snippets.append(f"// {file_}\n{body}")
+
+            if not snippets:
+                continue
+
+            prompt = (
+                f"Analyze this group of related code functions/classes "
+                f"(community '{label}') and write a concise technical summary.\n\n"
+                f"Answer:\n"
+                f"1. What is the primary responsibility of this code group?\n"
+                f"2. What key operations/patterns does it implement?\n"
+                f"3. What external systems/APIs does it interact with?\n\n"
+                f"Keep the summary under 150 words, technical and precise.\n\n"
+                f"Code:\n" + "\n\n---\n\n".join(snippets)
+            )
+
+            try:
+                summary = await llm_client.complete_for_task("summarize", prompt)
+                summary = summary.strip()
+
+                # Store in LanceDB memory for future retrieval
+                try:
+                    import evocli_soul.state as _st
+                    mem = _st.get_memory()
+                    if mem:
+                        body_text = (
+                            f"Community: {label}\n"
+                            f"Symbols: {', '.join(symbols)}\n\n"
+                            f"{summary}"
+                        )
+                        mem.add(
+                            body_text,
+                            memory_type="semantic",
+                            priority="project",
+                            importance=0.85,
+                        )
+                        stored = True
+                    else:
+                        stored = False
+                except Exception as _me:
+                    log.debug("community_summary: memory store failed: %s", _me)
+                    stored = False
+
+                results.append({
+                    "community_id": comm_id,
+                    "label":        label,
+                    "summary":      summary,
+                    "symbols":      symbols,
+                    "stored":       stored,
+                })
+                log.info("Community summary generated: %s (%d symbols)", label, len(symbols))
+
+            except Exception as e:
+                log.warning("community_summary failed for %s: %s", label, e)
+                continue
+
+        return results
+
 
 # ── 进程级单例 ────────────────────────────────────────────────────────────────
 

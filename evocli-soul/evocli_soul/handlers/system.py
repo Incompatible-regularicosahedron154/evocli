@@ -17,6 +17,7 @@ def register(router) -> None:
     router.add("code_intel.ingest_tree_sitter", handle_ingest_tree_sitter)
     router.add("code.ingest_chunks",  handle_code_ingest_chunks)
     router.add("code.search_semantic", handle_code_search_semantic)
+    router.add("code.generate_community_summaries", handle_code_generate_community_summaries)
     router.add("search.code_context", handle_search_code_context)
     # Soul 自更新协议 (Section 9.8)
     router.add("soul.propose_update", handle_soul_propose_update)
@@ -427,4 +428,69 @@ async def handle_code_search_semantic(req_id: str, params: dict, send, state) ->
         })
     except Exception as e:
         log.exception("code.search_semantic failed")
+        await send.error(req_id, -32603, str(e))
+
+
+async def handle_code_generate_community_summaries(req_id: str, params: dict, send, state) -> None:
+    """
+    code.generate_community_summaries — GraphRAG 核心：为代码社区生成 LLM 摘要。
+
+    调用流程：
+      1. 从 code_intel.communities 获取社区列表
+      2. 为每个社区的符号从 code_chunks 获取代码体
+      3. 调用 LLM 生成自然语言摘要
+      4. 存入 LanceDB memory（可通过语义搜索召回）
+
+    完成后，全局问题（"认证系统怎么工作"）可直接检索到摘要。
+
+    params:
+      project_id:          string (default ".")
+      max_communities:     int (default 20)
+      communities:         list — 如果提供则直接使用，否则从 bridge 获取
+    """
+    try:
+        from evocli_soul.code_chunks import get_index as _get_chunk_idx
+        from evocli_soul.llm_client import LLMClient
+
+        project_id        = params.get("project_id", ".")
+        max_communities   = int(params.get("max_communities", 20))
+        communities       = params.get("communities", [])
+
+        # Fetch communities from Rust if not provided
+        if not communities:
+            try:
+                bridge = state.get_bridge()
+                result = await bridge.call("code_intel.communities", {})
+                if isinstance(result, dict):
+                    communities = result.get("communities", [])
+                elif isinstance(result, list):
+                    communities = result
+            except Exception as e:
+                log.warning("code.generate_community_summaries: could not fetch communities: %s", e)
+
+        if not communities:
+            await send.response(req_id, {
+                "ok": False,
+                "error": "No communities found. Run 'evocli index' first.",
+            })
+            return
+
+        cfg       = state.get_config()
+        llm       = LLMClient(cfg)
+        idx       = _get_chunk_idx(project_id)
+        summaries = await idx.generate_community_summaries(
+            communities,
+            llm,
+            project_id=project_id,
+            max_communities=max_communities,
+        )
+
+        await send.response(req_id, {
+            "ok":             True,
+            "summaries_count": len(summaries),
+            "summaries":      summaries,
+            "project":        project_id,
+        })
+    except Exception as e:
+        log.exception("code.generate_community_summaries failed")
         await send.error(req_id, -32603, str(e))

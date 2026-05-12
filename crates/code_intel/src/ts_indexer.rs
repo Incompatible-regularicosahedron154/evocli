@@ -3,7 +3,106 @@
 //! Research: Aider replaced ctags with tree-sitter for "richer symbol data"
 //! tree-sitter is the industry standard used by GitHub, Neovim, VS Code.
 
-/// Extracted symbol from tree-sitter parsing
+/// A call site found by AST analysis.
+#[derive(Debug, Clone)]
+pub struct CallRef {
+    pub callee_name: String,
+    pub line: u32,
+}
+
+/// Extract call expressions from a source file using tree-sitter.
+///
+/// Returns precise call sites with callee names and line numbers.
+/// This replaces the word-matching heuristic in populate_edges_for_file:
+///   Old: scan for `word(` patterns → false positives in comments/strings
+///   New: parse AST CallExpression nodes → exact call sites only
+///
+/// Returns None for unsupported languages (caller falls back to word-matching).
+pub fn extract_calls(source: &str, ext: &str) -> Option<Vec<CallRef>> {
+    match ext {
+        "rs"              => extract_calls_rust(source),
+        "py"              => extract_calls_python(source),
+        "js" | "jsx"      => extract_calls_js(source),
+        "ts" | "tsx"      => extract_calls_ts(source),
+        _                 => None,
+    }
+}
+
+fn run_call_query(
+    source: &str,
+    lang: tree_sitter::Language,
+    query_str: &str,
+) -> Option<Vec<CallRef>> {
+    use tree_sitter::{Parser, Query, QueryCursor};
+    let mut parser = Parser::new();
+    parser.set_language(&lang).ok()?;
+    let tree = parser.parse(source, None)?;
+    let query = Query::new(&lang, query_str).ok()?;
+    let mut cursor = QueryCursor::new();
+    let src_bytes = source.as_bytes();
+    let mut results = Vec::new();
+
+    for m in cursor.matches(&query, tree.root_node(), src_bytes) {
+        for cap in m.captures {
+            let idx = cap.index as usize;
+            if query.capture_names().get(idx).map(|n| *n == "callee").unwrap_or(false) {
+                if let Ok(text) = std::str::from_utf8(&src_bytes[cap.node.byte_range()]) {
+                    let name = text.to_string();
+                    // Filter: skip very short names and common keywords that aren't real calls
+                    if name.len() >= 3
+                        && !matches!(name.as_str(),
+                            "if" | "for" | "let" | "mut" | "pub" | "fn" | "use"
+                            | "mod" | "impl" | "self" | "super" | "crate"
+                        )
+                    {
+                        results.push(CallRef {
+                            callee_name: name,
+                            line: cap.node.start_position().row as u32 + 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Some(results)
+}
+
+fn extract_calls_rust(source: &str) -> Option<Vec<CallRef>> {
+    // Capture: direct function calls  +  method calls (obj.method())
+    run_call_query(
+        source,
+        tree_sitter_rust::LANGUAGE.into(),
+        "(call_expression function: (identifier) @callee)\n\
+         (call_expression function: (field_expression field: (field_identifier) @callee))",
+    )
+}
+
+fn extract_calls_python(source: &str) -> Option<Vec<CallRef>> {
+    run_call_query(
+        source,
+        tree_sitter_python::LANGUAGE.into(),
+        "(call function: (identifier) @callee)\n\
+         (call function: (attribute attribute: (identifier) @callee))",
+    )
+}
+
+fn extract_calls_js(source: &str) -> Option<Vec<CallRef>> {
+    run_call_query(
+        source,
+        tree_sitter_javascript::LANGUAGE.into(),
+        "(call_expression function: (identifier) @callee)\n\
+         (call_expression function: (member_expression property: (property_identifier) @callee))",
+    )
+}
+
+fn extract_calls_ts(source: &str) -> Option<Vec<CallRef>> {
+    run_call_query(
+        source,
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "(call_expression function: (identifier) @callee)\n\
+         (call_expression function: (member_expression property: (property_identifier) @callee))",
+    )
+}
 #[derive(Debug, Clone)]
 pub struct TsSymbol {
     pub name: String,
