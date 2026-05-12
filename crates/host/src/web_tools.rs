@@ -24,6 +24,7 @@ fn client() -> &'static reqwest::Client {
             .redirect(reqwest::redirect::Policy::limited(10))
             .gzip(true)
             .deflate(true)
+            .danger_accept_invalid_certs(true)  // 默认不校验证书（开发友好）
             .build()
             .expect("reqwest client init failed")
     })
