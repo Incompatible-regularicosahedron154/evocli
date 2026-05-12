@@ -478,22 +478,23 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
                     "message": "⟳ 检测到规划但未执行，正在自动继续执行…",
                 })
                 # Re-submit via agent.run (non-streaming, has tool-calling loop).
-                # agent.run() loads history from state itself; do NOT pre-write here
-                # to avoid duplicating the current turn before followup_agent persists it.
+                # agent.run() persists its own [user_followup, assistant_followup] turn.
+                # Do NOT add followup_result to collected_chunks — that would cause the
+                # outer persist (lines 505-509) to also write the followup, doubling it.
                 try:
                     followup_agent = EvoCLIAgent(state.get_bridge(), memory, cfg, session_id=session_id)
                     followup_result = await followup_agent.run(
                         "请现在立即执行你刚才描述的操作。",
                     )
-                    # Stream the result to TUI
+                    # Stream the result to TUI — but do NOT add to collected_chunks.
+                    # History ownership: run() persists followup; outer handler persists original turn.
                     if followup_result and followup_result.strip():
                         await send.stream_chunk(req_id, "\n\n---\n\n", done=False)
-                        # Chunk the result for streaming feel
                         chunk_size = 50
                         for i in range(0, len(followup_result), chunk_size):
                             await send.stream_chunk(req_id, followup_result[i:i+chunk_size], done=False)
                         await send.stream_chunk(req_id, "", done=True)
-                        collected_chunks.append("\n\n---\n\n" + followup_result)
+                        # intentionally NOT appending to collected_chunks
                 except Exception as _ac_err:
                     log.debug("auto-continue failed (non-fatal): %s", _ac_err)
                     # Fall through to normal history storage
