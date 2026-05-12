@@ -1,6 +1,97 @@
 # Tool Reference
 
-All tools available in EvoCLI. Rust tools are called via `bridge.call(tool, params)` from Python. Python tools are registered via `@agent.tool_plain` and visible to the LLM.
+All tools available in EvoCLI.
+
+**Architecture:**
+- **Rust tools** (`shell.*`, `fs.*`, `git.*`, etc.): called via `bridge.call(tool, params)` from Python. Pure Rust implementations — cross-platform, no system shell required.
+- **Python pydantic-ai tools** (64 total): registered via `@agent.tool_plain`, visible to the LLM for tool calling. All shell convenience tools use the Rust RPC methods above.
+- **`shell.run`**: for external programs (cargo, git, npm, python, etc.) that require a real process.
+
+**Tool routing**: `tool_router.py` dynamically selects ≤12 tools per request based on intent (keyword gate → tag matching → embedding similarity). Tool schemas not sent to the LLM save ~55% context tokens.
+
+---
+
+## Rust-Native Shell Tools (cross-platform, no system shell)
+
+These are pure Rust implementations using `std::fs` and `walkdir` — identical behavior on Windows, Linux, macOS.
+
+### `shell.ls`
+List directory contents.
+```json
+params: { "path": "src/", "long": false }
+returns: { "path": "src/", "entries": ["main.rs", "lib.rs"], "count": 2 }
+// long=true: entries = [{"name": "main.rs", "is_dir": false, "size": 1234}]
+```
+
+### `shell.find`
+Find files by name pattern (walkdir, no glob shell needed).
+```json
+params: { "name": "*.rs", "path": "src/" }
+returns: { "files": ["src/main.rs", "src/lib.rs"], "count": 2 }
+```
+
+### `shell.grep`
+Regex search across files (Rust regex, no grep binary needed).
+```json
+params: { "pattern": "fn main", "path": "src/" }
+returns: { "matches": [{"file": "src/main.rs", "line": 5, "content": "fn main() {"}], "count": 1 }
+```
+
+### `shell.cat`
+Read file contents.
+```json
+params: { "file": "src/main.rs" }
+returns: { "file": "src/main.rs", "content": "..." }
+```
+
+### `shell.head` / `shell.tail`
+Read first/last N lines.
+```json
+params: { "file": "src/main.rs", "n": 20 }
+returns: { "file": "src/main.rs", "n": 20, "content": "..." }
+```
+
+### `shell.wc`
+Count lines, words, characters.
+```json
+params: { "file": "src/main.rs" }
+returns: { "file": "src/main.rs", "lines": 142, "words": 890, "chars": 4521 }
+```
+
+### `shell.mkdir`
+Create directory recursively.
+```json
+params: { "path": "src/new/module" }
+returns: { "created": "src/new/module" }
+```
+
+### `shell.mv` / `shell.cp`
+Move or copy files.
+```json
+params: { "src": "old.rs", "dst": "new.rs" }
+returns: { "moved": {"from": "old.rs", "to": "new.rs"} }
+```
+
+### `shell.rm`
+Remove file or directory.
+```json
+params: { "path": "tmp/", "recursive": true }
+returns: { "removed": "tmp/" }
+```
+
+### `shell.touch`
+Create empty file or update timestamp.
+```json
+params: { "file": "src/new.rs" }
+returns: { "touched": "src/new.rs" }
+```
+
+### `shell.run`
+Execute any whitelisted external program. Uses `sh -c` on Linux/macOS; bash → pwsh → powershell fallback on Windows.
+```json
+params: { "cmd": "cargo build --release", "cwd": ".", "timeout_s": 60, "dry_run": false }
+returns: { "exit_code": 0, "stdout": "...", "stderr": "..." }
+```
 
 ---
 
@@ -470,44 +561,120 @@ returns: { "stdout": "...", "exit_code": 0 }
 
 ---
 
-## Python Tools (LLM-visible, 55+)
+## Python Tools (LLM-visible, 64 total)
 
-These are registered in `agent.py` via `@agent.tool_plain` and appear in the LLM's function-calling list. They call the Rust tools above via `bridge.call()`.
+These are registered in `agent.py` via `@agent.tool_plain` and appear in the LLM's function-calling schema. The **tool router** (`tool_router.py`) selects ≤12 relevant tools per request based on intent — the LLM only sees those tools, not all 64.
 
-| Python Tool | Maps to Rust Tool | Notes |
+All tool errors are caught by `_sc()` (safe bridge call) — failures return `"Error: ..."` string rather than crashing the stream.
+
+### File System
+| Tool | Rust RPC | Description |
 |---|---|---|
-| `fs_read` | `fs.read` | |
-| `fs_write` | `fs.write` | |
-| `fs_apply_diff` | `fs.apply_diff` | |
-| `shell_run` | `shell.run` | Security-checked |
-| `shell_grep` | `shell.grep` | |
-| `shell_find` | `shell.find` | |
-| `shell_ls` | `shell.ls` | |
-| `shell_cat` | `shell.cat` | |
-| `git_status` | `git.status` | |
-| `git_commit` | `git.commit` | |
-| `git_snapshot` | `git.snapshot` | |
-| `git_diff` | `git.diff` | |
-| `search_code` | `search.code` | |
-| `memory_recall` | `memory.recall` | |
-| `memory_write` | `memory.write` | |
-| `memory_constraints` | `memory.constraints` | |
-| `symbol_lookup` | `symbol.lookup` | |
-| `symbol_variants` | `symbol.variants` | |
-| `symbol_usages` | `symbol.usages` | |
-| `code_intel_full_chain` | `code_intel.full_chain` | |
-| `code_intel_incoming_calls` | `code_intel.incoming_calls` | |
-| `code_intel_outgoing_calls` | `code_intel.outgoing_calls` | |
-| `code_intel_impact_radius` | `code_intel.impact_radius` | |
-| `code_intel_ranked_context` | `code_intel.ranked_context` | |
-| `assume_has_tests` | `assume.has_tests` | |
-| `assume_caller_count` | `assume.caller_count` | |
-| `assume_is_pure` | `assume.is_pure` | |
-| `assume_verify` | `assume.verify` | |
-| `impact_check` | `impact.check` | |
-| `impact_affected_tests` | `impact.affected_tests` | |
-| `impact_batch_check` | `impact.batch_check` | |
-| `equiv_find` | `equiv.find` | |
-| `approval_request` | `approval.request` | Shows modal in TUI |
-| `tool_list_user` | `tool.list_user` | |
-| `tool_run_user` | `tool.run_user` | |
+| `fs_read` | `fs.read` | Read full file contents |
+| `fs_read_range` | `fs.read_range` | Read line range (preferred for large files) |
+| `fs_read_symbol` | `fs.read_range` | Read source code of a named symbol |
+| `fs_write` | `fs.write` | Write/overwrite a file |
+| `fs_apply_search_replace` | python-native | Apply SEARCH/REPLACE block (Aider pattern) |
+| `fs_apply_diff` | `fs.apply_diff` | Apply unified diff patch |
+| `fs_apply_batch` | python-native | Apply SEARCH/REPLACE to multiple files |
+| `fs_lint_file` | `shell.run` | Run linter (py_compile or cargo check) |
+| `diff_parse_stats` | python-native | Parse diff: files_changed, lines_added/removed |
+
+### Shell (all Rust-native, cross-platform)
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `shell_run` | `shell.run` | Run external program (cargo, git, npm, etc.) |
+| `shell_grep` | `shell.grep` | Regex search across files |
+| `shell_ls` | `shell.ls` | List directory contents |
+| `shell_find` | `shell.find` | Find files by name pattern |
+| `shell_cat` | `shell.cat` | Read file contents |
+| `shell_head` | `shell.head` | Read first N lines |
+| `shell_tail` | `shell.tail` | Read last N lines |
+| `shell_wc` | `shell.wc` | Count lines/words/chars |
+| `shell_mkdir` | `shell.mkdir` | Create directory recursively |
+| `shell_mv` | `shell.mv` | Move/rename file or directory |
+| `shell_cp` | `shell.cp` | Copy file or directory |
+| `shell_touch` | `shell.touch` | Create empty file |
+| `run_and_capture` | `shell.run` | Run command, return stdout/stderr/exit_code |
+| `test_and_capture` | `shell.run` | Run tests, return output only on failure |
+
+### Code Search & Intelligence
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `search_code` | `search.code` | Semantic/regex search across codebase |
+| `code_hybrid_search` | python-native | Hybrid BM25 + vector search (RRF fusion) |
+| `symbol_lookup` | `symbol.lookup` | Find symbol definition, file, and line |
+| `symbol_variants` | `symbol.variants` | Find all variants/implementations of a type |
+| `symbol_usages` | `symbol.usages` | Find all call sites of a symbol |
+| `code_intel_list_symbols` | `code_intel.list_symbols` | List all symbols in a file |
+| `code_intel_incoming_calls` | `code_intel.incoming_calls` | Direct callers of a symbol |
+| `code_intel_outgoing_calls` | `code_intel.outgoing_calls` | Functions called by a symbol |
+| `code_blast_radius` | `code_intel.blast_radius` | Full impact analysis with risk level |
+| `code_symbol_context` | `code_intel.symbol_context` | 360° context: callers, callees, communities |
+| `code_communities` | `code_intel.communities` | Functional code communities (graph detection) |
+
+### Assumption Verifiers (run BEFORE modifying shared code)
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `assume_has_tests` | `assume.has_tests` | Check if symbol has test coverage |
+| `assume_is_pure` | `assume.is_pure` | Check if function is pure (no side effects) |
+| `assume_caller_count` | `assume.caller_count` | Count call sites (change risk assessment) |
+| `assume_has_side_effects` | `assume.has_side_effects` | Check for I/O, mutation side effects |
+| `assume_verify` | `assume.verify` | Verify a natural language assumption |
+| `assume_is_deprecated` | `assume.is_deprecated` | Check for deprecation markers |
+| `assume_is_only_caller` | `assume.is_only_caller` | Check if current context is the sole caller |
+| `assume_types_match` | `assume.types_match` | Check type signature compatibility |
+
+### Impact Analysis
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `impact_check` | `impact.check` | Full impact radius of modifying a symbol |
+| `impact_affected_tests` | `impact.affected_tests` | Tests affected by a change |
+| `impact_batch_check` | `impact.batch_check` | Batch impact check for multiple symbols |
+
+### Git
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `git_status` | `git.status` | Working tree status |
+| `git_diff` | `git.diff` | Staged and unstaged diff |
+| `git_commit` | `git.commit` | Create a commit |
+| `git_snapshot` | `git.snapshot` | Create rollback snapshot (before risky edits) |
+| `git_restore` | `git.restore` | Restore from snapshot |
+
+### Verification
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `verify_task` | `verify.task` | Verify task contract completion |
+| `verify_coverage` | `verify.coverage` | Verify test coverage threshold |
+| `verify_drift` | `verify.drift` | Check implementation vs spec drift |
+
+### Equivalence Search
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `equiv_find` | `equiv.find` | Find existing implementations matching an intent |
+| `equiv_find_similar_code` | `equiv.find_similar_code` | Find semantically similar code blocks |
+
+### Memory
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `memory_recall` | python-native (LanceDB) | Search project memory |
+| `memory_write` | python-native (LanceDB) | Save decision/lesson to memory |
+| `memory_constraints` | python-native (LanceDB) | Retrieve all active project constraints |
+
+### Web
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `fetch_url` | `web.fetch` | Fetch URL as clean Markdown (Rust: reqwest + scraper + htmd, SSL not verified by default) |
+
+### System
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `approval_request` | `approval.request` | Request user confirmation (TUI modal) |
+| `tool_list_user` | `tool.list_user` | List user-registered custom tools |
+| `tool_run_user` | `tool.run_user` | Run a user-registered custom tool |
+
+### MCP (External plugins)
+| Tool | Rust RPC | Description |
+|---|---|---|
+| `mcp_call` | python-native | Call an external MCP tool |
+| `mcp_list_tools` | python-native | List available MCP tools from connected servers |

@@ -1,10 +1,10 @@
 # EvoCLI
 
+[![CI](https://github.com/bambooqj/evocli/actions/workflows/ci.yml/badge.svg)](https://github.com/bambooqj/evocli/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.82%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 **AI coding runtime — local-first, long memory, self-evolving**
 
@@ -16,44 +16,54 @@
 ╭ EvoCLI  gpt-4o-mini  ⌂ ~/projects/myapp  [████░░░░░░] 15k/128k  12%
 ╭ Messages ──────────────────────────────────────────────────────────────────╮
 │  ▌ You                                                                      │
-│    Fix the authentication bug in src/auth.rs                               │
+│    Analyze the project architecture                                         │
 │                                                                             │
 │  ◆ gpt-4o-mini                                                              │
-│    I found the issue. The token validation skips the expiry check when     │
-│    the user role is "admin". Here is the fix:                              │
-│    ╭─ rust ──────────────────────────────────────────────────────────      │
-│  │ - if user.role == Role::Admin { return Ok(()); }                        │
-│  │ + if token.is_expired() { return Err(AuthError::TokenExpired); }       │
-│    ╰─────────────────────────────────────────────────────────────          │
+│  ⚙ Building context…  🧠 Searching memory…  📊 Scanning codebase…          │
+│                                                                             │
+│    ## Architecture Overview                                                 │
+│    Rust Host (immutable) ↔ Python Soul (evolvable) via JSON-RPC            │
+│    64 tools registered · Intent-aware routing · Auto tool flows            │
 ╰─────────────────────────────────────────────────────────────────────────────╯
- ● Ready   ^C:quit  Enter:send  PgUp/Dn:scroll  /help:cmds  F12:log
+ ● Ready   Ctrl+C:quit  Enter:send  PgUp/Dn:scroll  Ctrl+Y:copy  /help:cmds
 ```
 
 ## Features
 
-- **Full-screen TUI** — ratatui terminal UI with streaming responses, token progress bar, thinking animation
-- **62 Rust tools** — file system, git, shell, code intelligence, memory, approval, interactive choice prompts
+### Core
+- **Full-screen TUI** — ratatui terminal UI with streaming responses, real-time token context bar, thinking animation, progress indicators during context building
+- **64 AI-visible tools** — file system, git, shell (Rust-native cross-platform), code intelligence, memory, web fetch, approval prompts
 - **Long-term memory** — LanceDB vector memory (jina-embeddings-v2-base-zh, 768-dim bilingual) + SQLite FTS fallback
-- **Multi-provider LLM** — OpenAI, Anthropic, DeepSeek, Ollama via LiteLLM router; any OpenAI-compatible API works
-- **Executable skills** — TOML-defined multi-step workflows; AI can discover and run them automatically
-- **Code intelligence** — tree-sitter AST + BM25 full-text + PageRank hybrid search across your entire codebase
-- **MCP native** — serves and consumes Model Context Protocol; connect to external data sources and tools
-- **Security by default** — blacklist model; `config.toml` is permanently inaccessible to the AI agent
-- **Zero-setup deploy** — single ~14 MB binary; auto-installs Python deps via `uv` on first run
+- **Multi-provider LLM** — OpenAI, Anthropic, DeepSeek, Ollama via LiteLLM; any OpenAI-compatible API; per-role model config
 
-## Architecture
+### Intelligent Tooling
+- **Dynamic tool routing** — intent-aware selection sends only 12 relevant tools per request (saves ~55% context tokens). 3-stage pipeline: keyword gate → tag matching → embedding similarity
+- **Auto tool flow learning** — repeating tool sequences (e.g. `symbol_lookup → fs_read_range → fs_apply_search_replace → fs_lint_file`) are automatically abstracted into named workflows and suggested on future similar tasks
+- **Native web fetch** — `web.fetch` built in Rust (reqwest + scraper + htmd): fetches any URL and returns clean Markdown. No browser, no curl, no Python HTTP dependencies
+- **Executable skills** — TOML-defined multi-step workflows; AI discovers and runs them automatically
 
-```text
-┌─ Rust Host (immutable core) ────────────────────────────────────────────────┐
-│  TUI rendering  ·  Security sandbox  ·  IPC dispatch  ·  SQLite  ·  Git     │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │  JSON-RPC over stdin/stdout
-┌─ Python Soul (evolvable) ────┴──────────────────────────────────────────────┐
-│  LLM calls (LiteLLM)  ·  Agent orchestration  ·  Skill execution  ·  Memory │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+### Shell Layer (Cross-Platform Rust Native)
+All shell utilities are pure Rust implementations — no system shell required:
 
-**Core constraint**: the Python Soul never touches the filesystem, shell, or database directly. Every operation goes through `bridge.call(tool, params)` to the Rust Host, which enforces the security sandbox.
+| Tool | Implementation |
+|---|---|
+| `shell.ls`, `shell.find` | `std::fs::read_dir` + `walkdir` |
+| `shell.cat`, `shell.head`, `shell.tail`, `shell.wc` | `std::fs::read_to_string` |
+| `shell.mkdir`, `shell.mv`, `shell.cp`, `shell.touch`, `shell.rm` | `std::fs` ops |
+| `shell.grep` | Rust regex + walkdir |
+| `shell.run` | bash (Git Bash/WSL) → pwsh → powershell fallback on Windows |
+
+### Security & Configuration
+- **All security settings in `config.toml`** — allowed commands, blocked patterns, denied paths are all user-configurable lists with sensible defaults. No hardcoded restrictions
+- **Blacklist mode by default** — AI can run any whitelisted command; `config.toml` is the only code-level protected file (AI cannot modify its own security rules)
+- **Project-local config** — `.evocli/config.toml` per-project overrides merge with global `~/.evocli/config.toml`
+
+### Code Intelligence
+- tree-sitter AST + BM25 full-text + PageRank hybrid search
+- Blast radius analysis, incoming/outgoing call chains, community detection
+- MCP native — serve and consume Model Context Protocol
+
+---
 
 ## Quick Start
 
@@ -77,7 +87,7 @@ bash setup.sh
 
 ### Build from source
 
-**Requirements**: Rust 1.82+, Python 3.11+
+**Requirements**: Rust 1.85+, Python 3.11+
 
 ```bash
 git clone https://github.com/bambooqj/evocli.git
@@ -97,12 +107,14 @@ EVOCLI_SOUL=evocli-soul/evocli_soul/main.py cargo run -p evocli
 evocli init   # Interactive wizard — stores key in system keyring
 
 # Or set an environment variable:
+export OPENAI_API_KEY="sk-..."          # OpenAI / any OpenAI-compatible API
 export ANTHROPIC_API_KEY="sk-ant-..."   # Anthropic Claude
-export OPENAI_API_KEY="sk-..."          # OpenAI GPT
 export DEEPSEEK_API_KEY="..."           # DeepSeek
 ```
 
-See [docs/config.toml.example](docs/config.toml.example) for all configuration options.
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for all configuration options.
+
+---
 
 ## TUI Keyboard Shortcuts
 
@@ -114,14 +126,33 @@ See [docs/config.toml.example](docs/config.toml.example) for all configuration o
 | `Esc` | Interrupt generation / close modal |
 | `PageUp / PageDown` | Scroll chat history |
 | `Home / End` | Jump to oldest / newest message |
-| `F12` | Toggle debug log panel (Esc to close) |
+| `Alt+Up / Alt+Down` | Scroll 5 rows fast |
+| `Ctrl+Y` | Copy last AI message to clipboard |
+| `Ctrl+L` | Clear screen |
+| `F12` | Toggle debug log panel |
 | `Ctrl+C` | Exit |
+
+**Text selection & copy:**
+- **Default** (`enable_mouse = false`): Click + drag for native terminal selection, Ctrl+C to copy
+- **Mouse mode** (`enable_mouse = true` in config): Mouse wheel scrolls messages, Ctrl+Y copies last AI message
+
+```toml
+# ~/.evocli/config.toml
+[tui]
+enable_mouse = false   # false = native terminal selection (default)
+                       # true  = mouse wheel scroll
+```
+
+---
 
 ## Slash Commands
 
 | Command | Description |
 |---|---|
-| `/help` | Show all available commands |
+| `/help` | Show all commands and keyboard shortcuts |
+| `/compress` | Compress session history to free context space |
+| `/flows` | List automatically learned tool workflows |
+| `/add <file>` | Pin a file to context for all turns |
 | `/chain <symbol>` | Visualize function call chain |
 | `/skills` | List available skills |
 | `/skill <name>` | Run a skill |
@@ -131,71 +162,112 @@ See [docs/config.toml.example](docs/config.toml.example) for all configuration o
 | `/clear` | Clear chat history |
 | `/log [N]` | Show last N log lines (default 30) |
 
-## Security Model
+---
 
-EvoCLI uses a **blacklist** approach: the AI can execute any command except hardcoded dangerous operations (`rm -rf /`, `dd`, `mkfs`, `format c:`, and 18 more).
+## Configuration
 
-Critically, `~/.evocli/config.toml` is **permanently off-limits** to the AI agent. This prevents the AI from modifying its own security rules or reading your API keys — even if it tries.
+All behaviour is controlled by `~/.evocli/config.toml` (global) and `.evocli/config.toml` (project-local). Project config is deep-merged over global.
 
-Users control all policy via `config.toml` (humans only):
+### Quick reference
 
 ```toml
+[llm]
+base_url  = "https://api.openai.com/v1"   # any OpenAI-compatible endpoint
+# api_key stored in OS keyring via evocli init
+
+[llm.tiers]
+fast  = "gpt-4o-mini"   # fast tasks: commits, lint, Q&A
+smart = "gpt-4o"        # complex: architecture, refactoring
+
+[llm.roles.architect]   # per-role model override
+model    = "claude-opus-4-5"
+base_url = "https://api.anthropic.com"
+
+[agent]
+first_chunk_timeout_s = 120  # seconds before "No response" error (default 120)
+max_tool_calls        = 20
+
+[tui]
+enable_mouse = false   # true = mouse wheel scroll; false = native selection
+
 [security]
-extra_blocked_patterns = ["curl * | bash"]   # add custom dangerous patterns
-extra_denied_paths     = ["/prod"]           # restrict directory access
-allow_all_commands     = false               # switch to strict whitelist mode
+allow_all_commands    = true       # blacklist mode (default)
+allowed_commands      = ["cargo", "git", "python", ...]   # full whitelist (replaceable)
+blocked_patterns      = ["rm -rf /", "mkfs", ...]         # dangerous patterns (replaceable)
+extra_allowed_commands = ["docker", "kubectl"]             # additive
+extra_blocked_patterns = ["curl | bash"]                   # additive
 ```
+
+Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
+
+---
+
+## Security Model
+
+EvoCLI uses a **config-driven** security model — all lists are in `config.toml`, nothing is hardcoded except the config file itself:
+
+- `allow_all_commands = true` (default) — blacklist mode: AI can run any command except `blocked_patterns`
+- `allow_all_commands = false` — strict whitelist: only `allowed_commands` + `extra_allowed_commands`
+- `allow_all_paths = true` (default) — no path restrictions; add `denied_paths` to restrict
+
+The single code-level protection: `~/.evocli/config.toml` itself is permanently off-limits to the AI agent, preventing it from modifying its own security rules or reading your API keys.
+
+---
 
 ## Project Structure
 
 ```
 evocli/
 ├── crates/
-│   ├── host/            CLI entry, config, git, logging (15 Rust files)
+│   ├── host/            CLI entry, config, security, git, web fetch (15 RS files)
 │   ├── soul_bridge/     Rust↔Python JSON-RPC bridge
-│   ├── tui/             Full-screen TUI (ratatui)
-│   ├── code_intel/      Symbol indexing (tree-sitter + LSP)
-│   ├── knowledge_graph/ BM25 + community detection + blast radius
+│   ├── tui/             Full-screen TUI (ratatui) — mouse config, Ctrl+Y copy
+│   ├── code_intel/      Symbol indexing (tree-sitter + BM25 + LSP)
+│   ├── knowledge_graph/ Blast radius + community detection
 │   ├── mem_router/      Self-training memory classifier
-│   ├── tools/           Secure command execution
+│   ├── tools/           Secure command execution (cross-platform shell)
 │   └── mcp/             MCP server/client
 ├── evocli-soul/
-│   └── evocli_soul/     Python Soul (43 modules)
-│       ├── agent.py           Pydantic AI Agent + LiteLLM
+│   └── evocli_soul/     Python Soul (66 modules)
+│       ├── agent.py           Pydantic AI Agent (64 tools) + LiteLLM
+│       ├── tool_registry.py   Single source of truth for all 66 tools
+│       ├── tool_router.py     Intent-aware dynamic tool selection + memory scoring
+│       ├── tool_flow_miner.py Auto tool workflow learning and execution
 │       ├── memory_client.py   LanceDB vector memory
 │       ├── skill_engine.py    TOML skill loader and executor
-│       ├── context_engine.py  Token budget + context assembly
-│       ├── evolution/         Self-evolution engine (7 submodules)
-│       └── handlers/          66 RPC handlers
-├── docs/          Documentation and config examples
-├── scripts/       Build and deployment scripts
+│       ├── context_engine.py  Token budget + context assembly + progress events
+│       └── handlers/          RPC handlers
+├── docs/          Documentation
+├── scripts/       Build and deploy scripts
 └── skills/        Built-in skill definitions
 ```
+
+---
 
 ## Documentation
 
 | Document | Description |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Dual-engine design, crate map, JSON-RPC internals, memory/security/TUI deep dive |
-| [docs/TOOLS_REFERENCE.md](docs/TOOLS_REFERENCE.md) | All 62 Rust tools + 55 Python tools — params, return values, examples |
-| [docs/SKILLS_GUIDE.md](docs/SKILLS_GUIDE.md) | How to write TOML skills, all actions, variable interpolation, prompt templates |
-| [docs/MEMORY_SYSTEM.md](docs/MEMORY_SYSTEM.md) | LanceDB + SQLite tiers, distillation, embedding model, context injection |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | JSON-RPC protocol spec, all message types, event types, handler authoring |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every config option with types, defaults, and environment variable overrides |
-| [docs/TUI_INTERNALS.md](docs/TUI_INTERNALS.md) | App state machine, event loop, renderer, virtual scrolling, adding widgets |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | v0.1.0 shipped, v0.2.0 planned, v1.0 vision |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every config option: LLM, agent, security, tui, context |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Dual-engine design, crate map, JSON-RPC, memory/security |
+| [docs/TOOLS_REFERENCE.md](docs/TOOLS_REFERENCE.md) | All 64+ Python tools + Rust tools — params, returns, examples |
+| [docs/SKILLS_GUIDE.md](docs/SKILLS_GUIDE.md) | TOML skills, actions, variable interpolation, prompt templates |
+| [docs/MEMORY_SYSTEM.md](docs/MEMORY_SYSTEM.md) | LanceDB, distillation, embeddings, context injection |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | JSON-RPC protocol spec, event types, handler authoring |
+| [docs/TUI_INTERNALS.md](docs/TUI_INTERNALS.md) | App state, event loop, renderer, virtual scrolling |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | v0.1.0 shipped, v0.2.0 planned |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Dev setup, build, test, code style, PR process |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 
 ## Contributing
 
-Contributions from everyone are welcome — whether that is a bug fix, new feature, documentation improvement, or a new built-in skill.
+Contributions are welcome — bug fixes, new features, documentation, new skills.
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
 
 - **Bug reports** — open an issue with the `bug` label
 - **Feature requests** — open an issue with the `enhancement` label
-- **Roadmap discussion** — see [docs/ROADMAP.md](docs/ROADMAP.md)
+- **Roadmap** — see [docs/ROADMAP.md](docs/ROADMAP.md)
 
 ## License
 
