@@ -204,6 +204,14 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect, mode: LayoutMode) {
     let cost_str = if app.session_cost_usd < 0.001 { String::new() }
         else { format!("  ${:.3}", app.session_cost_usd) };
 
+    // Show "↑Xk ↓Xk" when we have accurate per-direction counts from cost_update
+    // Falls back to plain token bar when no cost_update received yet
+    let tok_detail = if app.tokens_input > 0 || app.tokens_output > 0 {
+        format!("↑{} ↓{}", fmt_tokens(app.tokens_input), fmt_tokens(app.tokens_output))
+    } else {
+        String::new()
+    };
+
     let line = match mode {
         LayoutMode::Wide | LayoutMode::Normal => {
             let model_max = if mode == LayoutMode::Wide { 20 } else { 14 };
@@ -237,6 +245,10 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect, mode: LayoutMode) {
             if !tok_bar.is_empty() {
                 spans.push(Span::styled("  ", Style::default()));
                 spans.push(Span::styled(tok_bar, Style::default().fg(tok_color)));
+            }
+            if !tok_detail.is_empty() {
+                spans.push(Span::styled("  ", Style::default()));
+                spans.push(Span::styled(tok_detail.clone(), Style::default().fg(FG_DIM)));
             }
             if !cost_str.is_empty() {
                 spans.push(Span::styled(cost_str, Style::default().fg(FG_DIM)));
@@ -280,10 +292,14 @@ fn fmt_tokens(n: usize) -> String {
 ///   < 60 % → teal (safe)   60-80 % → yellow (watch)
 ///   80-95 % → orange (warn)   ≥ 95 % → red (compress session now)
 ///
-/// Returns `("", C_TEAL)` when max_ctx == 0 (unknown context size).
+/// Format: "[████░░░░] 15%  12k↑ 3k↓ / 128k"
+///   ↑ = input tokens (the expensive part to optimize)
+///   ↓ = output tokens
+///
+/// Returns plain token counts when max_ctx == 0 (unknown context size).
 fn token_bar(used: usize, max_ctx: usize, bar_w: usize) -> (String, Color) {
     if max_ctx == 0 || bar_w == 0 {
-        let s = if used > 0 { format!("{} tok", fmt_tokens(used)) } else { String::new() };
+        let s = if used > 0 { format!("{}tok", fmt_tokens(used)) } else { String::new() };
         return (s, C_TEAL);
     }
     let pct  = (used * 100 / max_ctx).min(100);
@@ -392,6 +408,8 @@ fn draw_chat_area(f: &mut Frame, app: &mut App, area: Rect, mode: LayoutMode) {
     let total_visual = vcum[n];
 
     let max_scroll = total_visual.saturating_sub(visible_h);
+    // Save for scroll helpers (fixes usize::MAX - N overflow bug in scroll_up/down)
+    app.last_max_scroll = max_scroll;
     let scroll_vrow = app.scroll.min(max_scroll);
     let at_bottom = scroll_vrow >= max_scroll;
 

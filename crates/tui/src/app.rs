@@ -116,6 +116,9 @@ pub struct App {
     pub cache_dirty:  bool,
     /// Streaming throttle: skip redraws for N frames to reduce CPU during fast token emission.
     pub stream_skip_frames: u8,
+    /// Last computed max_scroll from draw_chat_area. Used by scroll helpers to
+    /// anchor from bottom before subtracting, fixing the usize::MAX - N overflow bug.
+    pub last_max_scroll: usize,
 
     // ── Debug overlay (F12) ──────────────────────────────────────
     pub show_debug:       bool,
@@ -212,6 +215,7 @@ impl App {
             line_cache:       None,
             cache_dirty:      true,
             stream_skip_frames: 0,
+            last_max_scroll:  0,
             show_debug:       false,
             debug_log_lines:  vec![],
             debug_log_path: dirs::home_dir()
@@ -400,23 +404,58 @@ impl App {
     // ── Scroll helpers ───────────────────────────────────────────
 
     /// PgUp — show older messages (scroll toward top).
+    ///
+    /// Fix: when scroll == usize::MAX (sentinel "follow bottom"), we must first
+    /// anchor to the last known max_scroll before subtracting. Otherwise
+    /// usize::MAX - 3 is still larger than max_scroll and nothing moves visually.
     pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(3);
+        let current = if self.scroll >= self.last_max_scroll {
+            self.last_max_scroll   // anchor from actual bottom
+        } else {
+            self.scroll
+        };
+        self.scroll = current.saturating_sub(3);
     }
 
     /// PgDn — show newer messages (scroll toward bottom).
+    /// If we reach the bottom, switch back to sentinel so new content is followed.
     pub fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(3);
+        let current = if self.scroll >= self.last_max_scroll {
+            return;  // already at bottom, nothing to do
+        } else {
+            self.scroll
+        };
+        let next = current.saturating_add(3);
+        if next >= self.last_max_scroll {
+            self.scroll = usize::MAX;  // re-engage follow-bottom
+        } else {
+            self.scroll = next;
+        }
     }
 
     /// Alt+Up — fast scroll up (5 lines).
     pub fn scroll_fast_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(5);
+        let current = if self.scroll >= self.last_max_scroll {
+            self.last_max_scroll
+        } else {
+            self.scroll
+        };
+        self.scroll = current.saturating_sub(5);
     }
 
     /// Alt+Down — fast scroll down (5 lines).
     pub fn scroll_fast_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(5);
+        let current = if self.scroll >= self.last_max_scroll {
+            return;
+        } else {
+            self.scroll
+        };
+        let next = current.saturating_add(5);
+        if next >= self.last_max_scroll {
+            self.scroll = usize::MAX;
+        } else {
+            self.scroll = next;
+        }
     }
 
     /// Ctrl+Home / Home — scroll to top (oldest messages).

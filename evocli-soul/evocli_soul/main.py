@@ -12,6 +12,18 @@ import logging
 import sys
 import threading
 
+# ── CRITICAL: Ensure THIS package directory is first in sys.path ──────────────
+# Without this, a stale evocli_soul installed in venv site-packages (from a
+# previous 'pip install evocli-soul') can shadow the current dist files.
+# Adding the parent of evocli_soul/ (i.e. evocli-soul/) as the FIRST path entry
+# guarantees that 'import evocli_soul.llm_client' always resolves to the current
+# dist files, not a cached/stale installation.
+import pathlib as _pathlib
+_soul_dir = str(_pathlib.Path(__file__).parent.parent.resolve())
+if _soul_dir not in sys.path:
+    sys.path.insert(0, _soul_dir)
+del _pathlib, _soul_dir
+
 # Windows GBK 修复：强制 stdout/stderr/stdin UTF-8（subprocess pipe 需要显式包装）
 if sys.platform == "win32":
     import io

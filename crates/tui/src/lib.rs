@@ -513,6 +513,10 @@ fn handle_soul_event(app: &mut App, event: serde_json::Value) {
             app.session_cost_usd += cost;
             app.tokens_input     += in_tok;
             app.tokens_output    += out_tok;
+            // Update the progress bar value: total = input + output
+            // Previously tokens_used was only updated from streaming (output only),
+            // missing the full input token count. Now cost_update keeps it accurate.
+            app.tokens_used = app.tokens_input + app.tokens_output;
         }
         "tool_call_start" => {
             let tool    = event["tool"].as_str().unwrap_or("").to_string();

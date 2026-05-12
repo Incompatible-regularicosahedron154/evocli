@@ -42,14 +42,36 @@ pub struct CommandOutput {
 
 /// Commands whose first token must match one of these prefixes.
 const ALLOWED_PREFIXES: &[&str] = &[
+    // Build tools
     "cargo", "rustc", "rustup",
     "npm", "npx", "node", "bun", "deno",
     "python", "python3", "pip", "uv",
     "go",
-    "make", "cmake",
+    "make", "cmake", "ninja",
+    "mvn", "gradle", "java", "javac",
+    "dotnet",
+    // Version control
     "git",
-    "cat", "ls", "dir", "echo", "head", "tail", "wc", "grep", "find", "fd",
-    "rg",
+    // Shell read-only / navigation (safe: no destructive side effects)
+    "cat", "ls", "dir", "echo",
+    "head", "tail", "wc", "grep", "find", "fd", "rg",
+    "pwd",           // print working directory (was accidentally blocked)
+    "which", "type", // find executable location
+    "env", "printenv",// environment inspection
+    "stat", "file",  // file metadata (read-only)
+    "diff", "patch", // diff viewing
+    "sort", "uniq", "cut", "awk", "sed", "xargs", "tr",
+    "curl", "wget",  // network (non-destructive by default)
+    "jq", "yq",      // JSON/YAML processing
+    "zip", "unzip", "tar", "gzip", "gunzip",
+    // Process inspection (read-only)
+    "ps", "top", "htop",
+    // Create / move (allowed with security blacklist protecting critical paths)
+    "mkdir",         // create directories (safe — security blocks system dirs)
+    "touch",         // create empty files (safe)
+    "cp", "mv",      // copy/move (safe — security blacklist blocks /etc etc.)
+    // NOTE: rm is intentionally NOT here. It is destructive and hard to reason
+    // about safely. Use 'git checkout -- <file>' or trash-cli instead.
 ];
 
 /// Patterns that are always rejected regardless of the command prefix.
