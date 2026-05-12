@@ -434,18 +434,16 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
 
         await send.stream_chunk(req_id, "", done=True)
 
-        # ── Auto-continue: detect "plan without execution" ────────────────────
-        # When the AI describes what it WILL do but the fallback path (_stream_litellm)
-        # ran without tool calling, we detect this pattern and automatically re-submit
-        # with a "please execute now" signal. This closes the loop so users don't have
-        # to manually say "ok go ahead" for safe read operations.
-        #
-        # Detection: response text contains future-tense planning phrases AND
-        # no tool calls were recorded this turn (no tool_called events).
-        #
-        # Only auto-continue for SAFE analysis operations (not destructive changes).
-        # Destructive operations should always wait for explicit user confirmation.
-        if collected_chunks:
+        # ── Auto-continue: DISABLED — protocol incompatibility ───────────────
+        # Auto-continue fires after done=True is already sent to TUI (line 435 above).
+        # Rust TUI breaks the stream loop on done=True (lib.rs:218), so any further
+        # stream_chunk calls after that are silently dropped. The followup result
+        # never reaches the user. Additionally, followup_agent.run() executes before
+        # the primary turn is persisted to history, so it can't see the plan it was
+        # asked to execute — the semantic chain is broken.
+        # TODO: Re-enable by restructuring: keep done=False until followup completes,
+        # then send done=True at the very end. Requires TUI protocol coordination.
+        if False and collected_chunks:
             assistant_reply = "".join(collected_chunks)
             _PLAN_PHRASES = [
                 "我将", "我会先", "让我先", "首先我会", "我打算", "我需要先",
