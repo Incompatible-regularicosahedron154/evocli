@@ -290,13 +290,23 @@ pub async fn run(bridge: Arc<SoulBridge>, model_name: &str, resume_session: Opti
                         terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
                     }
 
-                    // Mouse scroll wheel — enables natural scrolling without key presses
+                    // Mouse scroll wheel — enables natural scrolling without key presses.
+                    // CRITICAL: always call terminal.draw() immediately after scroll.
+                    // Previously: relied on the loop-top conditional draw, which is SKIPPED
+                    // during streaming (is_streaming=true, cache_dirty=false). Users couldn't
+                    // scroll while the AI was responding, and sometimes couldn't scroll at all.
                     crossterm::event::Event::Mouse(mouse) => {
                         use crossterm::event::MouseEventKind;
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp   => { app.scroll_up();   }
-                            MouseEventKind::ScrollDown => { app.scroll_down(); }
-                            _ => {}
+                        let scrolled = match mouse.kind {
+                            MouseEventKind::ScrollUp   => { app.scroll_up_n(5);   true }
+                            MouseEventKind::ScrollDown => { app.scroll_down_n(5); true }
+                            _ => false,
+                        };
+                        if scrolled {
+                            // Force immediate redraw — bypasses all throttle logic.
+                            // Scroll MUST feel instant regardless of streaming state.
+                            app.cache_dirty = true;
+                            terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
                         }
                     }
 
@@ -664,15 +674,37 @@ fn handle_soul_event(app: &mut App, event: serde_json::Value) {
             app.notify(format!("{icon} {message}  ·  F12 for details"), notif_level);
         }
 
-        // Soul status — loading/ready stay in chat; errors become notifications.
+        // Soul status — routing strategy:
+        //   "loading" → transient notification bar (not permanent chat message)
+        //               Reason: "⏳ Building context..." must NOT persist after
+        //               the response arrives. Previously it stayed forever, making
+        //               users think the AI was still working.
+        //   "ready"   → transient notification (brief confirmation, auto-expires)
+        //               Exception: Memory/model ready messages ARE shown in chat
+        //               on first startup (they're meaningful system events).
+        //   "error"   → transient notification (prominent)
         "soul_status" => {
             let status  = event["status"].as_str().unwrap_or("info");
             let message = event["message"].as_str().unwrap_or("");
             match status {
-                "loading" | "ready" => {
-                    let icon = if status == "loading" { "⏳" } else { "✅" };
-                    app.messages.push(ChatMessage::System(format!("{icon} {message}")));
-                    app.invalidate_cache();
+                "loading" => {
+                    // Transient: show in notification bar, auto-expires in 8s.
+                    // Never pushed to permanent messages to avoid "stuck loading" UX.
+                    app.notify(
+                        format!("⏳ {message}"),
+                        app::NotifLevel::Info,
+                    );
+                }
+                "ready" => {
+                    // "Memory ready" and similar startup messages → chat (one-time info)
+                    // but only if they look like startup completion messages.
+                    if message.contains("ready") || message.contains("✅") || message.contains("loaded") {
+                        app.messages.push(ChatMessage::System(format!("✅ {message}")));
+                        app.invalidate_cache();
+                    } else {
+                        // Other ready messages (e.g. restart confirmation) → transient
+                        app.notify(format!("✅ {message}"), app::NotifLevel::Info);
+                    }
                 }
                 "error" => {
                     app.notify(

@@ -27,34 +27,37 @@ SYSTEM_CORE = """\
 SYSTEM_WORKFLOW = """\
 ## 工作流程（必须遵守）
 
+**核心原则：直接执行，不要事先描述计划。**
+- ❌ 错误："我将先搜索 auth.rs，然后..."（只说不做）
+- ✅ 正确：直接调用 symbol_lookup，然后告知结果
+
 每次处理任务时，按以下步骤执行：
 
-**1. 分析（Analysis）**
-- 用 `symbol_lookup` 或 `search_code` 找到相关符号和文件
-- 用 `code_intel_ranked_context` 获取高权重上下文
-- 用 `impact_check` 评估修改的影响半径
+**1. 分析（Analysis）— 立即执行，不要描述**
+- 直接调用 `symbol_lookup` 或 `search_code` 找到相关符号
+- 直接调用 `code_intel_ranked_context` 获取高权重上下文
+- 直接调用 `impact_check` 评估影响半径
+- 工具调用后，用 1-2 句话说明发现了什么
 
-**2. 规划（Plan）**
-- 在执行前，简洁说明："我将修改 X 来实现 Y，原因是 Z"
-- 对于影响 3 个以上文件的修改，列出修改清单再执行
-- 对于架构级变更（新模块、公共 API 变更），等待用户确认
-
-**3. 搜索（Search）**
-- 修改前必须用 `fs_read` 或 `shell_cat` 读取目标文件的完整内容
+**2. 搜索（Search）— 先读文件，再修改**
+- 直接用 `fs_read` 或 `fs_read_range` 读取目标文件内容
 - 确认函数/类的精确签名，避免幻觉式修改
+- 对于大文件（>200行）优先使用 `fs_read_range` 节省 token
 
-**4. 编辑（Edit）**
+**3. 编辑（Edit）— 最小化精确修改**
 - **优先使用 `fs_apply_search_replace`**（SEARCH/REPLACE 格式）进行代码修改
-  - 比 unified diff 更可靠：LLM 不需要维护精确行号
-  - 研究来源：Aider、Cursor、GitHub Copilot 均采用此格式
-- 如果 SEARCH/REPLACE 不适用（如新建文件），使用 `fs_write`
-- 不要重写整个文件（除非是新建文件）
-- 每次只修改必要的最小代码范围
+- 如果 SEARCH/REPLACE 不适用（新建文件），使用 `fs_write`
+- 不要重写整个文件，每次只修改必要的最小代码范围
+- 多文件相关改动使用 `fs_apply_batch` 保证原子性
 
-**5. 验证（Verify）**
-- 修改后运行相关测试：`shell_run("cargo test")` 或 `shell_run("pytest")`
-- 检查语法错误：`shell_run("cargo check")` 或 `shell_run("python -m py_compile <file>")`
-- 如果测试失败，分析错误原因并修复，不要跳过或删除失败的测试
+**4. 验证（Verify）— 修改后必须验证**
+- 运行相关测试：`shell_run("cargo test")` 或 `shell_run("pytest")`
+- 检查语法：`shell_run("cargo check")` 或 `fs_lint_file`
+- 测试失败时修复，不跳过
+
+**对于大型任务（涉及 3+ 个文件或架构变更）**：
+- 先列出修改清单，等待用户确认
+- 然后逐步执行
 """
 
 SYSTEM_TOOL_RULES = """\

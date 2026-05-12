@@ -403,60 +403,40 @@ impl App {
 
     // ── Scroll helpers ───────────────────────────────────────────
 
-    /// PgUp — show older messages (scroll toward top).
+    /// Scroll up by N visual rows. Anchors from last_max_scroll when at bottom.
     ///
     /// Fix: when scroll == usize::MAX (sentinel "follow bottom"), we must first
     /// anchor to the last known max_scroll before subtracting. Otherwise
-    /// usize::MAX - 3 is still larger than max_scroll and nothing moves visually.
-    pub fn scroll_up(&mut self) {
+    /// usize::MAX - N is still larger than max_scroll and nothing moves visually.
+    pub fn scroll_up_n(&mut self, n: usize) {
         let current = if self.scroll >= self.last_max_scroll {
             self.last_max_scroll   // anchor from actual bottom
         } else {
             self.scroll
         };
-        self.scroll = current.saturating_sub(3);
+        self.scroll = current.saturating_sub(n);
     }
 
-    /// PgDn — show newer messages (scroll toward bottom).
-    /// If we reach the bottom, switch back to sentinel so new content is followed.
-    pub fn scroll_down(&mut self) {
-        let current = if self.scroll >= self.last_max_scroll {
-            return;  // already at bottom, nothing to do
-        } else {
-            self.scroll
-        };
-        let next = current.saturating_add(3);
-        if next >= self.last_max_scroll {
-            self.scroll = usize::MAX;  // re-engage follow-bottom
-        } else {
-            self.scroll = next;
+    /// Scroll down by N visual rows. Re-engages follow-bottom at end.
+    pub fn scroll_down_n(&mut self, n: usize) {
+        if self.scroll >= self.last_max_scroll {
+            return;  // already at bottom
         }
+        let next = self.scroll.saturating_add(n);
+        self.scroll = if next >= self.last_max_scroll { usize::MAX } else { next };
     }
+
+    /// PgUp — scroll up 3 rows (keyboard shortcut).
+    pub fn scroll_up(&mut self) { self.scroll_up_n(3); }
+
+    /// PgDn — scroll down 3 rows (keyboard shortcut).
+    pub fn scroll_down(&mut self) { self.scroll_down_n(3); }
 
     /// Alt+Up — fast scroll up (5 lines).
-    pub fn scroll_fast_up(&mut self) {
-        let current = if self.scroll >= self.last_max_scroll {
-            self.last_max_scroll
-        } else {
-            self.scroll
-        };
-        self.scroll = current.saturating_sub(5);
-    }
+    pub fn scroll_fast_up(&mut self) { self.scroll_up_n(5); }
 
     /// Alt+Down — fast scroll down (5 lines).
-    pub fn scroll_fast_down(&mut self) {
-        let current = if self.scroll >= self.last_max_scroll {
-            return;
-        } else {
-            self.scroll
-        };
-        let next = current.saturating_add(5);
-        if next >= self.last_max_scroll {
-            self.scroll = usize::MAX;
-        } else {
-            self.scroll = next;
-        }
-    }
+    pub fn scroll_fast_down(&mut self) { self.scroll_down_n(5); }
 
     /// Ctrl+Home / Home — scroll to top (oldest messages).
     pub fn scroll_to_top(&mut self) {
