@@ -50,6 +50,8 @@ const ALLOWED_PREFIXES: &[&str] = &[
     "make", "cmake", "ninja",
     "mvn", "gradle", "java", "javac",
     "dotnet",
+    // EvoCLI itself — agent may call `evocli doctor`, `evocli stats`, etc.
+    "evocli",
     // Version control
     "git",
     // Shell navigation & directory operations

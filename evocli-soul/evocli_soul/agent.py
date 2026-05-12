@@ -234,49 +234,54 @@ class EvoCLIAgent:
 
         bridge = self.bridge  # closure capture — agent instances share bridge
 
+        async def _sc(method: str, params: dict) -> str:
+            """Safe bridge call — catches ALL exceptions and returns error strings.
+
+            pydantic-ai propagates unhandled tool exceptions as stream failures.
+            Returning an error string lets the model see what went wrong and
+            try an alternative approach, instead of crashing the whole session.
+            """
+            try:
+                result = await bridge.call(method, params)
+                return result if isinstance(result, str) else _json.dumps(result, ensure_ascii=False)
+            except Exception as _tool_err:
+                log.warning("tool %s failed: %s", method, _tool_err)
+                return f"Error: {_tool_err}"
+
         @agent.tool_plain
         async def fs_read(path: str) -> str:
             """Read the full contents of a file. path: absolute or relative file path."""
-            result = await bridge.call("fs.read", {"path": path})
-            return result if isinstance(result, str) else _json.dumps(result, ensure_ascii=False)
+            return await _sc("fs.read", {"path": path})
 
         @agent.tool_plain
         async def fs_write(path: str, content: str) -> str:
             """Write (or overwrite) a file with the given content."""
-            result = await bridge.call("fs.write", {"path": path, "content": content})
-            return _json.dumps(result, ensure_ascii=False)
+            return await _sc("fs.write", {"path": path, "content": content})
 
         @agent.tool_plain
         async def fs_apply_diff(path: str, diff: str, dry_run: bool = False) -> str:
             """Apply a unified diff patch to a file. Set dry_run=True to preview only."""
-            result = await bridge.call("fs.apply_diff", {"path": path, "diff": diff, "dry_run": dry_run})
-            return _json.dumps(result, ensure_ascii=False)
+            return await _sc("fs.apply_diff", {"path": path, "diff": diff, "dry_run": dry_run})
 
         @agent.tool_plain
         async def shell_run(cmd: str, cwd: str = ".", timeout_s: int = 30) -> str:
             """Run a whitelisted shell command. Returns stdout+stderr."""
-            result = await bridge.call("shell.run", {
-                "cmd": cmd, "cwd": cwd, "timeout_s": timeout_s, "dry_run": False,
-            })
-            return result if isinstance(result, str) else _json.dumps(result, ensure_ascii=False)
+            return await _sc("shell.run", {"cmd": cmd, "cwd": cwd, "timeout_s": timeout_s, "dry_run": False})
 
         @agent.tool_plain
         async def shell_grep(pattern: str, path: str = ".") -> str:
             """Search for a regex pattern in files (like grep -rn)."""
-            result = await bridge.call("shell.grep", {"pattern": pattern, "path": path})
-            return result if isinstance(result, str) else _json.dumps(result, ensure_ascii=False)
+            return await _sc("shell.grep", {"pattern": pattern, "path": path})
 
         @agent.tool_plain
         async def search_code(query: str, path: str = ".") -> str:
             """Semantic / regex search across the codebase."""
-            result = await bridge.call("search.code", {"query": query, "path": path})
-            return _json.dumps(result, ensure_ascii=False)
+            return await _sc("search.code", {"query": query, "path": path})
 
         @agent.tool_plain
         async def symbol_lookup(name: str) -> str:
             """Look up a symbol's exact definition, file, and line in the codebase."""
-            result = await bridge.call("symbol.lookup", {"name": name})
-            return _json.dumps(result, ensure_ascii=False)
+            return await _sc("symbol.lookup", {"name": name})
 
         @agent.tool_plain
         async def memory_recall(query: str, top_k: int = 5) -> str:
@@ -322,20 +327,17 @@ class EvoCLIAgent:
         @agent.tool_plain
         async def git_status() -> str:
             """Get the current git working tree status."""
-            result = await bridge.call("git.status", {})
-            return result if isinstance(result, str) else _json.dumps(result, ensure_ascii=False)
+            return await _sc("git.status", {})
 
         @agent.tool_plain
         async def git_diff() -> str:
             """Get the current staged and unstaged git diff."""
-            result = await bridge.call("git.diff", {})
-            return result if isinstance(result, str) else _json.dumps(result, ensure_ascii=False)
+            return await _sc("git.diff", {})
 
         @agent.tool_plain
         async def git_commit(message: str) -> str:
             """Commit current changes to git with the given message."""
-            result = await bridge.call("git.commit", {"message": message, "files": []})
-            return _json.dumps(result, ensure_ascii=False)
+            return await _sc("git.commit", {"message": message, "files": []})
 
         @agent.tool_plain
         async def diff_parse_stats(diff: str) -> str:
@@ -419,7 +421,7 @@ class EvoCLIAgent:
             context usage: reading lines 50-120 of a 2000-line file uses 3% of the tokens.
 
             Args:
-              path:       file path
+              path:       file path — must be a real file path (e.g. "src/main.rs"), NOT a description
               start_line: first line to include (1-indexed). 0 = start of file.
               end_line:   last line to include (1-indexed, inclusive). 0 = end of file.
 
@@ -436,10 +438,7 @@ class EvoCLIAgent:
                 params["start_line"] = start_line
             if end_line > 0:
                 params["end_line"] = end_line
-            result = await bridge.call("fs.read_range", params)
-            if isinstance(result, dict):
-                return _json.dumps(result, ensure_ascii=False)
-            return str(result)
+            return await _sc("fs.read_range", params)
 
         @agent.tool_plain
         async def fs_read_symbol(symbol_name: str, path: str = "", context_lines: int = 10) -> str:
@@ -544,8 +543,12 @@ class EvoCLIAgent:
             Run a shell command and return the output. Use for: running tests, building,
             checking output. Research: Aider's /run command — executes and adds to context.
             """
-            # Calls bridge.call("shell.run") — existing Rust tool, correctly routed.
-            result = await bridge.call("shell.run", {"cmd": cmd, "cwd": cwd, "timeout_s": 60, "dry_run": False})
+            import json as _j
+            raw = await _sc("shell.run", {"cmd": cmd, "cwd": cwd, "timeout_s": 60, "dry_run": False})
+            try:
+                result = _j.loads(raw) if raw.startswith("{") else {"stdout": raw}
+            except Exception:
+                result = {"stdout": raw}
             stdout    = result.get("stdout", "") if isinstance(result, dict) else str(result)
             stderr    = result.get("stderr", "") if isinstance(result, dict) else ""
             exit_code = result.get("exit_code", 0) if isinstance(result, dict) else 0
@@ -559,7 +562,12 @@ class EvoCLIAgent:
             Research: Aider's /test command — reflection loop for test-driven development.
             Use after code changes to verify correctness.
             """
-            result    = await bridge.call("shell.run", {"cmd": cmd, "cwd": cwd, "timeout_s": 120, "dry_run": False})
+            import json as _j
+            raw = await _sc("shell.run", {"cmd": cmd, "cwd": cwd, "timeout_s": 120, "dry_run": False})
+            try:
+                result = _j.loads(raw) if raw.startswith("{") else {"stdout": raw}
+            except Exception:
+                result = {"stdout": raw}
             stdout    = result.get("stdout", "") if isinstance(result, dict) else str(result)
             stderr    = result.get("stderr", "") if isinstance(result, dict) else ""
             exit_code = result.get("exit_code", 0) if isinstance(result, dict) else 0
@@ -649,8 +657,7 @@ class EvoCLIAgent:
             Shows ALL callers (upstream) and callees (downstream) with risk level.
             Use BEFORE modifying a symbol to understand full impact.
             """
-            result = await bridge.call("code_intel.blast_radius", {"symbol_id": symbol_id, "max_depth": max_depth})
-            return _json.dumps(result, ensure_ascii=False)
+            return await _sc("code_intel.blast_radius", {"symbol_id": symbol_id, "max_depth": max_depth})
 
         @agent.tool_plain
         async def code_symbol_context(symbol_id: str) -> str:
@@ -658,8 +665,7 @@ class EvoCLIAgent:
             360° symbol context (GitNexus context tool).
             Returns callers, callees, community membership, process participation.
             """
-            result = await bridge.call("code_intel.symbol_context", {"symbol_id": symbol_id})
-            return _json.dumps(result, ensure_ascii=False)
+            return await _sc("code_intel.symbol_context", {"symbol_id": symbol_id})
 
         @agent.tool_plain
         async def code_communities() -> str:
@@ -668,8 +674,7 @@ class EvoCLIAgent:
             Communities are groups of related symbols detected by graph analysis.
             Use to understand codebase high-level structure.
             """
-            result = await bridge.call("code_intel.communities", {})
-            return _json.dumps(result, ensure_ascii=False)
+            return await _sc("code_intel.communities", {})
 
         @agent.tool_plain
         async def mcp_call(tool_name: str, arguments_json: str = "{}") -> str:
