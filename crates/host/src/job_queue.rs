@@ -105,10 +105,10 @@ impl JobQueue {
     pub fn push(&self, job_type: JobType) -> Result<String> {
         let project_id = match &job_type {
             JobType::CodeIndexUpdate { project, .. } => project.clone(),
-            JobType::SkillRun { project, .. }        => project.clone(),
-            JobType::EvolutionScan { project }       => project.clone(),
-            JobType::MemoryDistill { .. }            => String::new(),
-            JobType::AgentSession { .. }             => String::new(),
+            JobType::SkillRun { project, .. } => project.clone(),
+            JobType::EvolutionScan { project } => project.clone(),
+            JobType::MemoryDistill { .. } => String::new(),
+            JobType::AgentSession { .. } => String::new(),
         };
         self.push_with_project(job_type, &project_id)
     }
@@ -292,7 +292,10 @@ mod tests {
         let db_path = dir.path().join("jobs.db");
         let q = JobQueue::new(&db_path).expect("fresh DB should initialise");
         // Push a job with project_id to confirm column exists
-        let id = q.push(JobType::EvolutionScan { project: "test_project".into() })
+        let id = q
+            .push(JobType::EvolutionScan {
+                project: "test_project".into(),
+            })
             .expect("push should succeed on fresh DB");
         assert!(!id.is_empty(), "job id should not be empty");
     }
@@ -309,7 +312,8 @@ mod tests {
         // Create an OLD-style jobs table WITHOUT project_id column
         {
             let conn = Connection::open(&db_path).expect("open legacy db");
-            conn.execute_batch("
+            conn.execute_batch(
+                "
                 CREATE TABLE jobs (
                     id          TEXT PRIMARY KEY,
                     job_type    TEXT NOT NULL,
@@ -322,7 +326,9 @@ mod tests {
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
-            ").expect("create legacy schema");
+            ",
+            )
+            .expect("create legacy schema");
         }
 
         // Now open via JobQueue — migration should add project_id and create index
@@ -330,7 +336,10 @@ mod tests {
             .expect("JobQueue::new should succeed on legacy DB via migration");
 
         // Verify we can push a job (requires project_id column to exist)
-        let id = q.push(JobType::EvolutionScan { project: "migrated_project".into() })
+        let id = q
+            .push(JobType::EvolutionScan {
+                project: "migrated_project".into(),
+            })
             .expect("push should succeed after migration");
         assert!(!id.is_empty(), "job id should not be empty after migration");
     }

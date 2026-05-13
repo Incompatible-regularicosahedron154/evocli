@@ -303,10 +303,14 @@ pub async fn dispatch(
             let symbol_id = args["symbol_id"].as_str().unwrap_or("").to_string();
             let max_depth = args["max_depth"].as_u64().unwrap_or(5) as usize;
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"chain": []}), |idx| {
-                let chain = idx.full_upstream_chain(&symbol_id, max_depth)?;
-                serde_json::json!({"symbol_id": symbol_id, "chain": chain})
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"chain": []}),
+                |idx| {
+                    let chain = idx.full_upstream_chain(&symbol_id, max_depth)?;
+                    serde_json::json!({"symbol_id": symbol_id, "chain": chain})
+                }
+            )
         }
         "code_intel.impact_radius" => {
             let symbol_id = args["symbol_id"].as_str().unwrap_or("").to_string();
@@ -315,7 +319,7 @@ pub async fn dispatch(
                 db_path,
                 fallback = serde_json::json!({"callers": 0, "test_files": []}),
                 |idx| {
-                    let callers    = idx.incoming_calls(&symbol_id)?;
+                    let callers = idx.incoming_calls(&symbol_id)?;
                     let test_files = idx.impact_test_files(&symbol_id)?;
                     serde_json::json!({
                         "symbol_id":    symbol_id,
@@ -342,7 +346,8 @@ pub async fn dispatch(
                                 for role_val in roles_obj.values_mut() {
                                     if let Some(role_obj) = role_val.as_object_mut() {
                                         if role_obj.contains_key("api_key") {
-                                            role_obj.insert("api_key".into(), serde_json::json!(null));
+                                            role_obj
+                                                .insert("api_key".into(), serde_json::json!(null));
                                         }
                                     }
                                 }
@@ -360,7 +365,8 @@ pub async fn dispatch(
             let jsonl_path = dirs::home_dir()
                 .unwrap_or_default()
                 .join(".evocli")
-                .join("data").join("memories.jsonl");
+                .join("data")
+                .join("memories.jsonl");
             if !jsonl_path.exists() {
                 tracing::debug!("memory.constraints: no JSONL store found, returning empty");
                 return Ok(serde_json::json!([]));
@@ -369,10 +375,18 @@ pub async fn dispatch(
             let constraints: Vec<String> = content
                 .lines()
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .filter(|v| v.get("memory_type").and_then(|t| t.as_str()).unwrap_or("") == "constraint")
+                .filter(|v| {
+                    v.get("memory_type").and_then(|t| t.as_str()).unwrap_or("") == "constraint"
+                })
                 .filter_map(|v| {
-                    v.get("body").and_then(|b| b.as_str()).map(|s| s.to_string())
-                        .or_else(|| v.get("content").and_then(|b| b.as_str()).map(|s| s.to_string()))
+                    v.get("body")
+                        .and_then(|b| b.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            v.get("content")
+                                .and_then(|b| b.as_str())
+                                .map(|s| s.to_string())
+                        })
                 })
                 .collect();
             Ok(serde_json::to_value(constraints)?)
@@ -384,7 +398,8 @@ pub async fn dispatch(
             let jsonl_path = dirs::home_dir()
                 .unwrap_or_default()
                 .join(".evocli")
-                .join("data").join("memories.jsonl");
+                .join("data")
+                .join("memories.jsonl");
             if !jsonl_path.exists() || query.is_empty() {
                 return Ok(serde_json::json!([]));
             }
@@ -396,8 +411,12 @@ pub async fn dispatch(
                     let text = format!(
                         "{} {}",
                         v.get("title").and_then(|t| t.as_str()).unwrap_or(""),
-                        v.get("body").or_else(|| v.get("content")).and_then(|b| b.as_str()).unwrap_or("")
-                    ).to_lowercase();
+                        v.get("body")
+                            .or_else(|| v.get("content"))
+                            .and_then(|b| b.as_str())
+                            .unwrap_or("")
+                    )
+                    .to_lowercase();
                     text.contains(&query)
                 })
                 .take(top_k)
@@ -407,12 +426,21 @@ pub async fn dispatch(
         }
         "memory.write" => {
             // H1 fallback: append to JSONL store for standalone MCP contexts.
-            let title   = args["title"].as_str().unwrap_or("").to_string();
-            let body    = args.get("body").and_then(|b| b.as_str())
+            let title = args["title"].as_str().unwrap_or("").to_string();
+            let body = args
+                .get("body")
+                .and_then(|b| b.as_str())
                 .or_else(|| args.get("content").and_then(|b| b.as_str()))
-                .unwrap_or("").to_string();
-            let mtype   = args.get("memory_type").and_then(|t| t.as_str()).unwrap_or("episodic");
-            let scope   = args.get("priority_scope").and_then(|s| s.as_str()).unwrap_or("project");
+                .unwrap_or("")
+                .to_string();
+            let mtype = args
+                .get("memory_type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("episodic");
+            let scope = args
+                .get("priority_scope")
+                .and_then(|s| s.as_str())
+                .unwrap_or("project");
             if title.is_empty() && body.is_empty() {
                 return Ok(serde_json::json!({"ok": false, "error": "title and body required"}));
             }
@@ -428,13 +456,16 @@ pub async fn dispatch(
             let jsonl_path = dirs::home_dir()
                 .unwrap_or_default()
                 .join(".evocli")
-                .join("data").join("memories.jsonl");
+                .join("data")
+                .join("memories.jsonl");
             if let Some(parent) = jsonl_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let line = format!("{}\n", serde_json::to_string(&entry)?);
             let mut file = std::fs::OpenOptions::new()
-                .create(true).append(true).open(&jsonl_path)?;
+                .create(true)
+                .append(true)
+                .open(&jsonl_path)?;
             std::io::Write::write_all(&mut file, line.as_bytes())?;
             Ok(serde_json::json!({"ok": true, "id": entry["id"]}))
         }
@@ -597,7 +628,7 @@ pub async fn dispatch(
                         let name = sym["name"].as_str().unwrap_or("");
                         let kind = sym["kind"].as_str().unwrap_or("function");
                         let line = sym["line"].as_u64().unwrap_or(1) as u32;
-                        let sig  = sym["signature"].as_str().unwrap_or("");
+                        let sig = sym["signature"].as_str().unwrap_or("");
                         let lang = sym["language"].as_str().unwrap_or("unknown");
                         if !name.is_empty() && !file_str.is_empty() {
                             let _ = index.add_symbol_direct(name, kind, &file_str, line, sig, lang);
@@ -617,7 +648,7 @@ pub async fn dispatch(
                         let name = sym["name"].as_str().unwrap_or("");
                         let kind = sym["kind"].as_str().unwrap_or("function");
                         let line = sym["line"].as_u64().unwrap_or(1) as u32;
-                        let sig  = sym["signature"].as_str().unwrap_or("");
+                        let sig = sym["signature"].as_str().unwrap_or("");
                         let lang = sym["language"].as_str().unwrap_or("unknown");
                         if !name.is_empty() && !file_str.is_empty() {
                             let _ = index.add_symbol_direct(name, kind, &file_str, line, sig, lang);
@@ -642,7 +673,7 @@ pub async fn dispatch(
                 }),
                 |idx| {
                     let total_symbols = idx.count_symbols();
-                    let total_edges   = idx.count_edges();
+                    let total_edges = idx.count_edges();
                     let metadata = std::fs::metadata(&db_path)?;
                     serde_json::json!({
                         "indexed":        true,
@@ -662,30 +693,34 @@ pub async fn dispatch(
             let symbol_id = args["symbol_id"].as_str().unwrap_or("").to_string();
             let max_depth = args["max_depth"].as_u64().unwrap_or(5) as usize;
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"chain": []}), |idx| {
-                let mut visited = std::collections::HashSet::new();
-                let mut chain = Vec::new();
-                fn collect_downstream(
-                    index: &mut code_intel::CodeIndex,
-                    symbol_id: &str,
-                    depth: usize,
-                    visited: &mut std::collections::HashSet<String>,
-                    chain: &mut Vec<code_intel::SymbolInfo>,
-                ) -> anyhow::Result<()> {
-                    if depth == 0 || visited.contains(symbol_id) {
-                        return Ok(());
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"chain": []}),
+                |idx| {
+                    let mut visited = std::collections::HashSet::new();
+                    let mut chain = Vec::new();
+                    fn collect_downstream(
+                        index: &mut code_intel::CodeIndex,
+                        symbol_id: &str,
+                        depth: usize,
+                        visited: &mut std::collections::HashSet<String>,
+                        chain: &mut Vec<code_intel::SymbolInfo>,
+                    ) -> anyhow::Result<()> {
+                        if depth == 0 || visited.contains(symbol_id) {
+                            return Ok(());
+                        }
+                        visited.insert(symbol_id.to_string());
+                        for callee in index.outgoing_calls(symbol_id)? {
+                            let callee_id = callee.id.clone();
+                            chain.push(callee);
+                            collect_downstream(index, &callee_id, depth - 1, visited, chain)?;
+                        }
+                        Ok(())
                     }
-                    visited.insert(symbol_id.to_string());
-                    for callee in index.outgoing_calls(symbol_id)? {
-                        let callee_id = callee.id.clone();
-                        chain.push(callee);
-                        collect_downstream(index, &callee_id, depth - 1, visited, chain)?;
-                    }
-                    Ok(())
+                    collect_downstream(&mut *idx, &symbol_id, max_depth, &mut visited, &mut chain)?;
+                    serde_json::json!({"symbol_id": symbol_id, "downstream_chain": chain})
                 }
-                collect_downstream(&mut *idx, &symbol_id, max_depth, &mut visited, &mut chain)?;
-                serde_json::json!({"symbol_id": symbol_id, "downstream_chain": chain})
-            })
+            )
         }
 
         // ── Knowledge Graph tools (GitNexus-inspired): BM25, blast_radius, communities ──────
@@ -871,14 +906,20 @@ pub async fn dispatch(
         "symbol.variants" => {
             let type_name = args["type_name"].as_str().unwrap_or("").to_string();
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"variants": []}), |idx| {
-                let symbols = idx.find_symbol(&type_name)?;
-                let variants: Vec<_> = symbols
-                    .iter()
-                    .map(|s| serde_json::json!({"name": s.name, "file": s.file, "line": s.line}))
-                    .collect();
-                serde_json::json!({"variants": variants})
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"variants": []}),
+                |idx| {
+                    let symbols = idx.find_symbol(&type_name)?;
+                    let variants: Vec<_> = symbols
+                        .iter()
+                        .map(
+                            |s| serde_json::json!({"name": s.name, "file": s.file, "line": s.line}),
+                        )
+                        .collect();
+                    serde_json::json!({"variants": variants})
+                }
+            )
         }
         // symbol.usages / symbol.lifecycle → 已迁移至 Python handlers/code_analysis.py
 
@@ -925,126 +966,259 @@ pub async fn dispatch(
         // When Python Soul is running, pydantic/LiteLLM paths route to Python handlers
         // directly (bypassing these arms) for richer LLM-assisted analysis.
         "assume.has_tests" | "assume.has_tests.stub" => {
-            let symbol  = args["symbol"].as_str().unwrap_or("");
+            let symbol = args["symbol"].as_str().unwrap_or("");
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"has_tests": false, "symbol": symbol, "note": "index not built"}), |idx| {
-                let test_matches: Vec<_> = idx.find_symbol(&format!("test_{}", symbol)).unwrap_or_default()
-                    .into_iter().chain(idx.find_symbol(&format!("{}_test", symbol)).unwrap_or_default())
-                    .chain(idx.find_symbol(&format!("test{}", symbol)).unwrap_or_default())
-                    .collect();
-                serde_json::json!({"has_tests": !test_matches.is_empty(), "symbol": symbol, "test_symbols": test_matches.len()})
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"has_tests": false, "symbol": symbol, "note": "index not built"}),
+                |idx| {
+                    let test_matches: Vec<_> = idx
+                        .find_symbol(&format!("test_{}", symbol))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain(
+                            idx.find_symbol(&format!("{}_test", symbol))
+                                .unwrap_or_default(),
+                        )
+                        .chain(
+                            idx.find_symbol(&format!("test{}", symbol))
+                                .unwrap_or_default(),
+                        )
+                        .collect();
+                    serde_json::json!({"has_tests": !test_matches.is_empty(), "symbol": symbol, "test_symbols": test_matches.len()})
+                }
+            )
         }
         "assume.is_pure" => {
-            let symbol  = args["symbol"].as_str().unwrap_or("");
+            let symbol = args["symbol"].as_str().unwrap_or("");
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"is_pure": null, "symbol": symbol, "note": "index not built"}), |idx| {
-                let sym_id = idx.find_symbol(symbol).unwrap_or_default().into_iter().next().map(|s| s.id).unwrap_or_else(|| symbol.to_string());
-                let outgoing = idx.outgoing_calls(&sym_id).unwrap_or_default();
-                let io_calls: Vec<String> = outgoing.iter().filter(|s| {
-                    let n = s.name.to_lowercase();
-                    n.contains("write") || n.contains("read") || n.contains("print") || n.contains("log") || n.contains("send")
-                }).map(|s| s.name.clone()).collect();
-                serde_json::json!({"is_pure": io_calls.is_empty(), "symbol": symbol, "io_calls": io_calls, "confidence": "heuristic"})
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"is_pure": null, "symbol": symbol, "note": "index not built"}),
+                |idx| {
+                    let sym_id = idx
+                        .find_symbol(symbol)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .next()
+                        .map(|s| s.id)
+                        .unwrap_or_else(|| symbol.to_string());
+                    let outgoing = idx.outgoing_calls(&sym_id).unwrap_or_default();
+                    let io_calls: Vec<String> = outgoing
+                        .iter()
+                        .filter(|s| {
+                            let n = s.name.to_lowercase();
+                            n.contains("write")
+                                || n.contains("read")
+                                || n.contains("print")
+                                || n.contains("log")
+                                || n.contains("send")
+                        })
+                        .map(|s| s.name.clone())
+                        .collect();
+                    serde_json::json!({"is_pure": io_calls.is_empty(), "symbol": symbol, "io_calls": io_calls, "confidence": "heuristic"})
+                }
+            )
         }
         "assume.caller_count" => {
-            let symbol  = args["symbol"].as_str().unwrap_or("");
+            let symbol = args["symbol"].as_str().unwrap_or("");
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"caller_count": 0, "symbol": symbol}), |idx| {
-                let sym_id = idx.find_symbol(symbol).unwrap_or_default().into_iter().next().map(|s| s.id).unwrap_or_else(|| symbol.to_string());
-                let callers = idx.incoming_calls(&sym_id).unwrap_or_default();
-                let caller_names: Vec<String> = callers.iter().map(|s| s.name.clone()).collect();
-                serde_json::json!({"caller_count": callers.len(), "symbol": symbol, "callers": caller_names})
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"caller_count": 0, "symbol": symbol}),
+                |idx| {
+                    let sym_id = idx
+                        .find_symbol(symbol)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .next()
+                        .map(|s| s.id)
+                        .unwrap_or_else(|| symbol.to_string());
+                    let callers = idx.incoming_calls(&sym_id).unwrap_or_default();
+                    let caller_names: Vec<String> =
+                        callers.iter().map(|s| s.name.clone()).collect();
+                    serde_json::json!({"caller_count": callers.len(), "symbol": symbol, "callers": caller_names})
+                }
+            )
         }
         "assume.has_side_effects" => {
-            let symbol  = args["symbol"].as_str().unwrap_or("");
+            let symbol = args["symbol"].as_str().unwrap_or("");
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"has_side_effects": null, "symbol": symbol}), |idx| {
-                let sym_id = idx.find_symbol(symbol).unwrap_or_default().into_iter().next().map(|s| s.id).unwrap_or_else(|| symbol.to_string());
-                let outgoing = idx.outgoing_calls(&sym_id).unwrap_or_default();
-                let effect_calls: Vec<String> = outgoing.iter().filter(|s| {
-                    let n = s.name.to_lowercase();
-                    n.contains("write") || n.contains("send") || n.contains("mutate") || n.contains("update") || n.contains("delete") || n.contains("save")
-                }).map(|s| s.name.clone()).collect();
-                serde_json::json!({"has_side_effects": !effect_calls.is_empty(), "symbol": symbol, "effect_calls": effect_calls, "confidence": "heuristic"})
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"has_side_effects": null, "symbol": symbol}),
+                |idx| {
+                    let sym_id = idx
+                        .find_symbol(symbol)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .next()
+                        .map(|s| s.id)
+                        .unwrap_or_else(|| symbol.to_string());
+                    let outgoing = idx.outgoing_calls(&sym_id).unwrap_or_default();
+                    let effect_calls: Vec<String> = outgoing
+                        .iter()
+                        .filter(|s| {
+                            let n = s.name.to_lowercase();
+                            n.contains("write")
+                                || n.contains("send")
+                                || n.contains("mutate")
+                                || n.contains("update")
+                                || n.contains("delete")
+                                || n.contains("save")
+                        })
+                        .map(|s| s.name.clone())
+                        .collect();
+                    serde_json::json!({"has_side_effects": !effect_calls.is_empty(), "symbol": symbol, "effect_calls": effect_calls, "confidence": "heuristic"})
+                }
+            )
         }
         "assume.verify" => {
             let assumption = args["assumption"].as_str().unwrap_or("");
-            let subject    = args["subject"].as_str().unwrap_or("");
+            let subject = args["subject"].as_str().unwrap_or("");
             let results = search_code(assumption, &cwd)?;
-            let relevant: Vec<_> = results.iter()
+            let relevant: Vec<_> = results
+                .iter()
                 .filter(|m| subject.is_empty() || m.file.contains(subject))
-                .take(5).collect();
-            Ok(serde_json::json!({"assumption": assumption, "subject": subject, "evidence": relevant, "verified": !relevant.is_empty(), "confidence": "heuristic"}))
+                .take(5)
+                .collect();
+            Ok(
+                serde_json::json!({"assumption": assumption, "subject": subject, "evidence": relevant, "verified": !relevant.is_empty(), "confidence": "heuristic"}),
+            )
         }
         "assume.is_deprecated" => {
-            let symbol  = args["symbol"].as_str().unwrap_or("");
-            let markers = ["#[deprecated", "@deprecated", "# Deprecated", "DEPRECATED", ".. deprecated::", "@Deprecated"];
+            let symbol = args["symbol"].as_str().unwrap_or("");
+            let markers = [
+                "#[deprecated",
+                "@deprecated",
+                "# Deprecated",
+                "DEPRECATED",
+                ".. deprecated::",
+                "@Deprecated",
+            ];
             let mut hits: usize = 0;
             for marker in &markers {
                 if let Ok(r) = search_code(marker, &cwd) {
-                    hits += r.iter().filter(|m| m.file.contains(symbol) || m.content.contains(symbol)).count();
+                    hits += r
+                        .iter()
+                        .filter(|m| m.file.contains(symbol) || m.content.contains(symbol))
+                        .count();
                 }
             }
-            Ok(serde_json::json!({"is_deprecated": hits > 0, "symbol": symbol, "evidence_count": hits}))
+            Ok(
+                serde_json::json!({"is_deprecated": hits > 0, "symbol": symbol, "evidence_count": hits}),
+            )
         }
         "assume.is_only_caller" => {
-            let caller  = args["caller"].as_str().unwrap_or("");
-            let target  = args["target"].as_str().unwrap_or("");
+            let caller = args["caller"].as_str().unwrap_or("");
+            let target = args["target"].as_str().unwrap_or("");
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"is_only_caller": false}), |idx| {
-                let target_id = idx.find_symbol(target).unwrap_or_default().into_iter().next().map(|s| s.id).unwrap_or_else(|| target.to_string());
-                let callers = idx.incoming_calls(&target_id).unwrap_or_default();
-                let is_only = callers.len() == 1 && callers.iter().any(|c| c.name.contains(caller));
-                serde_json::json!({"is_only_caller": is_only, "caller": caller, "target": target, "total_callers": callers.len()})
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"is_only_caller": false}),
+                |idx| {
+                    let target_id = idx
+                        .find_symbol(target)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .next()
+                        .map(|s| s.id)
+                        .unwrap_or_else(|| target.to_string());
+                    let callers = idx.incoming_calls(&target_id).unwrap_or_default();
+                    let is_only =
+                        callers.len() == 1 && callers.iter().any(|c| c.name.contains(caller));
+                    serde_json::json!({"is_only_caller": is_only, "caller": caller, "target": target, "total_callers": callers.len()})
+                }
+            )
         }
         "assume.types_match" => {
             let symbol_a = args["symbol_a"].as_str().unwrap_or("");
             let symbol_b = args["symbol_b"].as_str().unwrap_or("");
-            let db_path  = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"types_match": null, "note": "index not built"}), |idx| {
-                let a_syms = idx.find_symbol(symbol_a).unwrap_or_default();
-                let b_syms = idx.find_symbol(symbol_b).unwrap_or_default();
-                let a_files: std::collections::HashSet<&str> = a_syms.iter().map(|s| s.file.as_str()).collect();
-                let b_files: std::collections::HashSet<&str> = b_syms.iter().map(|s| s.file.as_str()).collect();
-                let shared: Vec<&&str> = a_files.intersection(&b_files).collect();
-                serde_json::json!({"types_match": !shared.is_empty(), "symbol_a": symbol_a, "symbol_b": symbol_b, "shared_file_count": shared.len(), "confidence": "heuristic"})
-            })
+            let db_path = cwd.join(".evocli").join("code_index.db");
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"types_match": null, "note": "index not built"}),
+                |idx| {
+                    let a_syms = idx.find_symbol(symbol_a).unwrap_or_default();
+                    let b_syms = idx.find_symbol(symbol_b).unwrap_or_default();
+                    let a_files: std::collections::HashSet<&str> =
+                        a_syms.iter().map(|s| s.file.as_str()).collect();
+                    let b_files: std::collections::HashSet<&str> =
+                        b_syms.iter().map(|s| s.file.as_str()).collect();
+                    let shared: Vec<&&str> = a_files.intersection(&b_files).collect();
+                    serde_json::json!({"types_match": !shared.is_empty(), "symbol_a": symbol_a, "symbol_b": symbol_b, "shared_file_count": shared.len(), "confidence": "heuristic"})
+                }
+            )
         }
         "impact.check" => {
-            let symbol      = args["symbol"].as_str().unwrap_or("");
+            let symbol = args["symbol"].as_str().unwrap_or("");
             let change_type = args["change_type"].as_str().unwrap_or("behavior");
-            let db_path     = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"symbol": symbol, "callers": [], "risk": "unknown"}), |idx| {
-                let sym_id = idx.find_symbol(symbol).unwrap_or_default().into_iter().next().map(|s| s.id).unwrap_or_else(|| symbol.to_string());
-                let callers  = idx.incoming_calls(&sym_id).unwrap_or_default();
-                let callees  = idx.outgoing_calls(&sym_id).unwrap_or_default();
-                let risk = if callers.len() > 10 { "high" } else if callers.len() > 3 { "medium" } else { "low" };
-                let caller_names: Vec<String> = callers.iter().map(|s| s.name.clone()).collect();
-                let callee_names: Vec<String> = callees.iter().map(|s| s.name.clone()).collect();
-                serde_json::json!({"symbol": symbol, "change_type": change_type, "caller_count": callers.len(), "callers": caller_names, "callees": callee_names, "risk": risk})
-            })
+            let db_path = cwd.join(".evocli").join("code_index.db");
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"symbol": symbol, "callers": [], "risk": "unknown"}),
+                |idx| {
+                    let sym_id = idx
+                        .find_symbol(symbol)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .next()
+                        .map(|s| s.id)
+                        .unwrap_or_else(|| symbol.to_string());
+                    let callers = idx.incoming_calls(&sym_id).unwrap_or_default();
+                    let callees = idx.outgoing_calls(&sym_id).unwrap_or_default();
+                    let risk = if callers.len() > 10 {
+                        "high"
+                    } else if callers.len() > 3 {
+                        "medium"
+                    } else {
+                        "low"
+                    };
+                    let caller_names: Vec<String> =
+                        callers.iter().map(|s| s.name.clone()).collect();
+                    let callee_names: Vec<String> =
+                        callees.iter().map(|s| s.name.clone()).collect();
+                    serde_json::json!({"symbol": symbol, "change_type": change_type, "caller_count": callers.len(), "callers": caller_names, "callees": callee_names, "risk": risk})
+                }
+            )
         }
         "impact.affected_tests" => {
-            let symbol  = args["symbol"].as_str().unwrap_or("");
+            let symbol = args["symbol"].as_str().unwrap_or("");
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"symbol": symbol, "affected_tests": []}), |idx| {
-                let sym_id = idx.find_symbol(symbol).unwrap_or_default().into_iter().next().map(|s| s.id).unwrap_or_else(|| symbol.to_string());
-                let callers = idx.incoming_calls(&sym_id).unwrap_or_default();
-                let tests: Vec<String> = callers.iter()
-                    .filter(|c| c.name.contains("test") || c.name.contains("spec") || c.file.contains("test"))
-                    .map(|c| c.name.clone()).collect();
-                serde_json::json!({"symbol": symbol, "affected_tests": tests, "total_callers": callers.len()})
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"symbol": symbol, "affected_tests": []}),
+                |idx| {
+                    let sym_id = idx
+                        .find_symbol(symbol)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .next()
+                        .map(|s| s.id)
+                        .unwrap_or_else(|| symbol.to_string());
+                    let callers = idx.incoming_calls(&sym_id).unwrap_or_default();
+                    let tests: Vec<String> = callers
+                        .iter()
+                        .filter(|c| {
+                            c.name.contains("test")
+                                || c.name.contains("spec")
+                                || c.file.contains("test")
+                        })
+                        .map(|c| c.name.clone())
+                        .collect();
+                    serde_json::json!({"symbol": symbol, "affected_tests": tests, "total_callers": callers.len()})
+                }
+            )
         }
         "impact.batch_check" => {
             let change_type = args["change_type"].as_str().unwrap_or("behavior");
-            let symbols: Vec<String> = args["symbols"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            let symbols: Vec<String> = args["symbols"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
             let db_path = cwd.join(".evocli").join("code_index.db");
             let mut results = vec![];
@@ -1053,10 +1227,21 @@ pub async fn dispatch(
                     let idx = arc.lock().unwrap();
                     for sym in &symbols {
                         // Resolve name → ID (same pattern as other analysis arms)
-                        let sym_id = idx.find_symbol(sym).unwrap_or_default()
-                            .into_iter().next().map(|s| s.id).unwrap_or_else(|| sym.clone());
+                        let sym_id = idx
+                            .find_symbol(sym)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .next()
+                            .map(|s| s.id)
+                            .unwrap_or_else(|| sym.clone());
                         let callers = idx.incoming_calls(&sym_id).unwrap_or_default();
-                        let risk = if callers.len() > 10 { "high" } else if callers.len() > 3 { "medium" } else { "low" };
+                        let risk = if callers.len() > 10 {
+                            "high"
+                        } else if callers.len() > 3 {
+                            "medium"
+                        } else {
+                            "low"
+                        };
                         results.push(serde_json::json!({"symbol": sym, "change_type": change_type, "caller_count": callers.len(), "risk": risk}));
                     }
                 }
@@ -1065,95 +1250,166 @@ pub async fn dispatch(
         }
         "equiv.find" => {
             let intent = args["intent"].as_str().unwrap_or("");
-            let limit  = args["limit"].as_u64().unwrap_or(5) as usize;
+            let limit = args["limit"].as_u64().unwrap_or(5) as usize;
             let results = search_code(intent, &cwd)?;
-            Ok(serde_json::json!({"intent": intent, "matches": results.into_iter().take(limit).collect::<Vec<_>>()}))
+            Ok(
+                serde_json::json!({"intent": intent, "matches": results.into_iter().take(limit).collect::<Vec<_>>()}),
+            )
         }
         "equiv.check_deps" => {
-            let intent  = args["intent"].as_str().unwrap_or("");
+            let intent = args["intent"].as_str().unwrap_or("");
             let results = search_code(intent, &cwd)?;
             let feasible = !results.is_empty();
-            Ok(serde_json::json!({"intent": intent, "feasible": feasible, "existing_matches": results.len(), "top_matches": results.into_iter().take(3).collect::<Vec<_>>()}))
+            Ok(
+                serde_json::json!({"intent": intent, "feasible": feasible, "existing_matches": results.len(), "top_matches": results.into_iter().take(3).collect::<Vec<_>>()}),
+            )
         }
         "equiv.find_similar_code" => {
-            let code  = args["code"].as_str().unwrap_or("");
+            let code = args["code"].as_str().unwrap_or("");
             let limit = args["limit"].as_u64().unwrap_or(5) as usize;
-            let query: String = code.split_whitespace()
+            let query: String = code
+                .split_whitespace()
                 .filter(|w| w.len() > 4 && w.chars().all(|c| c.is_alphanumeric() || c == '_'))
-                .take(5).collect::<Vec<_>>().join(" ");
-            let results = if !query.is_empty() { search_code(&query, &cwd)? } else { vec![] };
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let results = if !query.is_empty() {
+                search_code(&query, &cwd)?
+            } else {
+                vec![]
+            };
             Ok(serde_json::json!({"matches": results.into_iter().take(limit).collect::<Vec<_>>()}))
         }
         "verify.task" => {
             let contract_id = args["contract_id"].as_str().unwrap_or("");
-            let db_path = dirs::home_dir().unwrap_or_default().join(".evocli").join("contracts.db");
+            let db_path = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".evocli")
+                .join("contracts.db");
             if !db_path.exists() {
-                return Ok(serde_json::json!({"ok": false, "error": format!("Contract '{}' not found (no contracts.db)", contract_id)}));
+                return Ok(
+                    serde_json::json!({"ok": false, "error": format!("Contract '{}' not found (no contracts.db)", contract_id)}),
+                );
             }
             let store = contracts::ContractStore::new(&db_path)?;
             let active = store.list_active()?;
-            let contract = active.iter().find(|c| c.id == contract_id || c.id.starts_with(contract_id));
+            let contract = active
+                .iter()
+                .find(|c| c.id == contract_id || c.id.starts_with(contract_id));
             match contract {
-                None => Ok(serde_json::json!({"ok": false, "error": format!("Contract '{}' not found", contract_id)})),
+                None => Ok(
+                    serde_json::json!({"ok": false, "error": format!("Contract '{}' not found", contract_id)}),
+                ),
                 Some(c) => {
                     let checkpoints = store.get_checkpoints(&c.id)?;
-                    let done  = checkpoints.iter().filter(|cp| cp.status == "done").count();
+                    let done = checkpoints.iter().filter(|cp| cp.status == "done").count();
                     let total = checkpoints.len();
-                    let pct   = if total > 0 { done * 100 / total } else { 0 };
-                    Ok(serde_json::json!({"contract_id": c.id, "requirement": c.requirement, "overall_pct": pct, "checkpoints_done": done, "checkpoints_total": total, "status": if pct == 100 { "complete" } else { "in_progress" }}))
+                    let pct = if total > 0 { done * 100 / total } else { 0 };
+                    Ok(
+                        serde_json::json!({"contract_id": c.id, "requirement": c.requirement, "overall_pct": pct, "checkpoints_done": done, "checkpoints_total": total, "status": if pct == 100 { "complete" } else { "in_progress" }}),
+                    )
                 }
             }
         }
         "verify.coverage" => {
             let contract_id = args["contract_id"].as_str().unwrap_or("");
-            let db_path = dirs::home_dir().unwrap_or_default().join(".evocli").join("contracts.db");
+            let db_path = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".evocli")
+                .join("contracts.db");
             if !db_path.exists() {
-                return Ok(serde_json::json!({"error": format!("Contract '{}' not found (no contracts.db)", contract_id)}));
+                return Ok(
+                    serde_json::json!({"error": format!("Contract '{}' not found (no contracts.db)", contract_id)}),
+                );
             }
             let store = contracts::ContractStore::new(&db_path)?;
             let checkpoints = store.get_checkpoints(contract_id)?;
-            let covered:   Vec<&str> = checkpoints.iter().filter(|cp| cp.status == "done").map(|cp| cp.description.as_str()).collect();
-            let uncovered: Vec<&str> = checkpoints.iter().filter(|cp| cp.status != "done").map(|cp| cp.description.as_str()).collect();
-            let pct = if checkpoints.is_empty() { 0usize } else { covered.len() * 100 / checkpoints.len() };
-            Ok(serde_json::json!({"contract_id": contract_id, "coverage_pct": pct, "covered": covered, "uncovered": uncovered}))
+            let covered: Vec<&str> = checkpoints
+                .iter()
+                .filter(|cp| cp.status == "done")
+                .map(|cp| cp.description.as_str())
+                .collect();
+            let uncovered: Vec<&str> = checkpoints
+                .iter()
+                .filter(|cp| cp.status != "done")
+                .map(|cp| cp.description.as_str())
+                .collect();
+            let pct = if checkpoints.is_empty() {
+                0usize
+            } else {
+                covered.len() * 100 / checkpoints.len()
+            };
+            Ok(
+                serde_json::json!({"contract_id": contract_id, "coverage_pct": pct, "covered": covered, "uncovered": uncovered}),
+            )
         }
         "verify.drift" => {
             let contract_id = args["contract_id"].as_str().unwrap_or("");
             let diff = git::git_diff_ext(&cwd, "", None, false, "").unwrap_or_default();
             let has_changes = !diff.trim().is_empty();
-            Ok(serde_json::json!({"contract_id": contract_id, "has_changes": has_changes, "diff_size": diff.len(), "drift_detected": has_changes, "note": "heuristic: based on current git diff"}))
+            Ok(
+                serde_json::json!({"contract_id": contract_id, "has_changes": has_changes, "diff_size": diff.len(), "drift_detected": has_changes, "note": "heuristic: based on current git diff"}),
+            )
         }
         "symbol.usages" => {
             let symbol_id = args["symbol_id"].as_str().unwrap_or("");
-            let limit     = args["limit"].as_u64().unwrap_or(20) as usize;
-            let db_path   = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"symbol_id": symbol_id, "usages": []}), |idx| {
-                // Accept both symbol_id (from indexed data) and name (user-provided)
-                let resolved_id = if idx.incoming_calls(symbol_id).map(|v| !v.is_empty()).unwrap_or(false) {
-                    symbol_id.to_string()
-                } else {
-                    idx.find_symbol(symbol_id).unwrap_or_default().into_iter().next().map(|s| s.id).unwrap_or_else(|| symbol_id.to_string())
-                };
-                let callers = idx.incoming_calls(&resolved_id).unwrap_or_default();
-                let usages: Vec<serde_json::Value> = callers.into_iter().take(limit)
-                    .map(|s| serde_json::json!({"name": s.name, "file": s.file, "line": s.line})).collect();
-                serde_json::json!({"symbol_id": symbol_id, "usages": usages})
-            })
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let db_path = cwd.join(".evocli").join("code_index.db");
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"symbol_id": symbol_id, "usages": []}),
+                |idx| {
+                    // Accept both symbol_id (from indexed data) and name (user-provided)
+                    let resolved_id = if idx
+                        .incoming_calls(symbol_id)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false)
+                    {
+                        symbol_id.to_string()
+                    } else {
+                        idx.find_symbol(symbol_id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .next()
+                            .map(|s| s.id)
+                            .unwrap_or_else(|| symbol_id.to_string())
+                    };
+                    let callers = idx.incoming_calls(&resolved_id).unwrap_or_default();
+                    let usages: Vec<serde_json::Value> = callers
+                        .into_iter()
+                        .take(limit)
+                        .map(
+                            |s| serde_json::json!({"name": s.name, "file": s.file, "line": s.line}),
+                        )
+                        .collect();
+                    serde_json::json!({"symbol_id": symbol_id, "usages": usages})
+                }
+            )
         }
         "symbol.lifecycle" => {
-            let name    = args["name"].as_str().unwrap_or("");
+            let name = args["name"].as_str().unwrap_or("");
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"name": name, "lifecycle": []}), |idx| {
-                let syms = idx.find_symbol(name).unwrap_or_default();
-                let sym_id = syms.iter().next().map(|s| s.id.as_str()).unwrap_or(name).to_string();
-                let callers = idx.incoming_calls(&sym_id).unwrap_or_default();
-                let caller_names: Vec<String> = callers.iter().map(|s| s.name.clone()).collect();
-                serde_json::json!({"name": name, "definitions": serde_json::to_value(syms).unwrap_or_default(), "callers": caller_names})
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"name": name, "lifecycle": []}),
+                |idx| {
+                    let syms = idx.find_symbol(name).unwrap_or_default();
+                    let sym_id = syms
+                        .iter()
+                        .next()
+                        .map(|s| s.id.as_str())
+                        .unwrap_or(name)
+                        .to_string();
+                    let callers = idx.incoming_calls(&sym_id).unwrap_or_default();
+                    let caller_names: Vec<String> =
+                        callers.iter().map(|s| s.name.clone()).collect();
+                    serde_json::json!({"name": name, "definitions": serde_json::to_value(syms).unwrap_or_default(), "callers": caller_names})
+                }
+            )
         }
         "code_intel.ranked_context" => {
             let modified_file = args["modified_file"].as_str().unwrap_or("");
-            let limit         = args["limit"].as_u64().unwrap_or(20) as usize;
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let mentioned: Vec<String> = args["mentioned"]
                 .as_array()
                 .unwrap_or(&vec![])
@@ -1161,30 +1417,49 @@ pub async fn dispatch(
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect();
             let db_path = cwd.join(".evocli").join("code_index.db");
-            with_code_index!(db_path, fallback = serde_json::json!({"ranked": [], "modified_file": modified_file}), |idx| {
-                // Score symbols by: explicitly_mentioned(+2.0) + caller_count(normalized)
-                // This is a lightweight proxy for PageRank until the Rust graph crate
-                // exposes a proper PageRank implementation over the call graph.
-                let symbols = idx.list_symbols(std::path::Path::new(modified_file)).unwrap_or_default();
-                let mut scored: Vec<(f64, serde_json::Value)> = symbols.into_iter().map(|s| {
-                    let mention_bonus = if mentioned.iter().any(|m| s.name.contains(m.as_str()) || m.contains(s.name.as_str())) { 2.0 } else { 0.0 };
-                    let caller_count = idx.incoming_calls(&s.id).map(|c| c.len()).unwrap_or(0);
-                    let score = mention_bonus + (caller_count as f64).sqrt();
-                    let entry = serde_json::json!({
-                        "name": s.name, "kind": s.kind, "file": s.file, "line": s.line,
-                        "score": (score * 100.0).round() / 100.0,
-                        "caller_count": caller_count,
-                    });
-                    (score, entry)
-                }).collect();
-                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                let ranked: Vec<serde_json::Value> = scored.into_iter().take(limit).map(|(_, v)| v).collect();
-                serde_json::json!({
-                    "ranked": ranked,
-                    "modified_file": modified_file,
-                    "algorithm": "caller_count_sqrt + mention_bonus (proxy-PageRank)",
-                })
-            })
+            with_code_index!(
+                db_path,
+                fallback = serde_json::json!({"ranked": [], "modified_file": modified_file}),
+                |idx| {
+                    // Score symbols by: explicitly_mentioned(+2.0) + caller_count(normalized)
+                    // This is a lightweight proxy for PageRank until the Rust graph crate
+                    // exposes a proper PageRank implementation over the call graph.
+                    let symbols = idx
+                        .list_symbols(std::path::Path::new(modified_file))
+                        .unwrap_or_default();
+                    let mut scored: Vec<(f64, serde_json::Value)> = symbols
+                        .into_iter()
+                        .map(|s| {
+                            let mention_bonus = if mentioned
+                                .iter()
+                                .any(|m| s.name.contains(m.as_str()) || m.contains(s.name.as_str()))
+                            {
+                                2.0
+                            } else {
+                                0.0
+                            };
+                            let caller_count =
+                                idx.incoming_calls(&s.id).map(|c| c.len()).unwrap_or(0);
+                            let score = mention_bonus + (caller_count as f64).sqrt();
+                            let entry = serde_json::json!({
+                                "name": s.name, "kind": s.kind, "file": s.file, "line": s.line,
+                                "score": (score * 100.0).round() / 100.0,
+                                "caller_count": caller_count,
+                            });
+                            (score, entry)
+                        })
+                        .collect();
+                    scored
+                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let ranked: Vec<serde_json::Value> =
+                        scored.into_iter().take(limit).map(|(_, v)| v).collect();
+                    serde_json::json!({
+                        "ranked": ranked,
+                        "modified_file": modified_file,
+                        "algorithm": "caller_count_sqrt + mention_bonus (proxy-PageRank)",
+                    })
+                }
+            )
         }
 
         // ── Shell built-ins (Section 22) ─────────────────────────────────

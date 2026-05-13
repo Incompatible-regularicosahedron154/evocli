@@ -41,7 +41,9 @@ impl EventBus {
                 .join(".evocli")
                 .join("events.db");
             let _ = std::fs::create_dir_all(
-                db_path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+                db_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
             );
 
             let conn = match Connection::open(&db_path) {
@@ -70,9 +72,8 @@ impl EventBus {
             );
 
             // 迁移：旧表没有 project_id 列时自动补充（idempotent）
-            let _ = conn.execute_batch(
-                "ALTER TABLE events ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
-            );
+            let _ = conn
+                .execute_batch("ALTER TABLE events ADD COLUMN project_id TEXT NOT NULL DEFAULT ''");
             // 迁移：旧表的索引
             let _ = conn.execute_batch(
                 "CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id)",
@@ -135,7 +136,6 @@ impl EventBus {
             serde_json::json!({ "query": query, "hits": hits }),
         );
     }
-
 }
 
 // ── 进程级单例 ────────────────────────────────────────────────────────────────

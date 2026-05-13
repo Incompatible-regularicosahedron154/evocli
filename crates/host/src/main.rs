@@ -357,8 +357,12 @@ async fn run_tui(_debug: bool) -> Result<()> {
                 // Read relevant events from events.db for distill/scan jobs.
                 // Filter by session_id for MemoryDistill, by project_id for EvolutionScan.
                 let (event_filter_col, event_filter_val): (&str, String) = match &job.job_type {
-                    job_queue::JobType::MemoryDistill { session_id } => ("session_id", session_id.clone()),
-                    job_queue::JobType::EvolutionScan { project }    => ("project_id", project.clone()),
+                    job_queue::JobType::MemoryDistill { session_id } => {
+                        ("session_id", session_id.clone())
+                    }
+                    job_queue::JobType::EvolutionScan { project } => {
+                        ("project_id", project.clone())
+                    }
                     _ => ("session_id", String::new()),
                 };
                 let recent_events: Vec<serde_json::Value> = {
@@ -387,8 +391,12 @@ async fn run_tui(_debug: bool) -> Result<()> {
                                 }
                                 Err(_) => vec![],
                             }
-                        } else { vec![] }
-                    } else { vec![] }
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    }
                 };
 
                 let (method, params, timeout_ms) = match &job.job_type {
