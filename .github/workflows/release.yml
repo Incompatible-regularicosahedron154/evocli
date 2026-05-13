@@ -38,13 +38,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux x86_64（native）
           - name: linux-x86_64
             target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
-          - name: linux-aarch64
-            target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
-            use_cross: true
+          # Windows x86_64（native MSVC）
+          # linux-aarch64 排除：tantivy 的 x86 SIMD 特性检测在交叉编译时将
+          # icelake-server/avx512 等指令集传给 aarch64 LLVM，导致编译失败。
+          # 根因是 tantivy/knowledge_graph 依赖 host CPU 特性，无法安全交叉编译。
+          # 用户在 aarch64 机器上可直接 `cargo build --release --bin evocli`。
           - name: windows-x86_64
             target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -262,10 +264,9 @@ jobs:
             | 平台 | 文件 |
             |------|------|
             | Linux x86_64 | `evocli-${{ steps.ver.outputs.VERSION }}-linux-x86_64.tar.gz` |
-            | Linux aarch64 | `evocli-${{ steps.ver.outputs.VERSION }}-linux-aarch64.tar.gz` |
             | Windows x86_64 | `evocli-${{ steps.ver.outputs.VERSION }}-windows-x86_64.zip` |
 
-            > **macOS**: 暂不提供预编译包（ONNX Runtime 依赖需本地构建）。
+            > **macOS / Linux aarch64**: 暂不提供预编译包（依赖 ONNX/tantivy 的 SIMD 检测与交叉编译不兼容）。
             > 源码构建：`cargo build --release --bin evocli`
 
             ```bash
