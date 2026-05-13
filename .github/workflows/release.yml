@@ -1,12 +1,10 @@
 name: Release
 
 # ── 触发条件 ──────────────────────────────────────────────────────────────────
-# 1. 推送 v* 标签自动触发（如 git push origin v0.1.0）
-# 2. Actions → Run workflow 手动触发
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'   # v0.1.0, v1.2.3-rc1 等
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch:
     inputs:
       version:
@@ -14,30 +12,25 @@ on:
         required: true
         type: string
       draft:
-        description: '发布为草稿（Draft）'
+        description: '发布为草稿'
         required: false
         type: boolean
         default: false
       prerelease:
-        description: '标记为预发布（Pre-release）'
+        description: '标记为预发布'
         required: false
         type: boolean
         default: false
 
-# ── 环境变量 ──────────────────────────────────────────────────────────────────
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   BIN: evocli
 
-# ── 所需权限 ──────────────────────────────────────────────────────────────────
 permissions:
-  contents: write   # 创建 release + 上传附件
+  contents: write
 
-# =============================================================================
 jobs:
-
-  # ── Step 1: 多平台并行构建 ─────────────────────────────────────────────────
   build:
     name: Build · ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -45,49 +38,32 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Linux x86_64（native glibc）
           - name: linux-x86_64
             target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
-            ext: ''
-            archive_ext: tar.gz
-
-          # ── Linux AArch64（cross 容器，QEMU 加速）
           - name: linux-aarch64
             target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
-            ext: ''
-            archive_ext: tar.gz
             use_cross: true
-
-          # ── Windows x86_64（MSVC native）
           - name: windows-x86_64
             target: x86_64-pc-windows-msvc
             os: windows-latest
-            ext: .exe
-            archive_ext: zip
-
-          # ── macOS Intel（macos-13 = x86_64 runner）
-          - name: macos-x86_64
-            target: x86_64-apple-darwin
-            os: macos-13
-            ext: ''
-            archive_ext: tar.gz
-
-          # ── macOS Apple Silicon（macos-latest = arm64 runner）
-          - name: macos-aarch64
-            target: aarch64-apple-darwin
-            os: macos-latest
-            ext: ''
-            archive_ext: tar.gz
 
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
       - uses: actions/checkout@v4
 
-      # ── 提取版本号 ──────────────────────────────────────────────────────────
-      # tag 触发时：GITHUB_REF = refs/tags/v0.1.0 → VERSION=v0.1.0
-      # 手动触发时：使用 inputs.version
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk \
+            /opt/hostedtoolcache/Ruby /opt/google/chrome \
+            /usr/local/share/powershell /usr/share/swift /usr/lib/jvm 2>/dev/null || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          df -h /
+
       - name: Resolve version
         id: ver
         shell: bash
@@ -100,14 +76,12 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "ARCHIVE_NAME=${{ env.BIN }}-${VERSION}-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
 
-      # ── Rust 工具链（固定 1.85，Cargo.toml rust-version 要求）────────────
-      - name: Install Rust 1.85
+      - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      # ── Cargo + target 缓存 ─────────────────────────────────────────────────
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -120,14 +94,12 @@ jobs:
           key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: release-${{ matrix.target }}-
 
-      # ── 安装 cross（仅 aarch64-linux）──────────────────────────────────────
       - name: Install cross
         if: matrix.use_cross
         uses: taiki-e/install-action@v2
         with:
           tool: cross
 
-      # ── 编译 ────────────────────────────────────────────────────────────────
       - name: Build (native)
         if: "!matrix.use_cross"
         run: cargo build --release --bin ${{ env.BIN }} --target ${{ matrix.target }}
@@ -136,50 +108,34 @@ jobs:
         if: matrix.use_cross
         run: cross build --release --bin ${{ env.BIN }} --target ${{ matrix.target }}
 
-      # ── 打包：Unix（binary + Python Soul + setup scripts）─────────────────
       - name: Pack (Unix)
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         env:
           VERSION: ${{ steps.ver.outputs.VERSION }}
           ARCHIVE_NAME: ${{ steps.ver.outputs.ARCHIVE_NAME }}
         run: |
+          set -e
           BIN_PATH="target/${{ matrix.target }}/release/${{ env.BIN }}"
-          STAGING="${ARCHIVE_NAME}"
-          mkdir -p "${STAGING}"
-
-          # 1. Binary（strip 精简体积）
+          S="${ARCHIVE_NAME}"
+          mkdir -p "${S}/evocli-soul"
           [[ "${{ matrix.use_cross }}" != "true" ]] && strip "${BIN_PATH}" 2>/dev/null || true
-          cp "${BIN_PATH}" "${STAGING}/${{ env.BIN }}"
-          chmod +x "${STAGING}/${{ env.BIN }}"
-
-          # 2. Python Soul（LLM/Agent/Skill/Memory 引擎）
-          mkdir -p "${STAGING}/evocli-soul"
-          cp -r evocli-soul/evocli_soul   "${STAGING}/evocli-soul/"
-          cp    evocli-soul/pyproject.toml "${STAGING}/evocli-soul/"
-          # 清理编译缓存
-          find "${STAGING}/evocli-soul" -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-          find "${STAGING}/evocli-soul" -name "*.pyc"       -delete 2>/dev/null || true
-
-          # 3. 辅助脚本（setup / preflight / model downloader）
-          cp scripts/setup_dist.sh  "${STAGING}/setup.sh" && chmod +x "${STAGING}/setup.sh"
-          cp scripts/preflight.py   "${STAGING}/preflight.py"
-          cp scripts/download_models.py "${STAGING}/download_models.py"
-          cp scripts/setup_env.py   "${STAGING}/setup_env.py"
-
-          # 4. 文档
-          cp README.zh-CN.md "${STAGING}/README.md" 2>/dev/null || cp README.md "${STAGING}/README.md"
-          cp CHANGELOG.md "${STAGING}/CHANGELOG.md" 2>/dev/null || true
-
-          # 5. 打包 + 校验
-          tar -czf "${ARCHIVE_NAME}.tar.gz" "${STAGING}/"
+          cp "${BIN_PATH}" "${S}/${{ env.BIN }}" && chmod +x "${S}/${{ env.BIN }}"
+          cp -r evocli-soul/evocli_soul    "${S}/evocli-soul/"
+          cp    evocli-soul/pyproject.toml "${S}/evocli-soul/"
+          find "${S}/evocli-soul" \( -name "__pycache__" -o -name "*.pyc" \) -exec rm -rf {} + 2>/dev/null || true
+          cp scripts/setup_dist.sh     "${S}/setup.sh" && chmod +x "${S}/setup.sh"
+          cp scripts/preflight.py      "${S}/preflight.py"
+          cp scripts/download_models.py "${S}/download_models.py"
+          cp scripts/setup_env.py      "${S}/setup_env.py"
+          cp README.zh-CN.md "${S}/README.md" 2>/dev/null || cp README.md "${S}/README.md"
+          cp CHANGELOG.md "${S}/CHANGELOG.md" 2>/dev/null || true
+          df -h /
+          tar -czf "${ARCHIVE_NAME}.tar.gz" "${S}/"
           sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
-
-          echo "=== Package contents ==="
-          tar -tzf "${ARCHIVE_NAME}.tar.gz" | head -30
+          rm -rf "${S}"
           ls -lh "${ARCHIVE_NAME}.tar.gz"
 
-      # ── 打包：Windows（完整分发包，含 Soul + setup）──────────────────────
       - name: Pack (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -187,66 +143,43 @@ jobs:
           VERSION: ${{ steps.ver.outputs.VERSION }}
           ARCHIVE_NAME: ${{ steps.ver.outputs.ARCHIVE_NAME }}
         run: |
-          $Staging = $env:ARCHIVE_NAME
-          New-Item -ItemType Directory -Force -Path $Staging | Out-Null
-
-          # 1. Binary
-          $BinPath = "target\${{ matrix.target }}\release\${{ env.BIN }}.exe"
-          Copy-Item $BinPath "$Staging\${{ env.BIN }}.exe"
-
-          # 2. Python Soul
-          New-Item -ItemType Directory -Force -Path "$Staging\evocli-soul" | Out-Null
-          Copy-Item "evocli-soul\evocli_soul" "$Staging\evocli-soul\" -Recurse -Force
-          Copy-Item "evocli-soul\pyproject.toml" "$Staging\evocli-soul\" -Force
-          # 清理编译缓存
-          Get-ChildItem "$Staging\evocli-soul" -Recurse -Filter "__pycache__" -ErrorAction SilentlyContinue |
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-          Get-ChildItem "$Staging\evocli-soul" -Recurse -Filter "*.pyc" -ErrorAction SilentlyContinue |
-            Remove-Item -Force -ErrorAction SilentlyContinue
-
-          # 3. 辅助脚本
-          Copy-Item "scripts\setup_dist.ps1" "$Staging\setup.ps1"
-          Copy-Item "scripts\preflight.py"   "$Staging\preflight.py"
-          Copy-Item "scripts\download_models.py" "$Staging\download_models.py"
-          Copy-Item "scripts\setup_env.py"   "$Staging\setup_env.py"
-          # setup.sh（含换行符处理）
-          $shContent = Get-Content "scripts\setup_dist.sh" -Raw
+          $S = $env:ARCHIVE_NAME
+          New-Item -ItemType Directory -Force -Path $S | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ env.BIN }}.exe" "$S\${{ env.BIN }}.exe"
+          New-Item -ItemType Directory -Force -Path "$S\evocli-soul" | Out-Null
+          Copy-Item "evocli-soul\evocli_soul" "$S\evocli-soul\" -Recurse -Force
+          Copy-Item "evocli-soul\pyproject.toml" "$S\evocli-soul\" -Force
+          Get-ChildItem "$S\evocli-soul" -Recurse -Filter "__pycache__" -EA SilentlyContinue | Remove-Item -Recurse -Force -EA SilentlyContinue
+          Get-ChildItem "$S\evocli-soul" -Recurse -Filter "*.pyc" -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue
+          Copy-Item "scripts\setup_dist.ps1"    "$S\setup.ps1"
+          Copy-Item "scripts\preflight.py"       "$S\preflight.py"
+          Copy-Item "scripts\download_models.py" "$S\download_models.py"
+          Copy-Item "scripts\setup_env.py"       "$S\setup_env.py"
           $utf8 = New-Object System.Text.UTF8Encoding $false
-          [System.IO.File]::WriteAllText("$Staging\setup.sh", $shContent, $utf8)
-
-          # 4. 文档
+          [System.IO.File]::WriteAllText("$S\setup.sh", (Get-Content "scripts\setup_dist.sh" -Raw), $utf8)
           $readme = if (Test-Path "README.zh-CN.md") { "README.zh-CN.md" } else { "README.md" }
-          Copy-Item $readme "$Staging\README.md"
-          if (Test-Path "CHANGELOG.md") { Copy-Item "CHANGELOG.md" "$Staging\CHANGELOG.md" }
-
-          # 5. 打包 + 校验
+          Copy-Item $readme "$S\README.md"
+          if (Test-Path "CHANGELOG.md") { Copy-Item "CHANGELOG.md" "$S\CHANGELOG.md" }
           $ZipName = "$env:ARCHIVE_NAME.zip"
-          Compress-Archive -Path "$Staging\*" -DestinationPath $ZipName
+          Compress-Archive -Path "$S\*" -DestinationPath $ZipName
           $Hash = (Get-FileHash -Algorithm SHA256 $ZipName).Hash.ToLower()
-          "$Hash  $ZipName" | Out-File -FilePath "$ZipName.sha256" -Encoding utf8
-
-          Write-Host "=== Package size ==="
+          "$Hash  $ZipName" | Out-File "$ZipName.sha256" -Encoding utf8
           Get-Item $ZipName | Select-Object Name, @{N='SizeMB';E={[math]::Round($_.Length/1MB,1)}}
 
-      # ── 上传构建产物（供 release job 下载）──────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: artifact-${{ matrix.name }}
-          path: |
-            ${{ steps.ver.outputs.ARCHIVE_NAME }}.*
+          path: ${{ steps.ver.outputs.ARCHIVE_NAME }}.*
           retention-days: 1
 
-  # ── Step 2: 汇总 + 发布 GitHub Release ────────────────────────────────────
   release:
     name: Publish Release
     needs: build
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      # ── 提取版本号（与 build job 保持一致）──────────────────────────────
       - name: Resolve version
         id: ver
         run: |
@@ -257,55 +190,37 @@ jobs:
           fi
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      # ── 下载所有平台产物到 dist/ ─────────────────────────────────────────
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist/
           merge-multiple: true
 
-      # ── 合并 SHA-256 校验文件 ────────────────────────────────────────────
       - name: Merge checksums
         run: |
-          cd dist/
-          cat *.sha256 | sort > checksums-sha256.txt
-          rm -f *.sha256
-          echo "=== checksums-sha256.txt ==="
-          cat checksums-sha256.txt
-          echo ""
-          echo "=== Artifacts ==="
-          ls -lh
+          cd dist/ && cat *.sha256 | sort > checksums-sha256.txt && rm -f *.sha256
+          echo "=== Artifacts ==="; ls -lh
 
-      # ── 从 CHANGELOG.md 提取本版本 release notes ─────────────────────────
       - name: Extract release notes
         id: notes
         env:
           VERSION: ${{ steps.ver.outputs.VERSION }}
         run: |
-          # 提取 ## [X.Y.Z] 到下一个 ## 之间的内容
-          VER_CLEAN="${VERSION#v}"   # 去掉 v 前缀
           python3 - << 'EOF'
-          import re, os, sys
+          import re, os
           ver = os.environ["VERSION"].lstrip("v")
           try:
               with open("CHANGELOG.md", encoding="utf-8") as f:
                   content = f.read()
-              # 找到对应版本的段落
-              pattern = rf"## \[{re.escape(ver)}\][^\n]*\n(.*?)(?=\n## |\Z)"
-              m = re.search(pattern, content, re.DOTALL)
+              m = re.search(rf"## \[{re.escape(ver)}\][^\n]*\n(.*?)(?=\n## |\Z)", content, re.DOTALL)
               notes = m.group(1).strip() if m else "See CHANGELOG.md for details."
-          except Exception as e:
+          except Exception:
               notes = "See CHANGELOG.md for details."
-          # 截断（GitHub body 限制 125000 字符）
-          notes = notes[:8000] + ("\n\n_[截断，完整内容见 CHANGELOG.md]_" if len(notes) > 8000 else "")
+          notes = notes[:6000] + ("\n\n_[截断]_" if len(notes) > 6000 else "")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              # 多行输出用 heredoc 语法
-              f.write("NOTES<<EOFNOTES\n")
-              f.write(notes + "\n")
-              f.write("EOFNOTES\n")
+              f.write("NOTES<<EOFNOTES\n" + notes + "\nEOFNOTES\n")
           EOF
 
-      # ── 创建 GitHub Release ──────────────────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -329,35 +244,30 @@ jobs:
 
             ### 安装
 
-            #### Windows
+            **Windows**
             ```powershell
-            # 1. 下载并解压 evocli-${{ steps.ver.outputs.VERSION }}-windows-x86_64.zip
-            # 2. 进入解压目录：
-            .\setup.ps1          # 配置 Python 环境（首次，约 2-5 分钟）
-            .\evocli.exe init    # 配置 LLM provider + API key
-            .\evocli.exe         # 启动 AI 编程会话
+            # 解压 zip 后：
+            .\setup.ps1 && .\evocli.exe init && .\evocli.exe
             ```
 
-            #### Linux / macOS
+            **Linux x86_64**
             ```bash
-            # 1. 下载并解压对应平台的 .tar.gz
-            # 2. 进入解压目录：
-            bash setup.sh        # 配置 Python 环境（首次，约 2-5 分钟）
-            ./evocli init        # 配置 LLM provider + API key
-            ./evocli             # 启动 AI 编程会话
+            tar -xzf evocli-${{ steps.ver.outputs.VERSION }}-linux-x86_64.tar.gz
+            cd evocli-${{ steps.ver.outputs.VERSION }}-linux-x86_64/
+            bash setup.sh && ./evocli init && ./evocli
             ```
 
-            ### 平台支持
+            ### 平台
 
-            | 平台 | 架构 | 文件 |
-            |------|------|------|
-            | Linux | x86_64 | `evocli-${{ steps.ver.outputs.VERSION }}-linux-x86_64.tar.gz` |
-            | Linux | aarch64 | `evocli-${{ steps.ver.outputs.VERSION }}-linux-aarch64.tar.gz` |
-            | macOS | Intel | `evocli-${{ steps.ver.outputs.VERSION }}-macos-x86_64.tar.gz` |
-            | macOS | Apple Silicon | `evocli-${{ steps.ver.outputs.VERSION }}-macos-aarch64.tar.gz` |
-            | Windows | x86_64 | `evocli-${{ steps.ver.outputs.VERSION }}-windows-x86_64.zip` |
+            | 平台 | 文件 |
+            |------|------|
+            | Linux x86_64 | `evocli-${{ steps.ver.outputs.VERSION }}-linux-x86_64.tar.gz` |
+            | Linux aarch64 | `evocli-${{ steps.ver.outputs.VERSION }}-linux-aarch64.tar.gz` |
+            | Windows x86_64 | `evocli-${{ steps.ver.outputs.VERSION }}-windows-x86_64.zip` |
 
-            ### 校验完整性
+            > **macOS**: 暂不提供预编译包（ONNX Runtime 依赖需本地构建）。
+            > 源码构建：`cargo build --release --bin evocli`
+
             ```bash
             sha256sum --check checksums-sha256.txt
             ```
