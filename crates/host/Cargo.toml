@@ -70,3 +70,6 @@ ignore.workspace = true
 reqwest.workspace = true
 scraper.workspace = true
 htmd.workspace    = true
+
+[dev-dependencies]
+tempfile = "3"

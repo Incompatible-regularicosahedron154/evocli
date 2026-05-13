@@ -120,7 +120,10 @@ class LLMClient:
         import os as _os
         try:
             from pathlib import Path
-            import tomllib
+            try:
+                import tomllib
+            except ImportError:
+                import tomli as tomllib  # type: ignore[no-redef]
 
             def _read_toml(path: Path) -> dict:
                 if not path.exists():

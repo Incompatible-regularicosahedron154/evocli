@@ -49,15 +49,16 @@ class MemoryDistiller:
         written = 0
         for item in items:
             try:
-                await self.bridge.call("memory.write", {
-                    "priority_scope": item["priority_scope"],
-                    "project_id":     project_id,
-                    "memory_type":    item["memory_type"],
-                    "title":          item["title"],
-                    "body":           item["body"],
-                    "tags":           item.get("tags", []),
-                    "outcome":        item.get("outcome", "resolved"),
-                })
+                import evocli_soul.state as _md_state
+                import asyncio as _md_asyncio
+                _md_mem = _md_state.get_memory(project_id=project_id)
+                _md_content = f"{item['title']}\n{item['body']}"
+                await _md_asyncio.to_thread(
+                    _md_mem.add,
+                    _md_content,
+                    item["memory_type"],
+                    item["priority_scope"],
+                )
                 written += 1
             except Exception as e:
                 log.warning("memory write failed: %s", e)

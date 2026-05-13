@@ -82,10 +82,30 @@ async def _search_in_tests(bridge, query: str) -> list[dict]:
     ]
 
 
-async def _incoming_calls(bridge, symbol_id: str) -> list[dict]:
-    """获取调用此符号的调用者列表。失败时静默回退到空列表。"""
+async def _resolve_symbol_id(bridge, name_or_id: str) -> str:
+    """Resolve a symbol name to its indexed symbol_id.
+
+    code_intel.incoming_calls / outgoing_calls expect a symbol_id (the DB key),
+    but callers often supply a human-readable name.  Try to look up the ID via
+    code_intel.find_symbol; fall back to the raw string if no match found.
+    """
+    if not name_or_id:
+        return name_or_id
     try:
-        result = await bridge.call("code_intel.incoming_calls", {"symbol_id": symbol_id})
+        result = await bridge.call("code_intel.find_symbol", {"query": name_or_id})
+        syms = result if isinstance(result, list) else []
+        if syms:
+            return syms[0].get("id", name_or_id)
+    except Exception as _e:
+        log.debug("_resolve_symbol_id: failed to resolve '%s': %s", name_or_id, _e)
+    return name_or_id
+
+
+async def _incoming_calls(bridge, symbol_id: str) -> list[dict]:
+    """获取调用此符号的调用者列表。解析名称→ID，失败时静默回退。"""
+    try:
+        resolved = await _resolve_symbol_id(bridge, symbol_id)
+        result = await bridge.call("code_intel.incoming_calls", {"symbol_id": resolved})
         return result if isinstance(result, list) else []
     except Exception as e:
         import logging as _log
@@ -452,7 +472,8 @@ async def handle_impact_check(req_id: str, params: dict, send, state) -> None:
       symbol:      str   要分析的符号名或 ID
       change_type: str   修改类型："behavior"|"signature"|"delete"（默认 "behavior"）
     """
-    sym         = params.get("symbol", "")
+    # Accept both 'symbol' (Python handler convention) and 'name' (Rust arm convention)
+    sym = params.get("symbol") or params.get("name", "")
     change_type = params.get("change_type", "behavior")
     try:
         bridge = state.get_bridge()
@@ -868,9 +889,10 @@ async def handle_symbol_lifecycle(req_id: str, params: dict, send, state) -> Non
     查询符号的 Git 版本历史（何时引入、最近修改等）。
 
     params:
-      symbol: str   符号名
+      symbol: str   符号名 (also accepts 'name' for Rust/MCP path compatibility)
     """
-    sym = params.get("symbol", "")
+    # Accept both 'symbol' (Python convention) and 'name' (Rust arm / MCP convention)
+    sym = params.get("symbol") or params.get("name", "")
     try:
         bridge = state.get_bridge()
         # Sanitize sym to prevent shell injection via git log -S argument.

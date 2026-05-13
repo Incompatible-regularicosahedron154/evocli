@@ -48,7 +48,21 @@ class SessionManager:
     # 参见架构审计 X4：~/.evocli/ 内部数据目录豁免。
 
     def _path(self, session_id: str) -> Path:
-        return SESSIONS_DIR / f"{session_id}.json"
+        """Return safe on-disk path for a session file.
+        
+        Uses the same collision-resistant sanitization as state._history_path():
+        - Readable prefix: only alphanumerics, hyphens, underscores, dots
+        - SHA-256 suffix (12 hex chars) prevents collisions between IDs that
+          differ only in unsafe characters (e.g. "a/b" vs "a?b")
+        - Prevents path traversal attacks
+        """
+        import re
+        import hashlib
+        sid_str = str(session_id)
+        safe_prefix = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', sid_str)[:80]
+        suffix = hashlib.sha256(sid_str.encode()).hexdigest()[:12]
+        safe_name = f"{safe_prefix}_{suffix}" if safe_prefix else suffix
+        return SESSIONS_DIR / f"{safe_name}.json"
 
     def _save(self, meta: SessionMeta) -> None:
         self._path(meta.id).write_text(

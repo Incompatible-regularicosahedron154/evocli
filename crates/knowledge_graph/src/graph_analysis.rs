@@ -80,7 +80,9 @@ pub struct KnowledgeGraph {
     graph: DiGraph<Symbol, String>,
     /// symbol_id → NodeIndex mapping
     id_to_node: HashMap<String, NodeIndex>,
-    /// NodeIndex → symbol_id mapping (retained for potential future traversal)
+    /// NodeIndex → symbol_id mapping.
+    // NOTE: node_to_id is referenced by the planned graph-navigation API (symbol_path).
+    // Retained to avoid breaking the build when that API is implemented.
     #[allow(dead_code)]
     node_to_id: Vec<String>,
 }
@@ -285,6 +287,9 @@ impl KnowledgeGraph {
     }
 
     /// Alternative merge using default min_size=2. Kept for API completeness.
+    // NOTE: Currently unused — detect_communities_with_params calls
+    // merge_small_communities_threshold directly with the caller-supplied min_size.
+    // Retained as a convenience entry point for external callers that want default min_size.
     #[allow(dead_code)]
     fn merge_small_communities(&self, communities: Vec<Community>) -> Vec<Community> {
         self.merge_small_communities_threshold(communities, 2)

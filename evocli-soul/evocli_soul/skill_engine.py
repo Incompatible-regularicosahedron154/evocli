@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import tomllib  # Python 3.11+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import tomli as tomllib  # type: ignore[no-redef]  # Python 3.10 fallback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any

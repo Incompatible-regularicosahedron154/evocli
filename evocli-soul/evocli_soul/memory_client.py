@@ -218,9 +218,17 @@ class EvoCLIMemory:
     """
 
     def __init__(self, project_id: Optional[str] = None):
+        log.debug(
+            "EvoCLIMemory.__init__: starting — this may block for up to 10s on first run "
+            "(ONNX model loading). Pre-warm via state.prewarm_memory() before first RPC request."
+        )
         self.project_id = project_id or "global"
         self._store = self._init_store()
         self._init_vector_store()
+        log.debug(
+            "EvoCLIMemory.__init__: ready (vector=%s)",
+            "lancedb+fastembed" if self._embed_fn is not None else "jsonl-fallback",
+        )
 
     def _init_store(self) -> "_JSONLinesStore":
         """初始化文本存储后端（JSONLines，零依赖保证）"""
@@ -286,60 +294,154 @@ class EvoCLIMemory:
         return self._embed_fn is not None and self._vector_db is not None
 
     def _upsert_vector(self, item_id: str, text: str, metadata: dict) -> None:
-        """写入向量索引（fastembed.TextEmbedding 直接生成向量，手动写入 LanceDB）。"""
+        """写入向量索引（fastembed.TextEmbedding 直接生成向量，手动写入 LanceDB）。
+
+        project_id 作为顶层列存储（不再只埋在 metadata JSON 内），
+        使 LanceDB 可在查询层直接过滤，无需全量拉取后 Python 二次筛选。
+        """
         if not self._ensure_embedder():
             return
         try:
             import pyarrow as pa
 
-            # fastembed.TextEmbedding.embed() → generator of numpy arrays
             vecs = list(self._embed_fn.embed([text]))
             if not vecs:
                 return
             vec = vecs[0].tolist()
             dim = len(vec)
 
+            pid = metadata.get("project_id", self.project_id)
+
             row = {
-                "id":       item_id,
-                "text":     text,
-                "vector":   vec,
-                "metadata": _safe_json_dumps(metadata),
+                "id":         item_id,
+                "project_id": pid,       # 顶层列，LanceDB 可直接 WHERE 过滤
+                "text":       text,
+                "vector":     vec,
+                "metadata":   _safe_json_dumps(metadata),  # 保留完整 metadata 向后兼容
             }
 
             table_name = "memories"
             try:
                 tbl = self._vector_db.open_table(table_name)
+                # 检测旧表是否缺少 project_id 顶层列，缺少时迁移
+                col_names = [f.name for f in tbl.schema]
+                if "project_id" not in col_names:
+                    tbl = self._migrate_add_project_id(tbl, dim)
                 tbl.add([row])
+                self._has_project_id_col = True
             except Exception:
+                # 表不存在，按新 schema 创建
                 schema = pa.schema([
-                    pa.field("id",       pa.string()),
-                    pa.field("text",     pa.string()),
-                    pa.field("vector",   pa.list_(pa.float32(), dim)),
-                    pa.field("metadata", pa.string()),
+                    pa.field("id",         pa.string()),
+                    pa.field("project_id", pa.string()),
+                    pa.field("text",       pa.string()),
+                    pa.field("vector",     pa.list_(pa.float32(), dim)),
+                    pa.field("metadata",   pa.string()),
                 ])
                 tbl = self._vector_db.create_table(table_name, schema=schema)
                 tbl.add([row])
+                self._has_project_id_col = True
 
-            log.debug("Vector upsert ok: %s", item_id[:8])
+            log.debug("Vector upsert ok: %s (project=%s)", item_id[:8], pid)
         except Exception as e:
             log.debug("Vector upsert failed: %s", e)
 
+    def _migrate_add_project_id(self, tbl, dim: int):
+        """
+        迁移旧 memories 表：补充 project_id 顶层列。
+
+        LanceDB 不支持 ALTER TABLE ADD COLUMN，需要重建表：
+        1. 读取所有现有行
+        2. 为每行补充 project_id='global'（旧数据视为全局记忆）
+        3. 删除旧表，创建新 schema 的表
+        4. 写回数据
+
+        如果迁移失败，静默回退到旧表（不阻断写入）。
+        """
+        import pyarrow as pa
+        try:
+            old_rows = tbl.search().select(["id", "text", "vector", "metadata"]).to_list()
+            new_rows = []
+            for r in old_rows:
+                try:
+                    meta = _safe_json_dumps({"project_id": "global"})
+                    try:
+                        import json as _json
+                        existing_meta = _json.loads(r.get("metadata", "{}"))
+                        pid = existing_meta.get("project_id", "global")
+                        meta = r.get("metadata", "{}")
+                    except Exception:
+                        pid = "global"
+                        meta = r.get("metadata", "{}")
+                    new_rows.append({
+                        "id":         r["id"],
+                        "project_id": pid,
+                        "text":       r.get("text", ""),
+                        "vector":     r["vector"],
+                        "metadata":   meta,
+                    })
+                except Exception:
+                    continue
+
+            vec_dim = dim
+            schema = pa.schema([
+                pa.field("id",         pa.string()),
+                pa.field("project_id", pa.string()),
+                pa.field("text",       pa.string()),
+                pa.field("vector",     pa.list_(pa.float32(), vec_dim)),
+                pa.field("metadata",   pa.string()),
+            ])
+            self._vector_db.drop_table("memories")
+            new_tbl = self._vector_db.create_table("memories", schema=schema)
+            if new_rows:
+                new_tbl.add(new_rows)
+            log.info(
+                "Migrated memories table: added project_id column (%d rows preserved)",
+                len(new_rows),
+            )
+            return new_tbl
+        except Exception as e:
+            log.warning("memories migration failed (%s) — continuing with old schema", e)
+            return self._vector_db.open_table("memories")
+
     def _vector_search(self, query: str, top_k: int = 5,
                         current_project: str = ".", active_tools: list | None = None) -> list[dict]:
-        """向量语义搜索 + P1/P2/P3 优先级重排序。"""
+        """向量语义搜索 + P1/P2/P3 优先级重排序。
+
+        如果表有 project_id 顶层列（新 schema），在查询层直接过滤，
+        只拉取当前项目 + global 的记忆，性能提升 O(N)→O(k)。
+        旧 schema（无顶层列）回退到全量拉取后 Python 过滤。
+        """
         if not self._ensure_embedder():
             return []
         try:
             tbl = self._vector_db.open_table("memories")
 
-            # fastembed.TextEmbedding.embed() — same method for both docs and queries
             query_vecs = list(self._embed_fn.embed([query]))
             if not query_vecs:
                 return []
             query_vec = query_vecs[0].tolist()
 
-            # 向量搜索（纯 ANN）— hybrid 需要 FTS index 预先创建，此处用标准向量搜索
-            candidates = tbl.search(query_vec).limit(top_k * 3).to_list()
+            # ── 查询层 project_id 过滤（新 schema）──────────────────
+            has_pid_col = getattr(self, "_has_project_id_col", None)
+            if has_pid_col is None:
+                col_names = [f.name for f in tbl.schema]
+                has_pid_col = "project_id" in col_names
+                self._has_project_id_col = has_pid_col
+
+            pid = current_project or self.project_id
+            if has_pid_col:
+                # 安全转义：project_id 来自 cwd，不含单引号，但保险起见替换
+                safe_pid = pid.replace("'", "''")
+                candidates = (
+                    tbl.search(query_vec)
+                    .where(f"project_id = '{safe_pid}' OR project_id = 'global'")
+                    .limit(top_k * 3)
+                    .to_list()
+                )
+            else:
+                # 旧 schema 回退：全量拉取后 Python 端过滤
+                candidates = tbl.search(query_vec).limit(top_k * 3).to_list()
 
             # ── 优先级重排序（Section 6.4 PRIORITY_BOOST）────────────
             PRIORITY_BOOST = {"project": 1.5, "tool": 1.2, "global": 1.0}
@@ -364,7 +466,12 @@ class EvoCLIMemory:
                 if scope == "project" and meta.get("project_id") == current_project:
                     priority = "project"
                 # P2：工具记忆（活跃工具）
-                elif scope == "tool" and active_tools and meta.get("tool_id") in active_tools:
+                # Match by tool_id OR by tags that contain a tool name.
+                # Legacy entries may not have tool_id stored; tags provide a fallback.
+                elif scope == "tool" and active_tools and (
+                    meta.get("tool_id") in active_tools
+                    or any(t in (meta.get("tags") or []) for t in active_tools)
+                ):
                     priority = "tool"
                 else:
                     priority = "global"
@@ -443,7 +550,11 @@ class EvoCLIMemory:
             "body":           content,
             "memory_type":    memory_type,
             "priority_scope": priority,
-            "project_id":     self.project_id,
+            # Cross-project visibility fix: global-scoped memories are tagged "global"
+            # so the vector search filter (project_id=current OR project_id="global")
+            # can find them from ANY project. Without this, a global memory written in
+            # project_a would be tagged with project_a's path and invisible from project_b.
+            "project_id":     "global" if priority == "global" else self.project_id,
             "severity":       severity,
             "tags":           tags or [],
             "importance_score": importance,

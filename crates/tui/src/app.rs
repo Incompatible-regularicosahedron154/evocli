@@ -170,6 +170,12 @@ pub struct App {
     /// Transient 1-line notification shown between chat and input areas.
     /// Auto-expires after NOTIF_TTL_SECS; does NOT go into chat history.
     pub notification: Option<Notification>,
+
+    // ── Session identity ──────────────────────────────────────────
+    /// When set (via `evocli session resume <id>`), all agent.stream calls use this ID
+    /// instead of the CWD-based hash, enabling true cross-restart history continuity.
+    /// None → fall back to CWD FNV-1a hash (default per-project bucket).
+    pub override_session_id: Option<String>,
 }
 
 /// Notification urgency level — controls icon and colour.
@@ -296,6 +302,7 @@ impl App {
             request_start: None,
             max_context_tokens,
             notification: None,
+            override_session_id: None,
         }
     }
 

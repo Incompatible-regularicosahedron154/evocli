@@ -85,22 +85,23 @@ class CodeChunkIndex:
             self._db = lancedb.connect(db_path)
 
             schema = {
-                "id":         "",
-                "symbol":     "",
-                "file":       "",
-                "language":   "",
-                "kind":       "",
-                "body":       "",
-                "signature":  "",
-                "project_id": "",
-                "line_start": 0,
-                "line_end":   0,
-                "body_hash":  "",
-                "indexed_at": 0.0,
-                "vector":     [0.0] * EMBED_DIM,  # jina-v2-base-code = 768-dim
+                "id":          "",
+                "rust_sym_id": "",   # Rust-side UUID — enables blast_radius/knowledge_graph → body lookup
+                "symbol":      "",
+                "file":        "",
+                "language":    "",
+                "kind":        "",
+                "body":        "",
+                "signature":   "",
+                "project_id":  "",
+                "line_start":  0,
+                "line_end":    0,
+                "body_hash":   "",
+                "indexed_at":  0.0,
+                "vector":      [0.0] * EMBED_DIM,  # jina-v2-base-code = 768-dim
             }
 
-            if COLLECTION in self._db.table_names():
+            if COLLECTION in self._db.list_tables():
                 self._tbl = self._db.open_table(COLLECTION)
             else:
                 # Create table with first dummy row to establish schema
@@ -218,7 +219,8 @@ class CodeChunkIndex:
         batch: list[dict] = []
 
         for sym in symbols:
-            name     = sym.get("name", "")
+            sym_id    = sym.get("id", "")   # Rust-side UUID for cross-referencing
+            name      = sym.get("name", "")
             kind     = sym.get("kind", "function")
             file_path = sym.get("file", "")
             line_start = int(sym.get("line", 0))
@@ -279,19 +281,20 @@ class CodeChunkIndex:
             vec = normalize_vector(vec, EMBED_DIM)
 
             batch.append({
-                "id":         chunk_id,
-                "symbol":     name,
-                "file":       file_path,
-                "language":   language,
-                "kind":       kind,
-                "body":       body[:4000],     # cap at ~1k tokens
-                "signature":  signature[:200],
-                "project_id": pid,
-                "line_start": line_start,
-                "line_end":   line_end or (line_start + len(body.splitlines())),
-                "body_hash":  bh,
-                "indexed_at": time.time(),
-                "vector":     vec,
+                "id":          chunk_id,
+                "rust_sym_id": sym_id,        # Rust UUID — for blast_radius reverse lookup
+                "symbol":      name,
+                "file":        file_path,
+                "language":    language,
+                "kind":        kind,
+                "body":        body[:4000],   # cap at ~1k tokens
+                "signature":   signature[:200],
+                "project_id":  pid,
+                "line_start":  line_start,
+                "line_end":    line_end or (line_start + len(body.splitlines())),
+                "body_hash":   bh,
+                "indexed_at":  time.time(),
+                "vector":      vec,
             })
 
             if len(batch) >= 50:
@@ -378,7 +381,7 @@ class CodeChunkIndex:
             return []
 
     def get_body(self, symbol_id: str) -> str | None:
-        """按 id 直接取函数体（用于 blast_radius 后的内容召回）。"""
+        """按 chunk id（file:line）取函数体。"""
         tbl = self._get_table()
         if tbl is None:
             return None
@@ -386,6 +389,28 @@ class CodeChunkIndex:
             rows = tbl.search().where(f"id = '{symbol_id}'").select(["body"]).to_list()
             return rows[0]["body"] if rows else None
         except Exception:
+            return None
+
+    def get_body_by_rust_id(self, rust_sym_id: str) -> str | None:
+        """按 Rust symbol UUID 取函数体（blast_radius / knowledge_graph 结果的内容召回）。
+
+        blast_radius RPC 返回的是 Rust 端 symbol UUID，
+        用此方法可直接从 LanceDB 取到对应的函数体文本。
+        旧版索引（无 rust_sym_id 字段）会静默返回 None。
+        """
+        tbl = self._get_table()
+        if tbl is None:
+            return None
+        try:
+            rows = (
+                tbl.search()
+                .where(f"rust_sym_id = '{rust_sym_id}'")
+                .select(["body"])
+                .to_list()
+            )
+            return rows[0]["body"] if rows else None
+        except Exception:
+            # Graceful fallback: old indexes without rust_sym_id column
             return None
 
     def get_bodies_for_symbols(self, symbol_names: list[str], project_id: str | None = None) -> list[dict]:
@@ -477,10 +502,12 @@ class CodeChunkIndex:
             # Build prompt with code snippets
             snippets = []
             for body_info in bodies[:max_symbols_per_community]:
+                sym_name = body_info.get("symbol", "")
                 file_    = body_info.get("file", "")
                 body     = (body_info.get("body", "") or "")[:500]
                 if body:
-                    snippets.append(f"// {file_}\n{body}")
+                    header = f"// {sym_name} in {file_}" if sym_name else f"// {file_}"
+                    snippets.append(f"{header}\n{body}")
 
             if not snippets:
                 continue
@@ -501,9 +528,11 @@ class CodeChunkIndex:
                 summary = summary.strip()
 
                 # Store in LanceDB memory for future retrieval
+                # Use the project_id (pid) from the outer loop so community summaries
+                # are stored in the correct project's memory bucket.
                 try:
                     import evocli_soul.state as _st
-                    mem = _st.get_memory()
+                    mem = _st.get_memory(project_id=pid)
                     if mem:
                         body_text = (
                             f"Community: {label}\n"
@@ -539,15 +568,24 @@ class CodeChunkIndex:
         return results
 
 
-# ── 进程级单例 ────────────────────────────────────────────────────────────────
+# ── 进程级索引缓存（per-project）──────────────────────────────────────────────
+# Changed from a single _index singleton to a dict keyed by normalized project path.
+# The old design had a "first caller wins" bug: if project A was indexed first,
+# all subsequent calls from any project returned A's index.
 
-_index: CodeChunkIndex | None = None
+import os as _os_cc
+_index_cache: dict[str, "CodeChunkIndex"] = {}
 
 
-def get_index(project_id: str = ".") -> CodeChunkIndex:
-    global _index
-    if _index is None:
-        _index = CodeChunkIndex(project_id)
-    return _index
+def get_index(project_id: str = ".") -> "CodeChunkIndex":
+    """Return the CodeChunkIndex for the given project, creating it if needed.
+
+    project_id is normalized to an absolute path so that ".", "/abs/path",
+    and os.getcwd() all resolve to the same cache entry for the same project.
+    """
+    norm = _os_cc.path.abspath(project_id)
+    if norm not in _index_cache:
+        _index_cache[norm] = CodeChunkIndex(norm)
+    return _index_cache[norm]
 
 

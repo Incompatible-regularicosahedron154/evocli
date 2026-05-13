@@ -285,7 +285,13 @@ impl Default for McpRegistry {
 /// **Maintenance contract**: when you add or remove a tool from
 /// `evocli_as_mcp_tools()`, update this constant accordingly.
 /// The `#[test] tool_count_matches_expected` below will catch drift.
-pub const EVOCLI_MCP_TOOL_COUNT: usize = 59;
+///
+/// Count breakdown (as of Wave-2 fix, 2026-05-13):
+///   fs(4) + git_base(7) + shell(13) + search(1) + memory(3)
+///   + symbol(4) + code_intel_calls(7) + assume(8) + impact(3)
+///   + equiv(3) + verify(3) + approval+user(3) + kg_base(3)
+///   + kg_new(2) + web(1) + git_ext(2) + fs_ext(1) + contracts(2) = 70
+pub const EVOCLI_MCP_TOOL_COUNT: usize = 70;
 
 /// 将 EvoCLI 所有内置工具暴露为标准 MCP tools/list 响应（62个工具完整版）
 /// 供其他 AI（Claude Desktop、Cursor 等）通过 MCP 协议使用 EvoCLI 能力
@@ -388,6 +394,25 @@ pub fn evocli_as_mcp_tools() -> Value {
         tool!("approval_request", "Request human approval before a destructive action",   serde_json::json!({"type":"object","properties":{"skill_id":{"type":"string"},"step_id":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"}}})),
         tool!("tool_list_user",   "List user-registered custom tools",                    serde_json::json!({"type":"object","properties":{}})),
         tool!("tool_run_user",    "Run a user-registered custom tool",                    serde_json::json!({"type":"object","properties":{"name":{"type":"string"},"args":{"type":"string"},"dry_run":{"type":"boolean"}},"required":["name"]})),
+
+        // ── Knowledge Graph (GitNexus-inspired) ──────────────────────────
+        tool!("code_intel_bm25_search",    "BM25 full-text code search across the indexed codebase", serde_json::json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]})),
+        tool!("code_intel_blast_radius",   "Blast radius analysis: upstream callers + downstream callees + risk assessment for a symbol", serde_json::json!({"type":"object","properties":{"symbol_id":{"type":"string"},"max_depth":{"type":"integer"}},"required":["symbol_id"]})),
+        tool!("code_intel_symbol_context", "360° symbol context: callers, callees, community membership, process/execution flow", serde_json::json!({"type":"object","properties":{"symbol_id":{"type":"string"}},"required":["symbol_id"]})),
+        tool!("code_intel_communities",    "List functional code communities detected by Label Propagation Algorithm", serde_json::json!({"type":"object","properties":{}})),
+        tool!("code_intel_processes",      "Execution flow / process detection: traces call chains from entry points", serde_json::json!({"type":"object","properties":{"max_depth":{"type":"integer"}}})),
+
+        // ── Web Fetch (native Rust: reqwest + scraper + htmd) ────────────
+        tool!("web_fetch", "Fetch a URL and return clean Markdown content (native Rust, no browser)", serde_json::json!({"type":"object","properties":{"url":{"type":"string"},"max_chars":{"type":"integer"},"selector":{"type":"string"}},"required":["url"]})),
+
+        // ── Git Extended (snapshot list/restore, range read) ─────────────
+        tool!("git_snapshot_list",    "List all safety snapshots for the project",         serde_json::json!({"type":"object","properties":{"limit":{"type":"integer"}}})),
+        tool!("git_snapshot_restore", "Restore from a specific snapshot by ref",           serde_json::json!({"type":"object","properties":{"ref":{"type":"string"},"project":{"type":"string"}},"required":["ref"]})),
+        tool!("fs_read_range",        "Read a specific line range from a file",            serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]})),
+
+        // ── Contracts (raw data access) ───────────────────────────────────
+        tool!("contracts_list",             "List all active task contracts",               serde_json::json!({"type":"object","properties":{}})),
+        tool!("contracts_get_checkpoints",  "Get checkpoints for a specific contract",      serde_json::json!({"type":"object","properties":{"contract_id":{"type":"string"}},"required":["contract_id"]})),
     ]})
 }
 

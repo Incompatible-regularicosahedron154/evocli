@@ -11,6 +11,7 @@ Memory handlers — 记忆增删查、蒸馏、巩固、冲突检测。
 """
 from __future__ import annotations
 import logging
+from typing import Any
 
 log = logging.getLogger("evocli.handlers.memory")
 
@@ -31,12 +32,13 @@ def register(router) -> None:
     router.add("memory.stats",            handle_memory_stats)
 
 
-async def handle_memory_add(req_id: str, params: dict, send, state) -> None:
-    content  = params.get("content", "")
-    mem_type = params.get("type", "episodic")
-    priority = params.get("priority", "project")
+async def handle_memory_add(req_id: str, params: dict[str, Any], send, state) -> None:
+    content    = params.get("content", "")
+    mem_type   = params.get("type", "episodic")
+    priority   = params.get("priority", "project")
+    project_id = params.get("project_id")
     try:
-        memory  = state.get_memory()
+        memory  = state.get_memory(project_id=project_id)
         item_id = memory.add(content, memory_type=mem_type, priority=priority)
         await send.response(req_id, {"ok": True, "id": item_id or ""})
     except Exception as e:
@@ -44,11 +46,12 @@ async def handle_memory_add(req_id: str, params: dict, send, state) -> None:
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_search(req_id: str, params: dict, send, state) -> None:
-    query = params.get("query", "")
-    top_k = params.get("top_k", 5)
+async def handle_memory_search(req_id: str, params: dict[str, Any], send, state) -> None:
+    query      = params.get("query", "")
+    top_k      = params.get("top_k", 5)
+    project_id = params.get("project_id")
     try:
-        memory  = state.get_memory()
+        memory  = state.get_memory(project_id=project_id)
         results = memory.search(query, top_k=top_k)
         await send.response(req_id, results)
     except Exception as e:
@@ -56,9 +59,10 @@ async def handle_memory_search(req_id: str, params: dict, send, state) -> None:
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_constraints(req_id: str, params: dict, send, state) -> None:
+async def handle_memory_constraints(req_id: str, params: dict[str, Any], send, state) -> None:
     try:
-        memory      = state.get_memory()
+        project_id  = params.get("project_id")
+        memory      = state.get_memory(project_id=project_id)
         constraints = memory.get_constraints()
         await send.response(req_id, constraints)
     except Exception as e:
@@ -66,7 +70,7 @@ async def handle_memory_constraints(req_id: str, params: dict, send, state) -> N
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_distill(req_id: str, params: dict, send, state) -> None:
+async def handle_memory_distill(req_id: str, params: dict[str, Any], send, state) -> None:
     try:
         from evocli_soul.memory_distill import MemoryDistiller
         distiller = MemoryDistiller(state.get_bridge())
@@ -77,11 +81,12 @@ async def handle_memory_distill(req_id: str, params: dict, send, state) -> None:
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_recall(req_id: str, params: dict, send, state) -> None:
-    query = params.get("query", "")
-    top_k = int(params.get("top_k", 5))
+async def handle_memory_recall(req_id: str, params: dict[str, Any], send, state) -> None:
+    query      = params.get("query", "")
+    top_k      = int(params.get("top_k", 5))
+    project_id = params.get("project_id")
     try:
-        memory  = state.get_memory()
+        memory  = state.get_memory(project_id=project_id)
         results = memory.search(query, top_k=top_k)
         await send.response(req_id, results)
     except Exception as e:
@@ -89,9 +94,10 @@ async def handle_memory_recall(req_id: str, params: dict, send, state) -> None:
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_write(req_id: str, params: dict, send, state) -> None:
+async def handle_memory_write(req_id: str, params: dict[str, Any], send, state) -> None:
     try:
-        memory   = state.get_memory()
+        project_id = params.get("project_id")
+        memory     = state.get_memory(project_id=project_id)
         content  = params.get("body", params.get("content", ""))
         priority = params.get("priority_scope", "project")
         item_id  = memory.add(content, memory_type=params.get("memory_type", "episodic"), priority=priority)
@@ -103,7 +109,7 @@ async def handle_memory_write(req_id: str, params: dict, send, state) -> None:
 
 # ── 研究驱动新增 handlers ────────────────────────────────────────────────────
 
-async def handle_memory_smart_add(req_id: str, params: dict, send, state) -> None:
+async def handle_memory_smart_add(req_id: str, params: dict[str, Any], send, state) -> None:
     """
     MemRouter 智能写入: 自动决策是否值得写入、分类类型、检测冲突。
     
@@ -117,11 +123,12 @@ async def handle_memory_smart_add(req_id: str, params: dict, send, state) -> Non
     """
     content  = params.get("content", "")
     priority = params.get("priority", "project")
+    project_id = params.get("project_id")
     if not content:
         await send.error(req_id, -32600, "content is required")
         return
     try:
-        memory = state.get_memory()
+        memory = state.get_memory(project_id=project_id)
         from evocli_soul.memory_router import get_memory_router
         from evocli_soul.memory_enhance import ConflictDetector
         from evocli_soul.handlers.metrics import _classify_with_model
@@ -189,7 +196,7 @@ async def handle_memory_smart_add(req_id: str, params: dict, send, state) -> Non
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_iterative_search(req_id: str, params: dict, send, state) -> None:
+async def handle_memory_iterative_search(req_id: str, params: dict[str, Any], send, state) -> None:
     """
     EviMem 迭代检索: 发现证据缺口时自动补充查询。
     
@@ -205,11 +212,12 @@ async def handle_memory_iterative_search(req_id: str, params: dict, send, state)
     query          = params.get("query", "")
     top_k          = int(params.get("top_k", 5))
     max_iterations = int(params.get("max_iterations", 2))
+    project_id     = params.get("project_id")
     if not query:
         await send.error(req_id, -32600, "query is required")
         return
     try:
-        memory = state.get_memory()
+        memory = state.get_memory(project_id=project_id)
         from evocli_soul.memory_enhance import IterativeRetriever
         retriever = IterativeRetriever(memory)
         results, meta = retriever.search_with_evidence_check(query, top_k, max_iterations)
@@ -219,7 +227,7 @@ async def handle_memory_iterative_search(req_id: str, params: dict, send, state)
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_consolidate(req_id: str, params: dict, send, state) -> None:
+async def handle_memory_consolidate(req_id: str, params: dict[str, Any], send, state) -> None:
     """
     记忆巩固: 情节记忆自动升格为语义记忆 (Memory Reflection Loop).
     
@@ -230,8 +238,9 @@ async def handle_memory_consolidate(req_id: str, params: dict, send, state) -> N
       dry_run: bool  True=仅统计不修改 (default False)
     """
     dry_run = params.get("dry_run", False)
+    project_id = params.get("project_id")
     try:
-        memory = state.get_memory()
+        memory = state.get_memory(project_id=project_id)
         from evocli_soul.memory_enhance import MemoryConsolidator
         consolidator = MemoryConsolidator(memory._store)
         result = consolidator.consolidate(
@@ -244,7 +253,7 @@ async def handle_memory_consolidate(req_id: str, params: dict, send, state) -> N
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_check_conflict(req_id: str, params: dict, send, state) -> None:
+async def handle_memory_check_conflict(req_id: str, params: dict[str, Any], send, state) -> None:
     """
     写入前冲突检测 (Conflict Resolution).
     
@@ -257,8 +266,9 @@ async def handle_memory_check_conflict(req_id: str, params: dict, send, state) -
     """
     content     = params.get("content", "")
     memory_type = params.get("memory_type", "episodic")
+    project_id  = params.get("project_id")
     try:
-        memory   = state.get_memory()
+        memory   = state.get_memory(project_id=project_id)
         from evocli_soul.memory_enhance import ConflictDetector
         detector = ConflictDetector(memory._store)
         result   = detector.check_conflict(content, memory_type, memory.project_id)
@@ -268,7 +278,7 @@ async def handle_memory_check_conflict(req_id: str, params: dict, send, state) -
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_forget_decayed(req_id: str, params: dict, send, state) -> None:
+async def handle_memory_forget_decayed(req_id: str, params: dict[str, Any], send, state) -> None:
     """
     选择性遗忘: 删除超过 min_days 未访问的情节记忆 (ScrapMem 光学遗忘思路).
     
@@ -282,8 +292,9 @@ async def handle_memory_forget_decayed(req_id: str, params: dict, send, state) -
     """
     min_days = int(params.get("min_days", 90))
     dry_run  = params.get("dry_run", True)
+    project_id = params.get("project_id")
     try:
-        memory    = state.get_memory()
+        memory    = state.get_memory(project_id=project_id)
         forgotten = memory.forget_decayed(min_days=min_days, dry_run=dry_run)
         await send.response(req_id, {
             "ok":       True,
@@ -297,15 +308,16 @@ async def handle_memory_forget_decayed(req_id: str, params: dict, send, state) -
         await send.error(req_id, -32603, str(e))
 
 
-async def handle_memory_stats(req_id: str, params: dict, send, state) -> None:
+async def handle_memory_stats(req_id: str, params: dict[str, Any], send, state) -> None:
     """
     记忆系统状态统计 (MemRouter 状态感知).
     
     Research: MemRouter 通过状态感知决定写入策略。
     Returns: 各类型记忆数量、衰减情况、项目 ID。
     """
+    project_id = params.get("project_id")
     try:
-        memory = state.get_memory()
+        memory = state.get_memory(project_id=project_id)
         stats  = memory.get_memory_stats()
         await send.response(req_id, stats)
     except Exception as e:

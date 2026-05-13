@@ -1,10 +1,32 @@
 """全局状态懒初始化 — 唯一职责：管理 Soul 内所有单例实例。"""
 from __future__ import annotations
+import os
 import threading
 from typing import Optional
 
+
+def normalize_project_id(project_id: str | None) -> str:
+    """Normalize project_id to a consistent absolute path.
+
+    Different callers use ".", "global", None, or an actual path.
+    This function maps all these to a single canonical form so memory
+    lookups, code-index keying, and context injection always use the same key.
+
+    Mapping rules:
+    - None / "" / "." / "global" → os.getcwd() (current project)
+    - relative path → os.path.abspath(path)
+    - absolute path → as-is (normalized separators)
+    """
+    if not project_id or project_id in (".", "global", ""):
+        return os.path.abspath(os.getcwd())
+    return os.path.abspath(project_id)
+
 _bridge: Optional[object]       = None
-_memory: Optional[object]       = None
+# _memory 改为字典单例，按 project_id 隔离
+# 旧代码中 _memory 是进程级唯一实例，首次绑定后不可更换。
+# 多项目并行时（evocli 在项目 A 启动后切换到 B），
+# 所有写入都会被标记 A 的 project_id，导致向量索引分类错乱。
+_memories: dict[str, object]    = {}   # project_id → EvoCLIMemory
 _skill_engine: Optional[object] = None
 _llm_client: Optional[object]   = None
 _agent: Optional[object]        = None
@@ -80,8 +102,68 @@ def clear_added_files(session_id: str = "default") -> None:
 
 # ── History API ───────────────────────────────────────────────────────────
 
+# History persistence directory: ~/.evocli/history/{session_id}.json
+# Written after every append, read lazily on first get_history() call.
+_HISTORY_DIR = None  # resolved lazily
+
+def _history_path(session_id: str):
+    """Return the on-disk path for a session's conversation history.
+
+    session_id is sanitized to prevent path traversal attacks AND file-name collisions:
+    - Only alphanumeric chars, hyphens, underscores, and dots are kept as-is
+    - Characters outside the safe set are replaced with '_' in the readable prefix
+    - A short SHA-256 suffix is appended to avoid collisions between session IDs
+      that differ only in unsafe chars (e.g. "a/b" vs "a?b" both sanitize to "a_b")
+    - Total filename length capped at 140 chars + ".json"
+    """
+    from pathlib import Path
+    import re
+    import hashlib
+    sid_str = str(session_id)
+    # Readable prefix (safe chars only)
+    safe_prefix = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', sid_str)[:80]
+    # Collision-resistant suffix: first 12 hex chars of SHA-256
+    suffix = hashlib.sha256(sid_str.encode()).hexdigest()[:12]
+    safe_name = f"{safe_prefix}_{suffix}" if safe_prefix else suffix
+    return Path.home() / ".evocli" / "history" / f"{safe_name}.json"
+
+
+def _load_history_from_disk(session_id: str) -> list[dict]:
+    """Load history from disk. Returns [] on any error (safe degradation)."""
+    import json
+    try:
+        path = _history_path(session_id)
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+
+def _save_history_to_disk(session_id: str, history: list[dict]) -> None:
+    """Persist history to disk (best-effort — never raises)."""
+    import json
+    try:
+        path = _history_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def get_history(session_id: str = "default") -> list[dict]:
-    """Return conversation history for a session (safe copy)."""
+    """Return conversation history for a session (safe copy).
+    
+    Loads from disk on first access so history persists across process restarts.
+    This enables true session resume: user restarts evocli and picks up where they left off.
+    """
+    if session_id not in _conversation_histories:
+        # First access: try to load from disk (cross-restart continuity)
+        loaded = _load_history_from_disk(session_id)
+        if loaded:
+            _conversation_histories[session_id] = loaded
     return list(_conversation_histories.get(session_id, []))
 
 
@@ -124,11 +206,15 @@ def append_history(messages: list[dict], session_id: str = "default") -> None:
             pruned.append(msg)
 
     _conversation_histories[session_id].extend(pruned)
+    # Persist to disk for cross-restart continuity (best-effort)
+    _save_history_to_disk(session_id, _conversation_histories[session_id])
 
 
 def set_history(messages: list[dict], session_id: str = "default") -> None:
     """Replace entire conversation history for a session (used by /undo)."""
     _conversation_histories[session_id] = list(messages)
+    # Persist to disk for cross-restart continuity (best-effort)
+    _save_history_to_disk(session_id, _conversation_histories[session_id])
 
 
 def clear_history(session_id: str = "default") -> None:
@@ -137,6 +223,9 @@ def clear_history(session_id: str = "default") -> None:
     The anchored summary is the whole point of /compress — it must survive the clear.
     Only the raw message list is cleared; the summary acts as the new compact "memory"
     of what happened before.
+
+    Also removes (or truncates) the on-disk history file so cleared history cannot
+    accidentally resurrect after a process restart (e.g., `evocli session resume`).
     """
     _conversation_histories.pop(session_id, None)
     _context_caches.pop(session_id, None)
@@ -145,6 +234,18 @@ def clear_history(session_id: str = "default") -> None:
     _files_read.pop(session_id, None)
     _current_turns.pop(session_id, None)
     # Note: _added_files intentionally NOT cleared — user's /add persists across /compress
+
+    # Remove on-disk history so cleared state survives restarts.
+    # Anchored summary is NOT persisted here — it's only needed within a running session.
+    # When a session resumes after /compress: the raw history is [] (disk deleted),
+    # and the model starts fresh. The summary is gone after restart by design — users
+    # must /compress again in the new session if they want a compact history.
+    try:
+        path = _history_path(session_id)
+        if path.exists():
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def get_history_token_estimate(session_id: str = "default") -> int:
@@ -250,7 +351,10 @@ def get_config() -> dict:
         with _init_lock:
             if _config is None:
                 try:
-                    import tomllib
+                    try:
+                        import tomllib
+                    except ImportError:
+                        import tomli as tomllib  # type: ignore[no-redef]
                     from pathlib import Path
 
                     def _read(p: Path) -> dict:
@@ -324,17 +428,27 @@ def set_bridge(bridge) -> None:
     _bridge = bridge
 
 
-def get_memory():
-    global _memory
-    if _memory is None:
+def get_memory(project_id: str | None = None):
+    """获取（或创建）指定项目的 EvoCLIMemory 实例。
+
+    project_id 默认为当前工作目录路径（cwd），保证每个项目写入各自的
+    LanceDB 行，不再出现多项目 project_id 标签混淆问题。
+
+    向后兼容：所有无参数的 get_memory() 调用自动使用 cwd，
+    行为与之前相同（每次从同一目录运行 evocli），
+    但现在支持同进程内切换项目。
+    """
+    global _memories
+    pid = normalize_project_id(project_id)  # canonical key: always absolute path
+    if pid not in _memories:
         with _init_lock:
-            if _memory is None:  # double-check after acquiring lock
+            if pid not in _memories:
                 from evocli_soul.memory_client import EvoCLIMemory
-                _memory = EvoCLIMemory()
-    return _memory
+                _memories[pid] = EvoCLIMemory(project_id=pid)
+    return _memories[pid]
 
 
-def get_memory_if_ready():
+def get_memory_if_ready(project_id: str | None = None):
     """Return the memory singleton **without blocking**.
 
     Returns the already-initialised EvoCLIMemory instance if it's ready,
@@ -344,7 +458,8 @@ def get_memory_if_ready():
     Reading a module-level reference is atomic under the GIL, so no lock
     is needed for this check-only path.
     """
-    return _memory
+    pid = normalize_project_id(project_id)  # same canonical key as get_memory()
+    return _memories.get(pid)
 
 
 def get_skill_engine():
@@ -384,7 +499,10 @@ def get_agent(config: dict | None = None):
 def reset_all() -> None:
     """测试用：重置所有单例。"""
     global _bridge, _memory, _skill_engine, _llm_client, _agent, _orchestrator, _config, _active_subagents
+    # Reset old-style single-instance vars (kept for backwards compat with any lingering refs)
     _bridge = _memory = _skill_engine = _llm_client = _agent = _orchestrator = _config = None
+    # Reset new-style per-project memory dict (the actual store since H1 unification)
+    _memories.clear()
     _active_subagents.clear()
     _session_events.clear()
     _conversation_histories.clear()

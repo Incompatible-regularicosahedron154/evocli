@@ -148,13 +148,13 @@ async def handle_evolution_transfer(req_id: str, params: dict, send, state) -> N
       dry_run:        bool  只分析不执行（default True）
       min_confidence: float 最低置信度（default 0.65）
     """
-    params.get("project_id", ".")
+    project_id     = params.get("project_id", ".")
     dry_run        = params.get("dry_run", True)
     min_confidence = float(params.get("min_confidence", 0.65))
     try:
         from evocli_soul.evolution.knowledge_classifier import KnowledgeClassifier, Transferability
         bridge  = state.get_bridge()
-        memory  = state.get_memory()
+        memory  = state.get_memory(project_id=project_id)
         clf     = KnowledgeClassifier()
 
         # 读取当前项目的 P1 记忆
@@ -177,13 +177,19 @@ async def handle_evolution_transfer(req_id: str, params: dict, send, state) -> N
             }
             if not dry_run:
                 try:
-                    await bridge.call("memory.write", {
-                        "priority_scope": target_scope,
-                        "memory_type":    mem.get("memory_type", "semantic"),
-                        "title":          f"[{target_scope.upper()}] {mem.get('title','')}",
-                        "body":           mem.get("body", ""),
-                        "tags":           (mem.get("tags") or []) + ["cross-project", "promoted"],
-                    })
+                    import evocli_soul.state as _mt_state
+                    import asyncio as _mt_asyncio
+                    _mt_mem = _mt_state.get_memory(project_id=project_id)
+                    _mt_content = (
+                        f"[{target_scope.upper()}] {mem.get('title','')}\n"
+                        f"{mem.get('body', '')}"
+                    )
+                    await _mt_asyncio.to_thread(
+                        _mt_mem.add,
+                        _mt_content,
+                        mem.get("memory_type", "semantic"),
+                        target_scope,
+                    )
                     promoted += 1
                     entry["promoted"] = True
                 except Exception as e:

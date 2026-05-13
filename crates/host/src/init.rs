@@ -9,7 +9,7 @@
 //!   6. AGENTS.md project rules
 
 use anyhow::{Context, Result};
-use dialoguer::{Confirm, Input, Password};
+use dialoguer::{Input, Password};
 
 use crate::config::{Config, LlmTiers};
 use crate::keystore::KeyStore;
@@ -546,36 +546,6 @@ print("  done")
             println!("  ⚠  Could not run download: {}", e);
             println!("     Text search will be used until model is available.");
         }
-    }
-}
-
-/// Map each provider to its current recommended fast/smart models.
-///
-/// These are updated to reflect models available as of 2025.
-/// Users can override in config.toml [llm.tiers] at any time.
-fn default_tiers_for(provider: &str) -> LlmTiers {
-    match provider {
-        "anthropic" => LlmTiers {
-            // claude-haiku-4-5 = fast/cheap, claude-sonnet-4-7 = balanced smart
-            fast: "claude-haiku-4-5".into(),
-            smart: "claude-sonnet-4-7".into(),
-        },
-        "openai" => LlmTiers {
-            // gpt-4o-mini = fast, gpt-4o = smart (universally available)
-            fast: "gpt-4o-mini".into(),
-            smart: "gpt-4o".into(),
-        },
-        "deepseek" => LlmTiers {
-            // deepseek-chat = fast, deepseek-reasoner = smart (chain-of-thought)
-            fast: "deepseek-chat".into(),
-            smart: "deepseek-reasoner".into(),
-        },
-        "ollama" => LlmTiers {
-            // Local models: small for fast tasks, larger for reasoning
-            fast: "qwen2.5-coder:7b".into(),
-            smart: "qwen2.5-coder:32b".into(),
-        },
-        _ => LlmTiers::default(),
     }
 }
 

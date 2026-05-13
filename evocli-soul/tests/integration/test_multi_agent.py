@@ -193,7 +193,11 @@ class TestDaemonWorkerManager:
     """验证后台 Daemon Workers 的调度逻辑"""
 
     def test_start_creates_background_tasks(self):
-        """start() 应该创建 2 个 asyncio 任务"""
+        """
+        start() is now a no-op: Python daemon scheduling was moved to Rust Job Queue
+        (JobType::MemoryDistill / JobType::EvolutionScan) to avoid JSON-RPC deadlocks.
+        Verify that start() executes without error and leaves _tasks empty.
+        """
         from evocli_soul.multi_agent import DaemonWorkerManager
 
         bridge = MockBridge()
@@ -205,7 +209,11 @@ class TestDaemonWorkerManager:
             return len(mgr._tasks)
 
         task_count = asyncio.run(_run())
-        assert task_count == 2, f"Expected 2 daemon tasks, got {task_count}"
+        # Design change: scheduling moved to Rust Job Queue, Python daemon is no-op
+        assert task_count == 0, (
+            f"DaemonWorkerManager.start() should be a no-op (0 tasks), got {task_count}. "
+            "If you restored Python scheduling, update this assertion and explain the design change."
+        )
         mgr.stop()
 
     def test_stop_cancels_all_tasks(self):

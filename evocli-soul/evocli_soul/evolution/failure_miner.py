@@ -44,20 +44,22 @@ class FailureMiner:
 
         for p in patterns:
             try:
-                await self.bridge.call("memory.write", {
-                    "priority_scope": "project",
-                    "project_id":     project_id,
-                    "memory_type":    "episode",
-                    "title":          f"失败模式：{p.failure_type}",
-                    "body":           (
-                        f"错误类型：{p.failure_type}\n"
-                        f"错误信息：{p.error_msg[:200]}\n"
-                        f"出现次数：{p.frequency}\n"
-                        f"最后出现：{p.last_seen}"
-                    ),
-                    "tags":    ["failure", p.failure_type],
-                    "outcome": "failure",
-                })
+                import evocli_soul.state as _fm_state
+                import asyncio as _fm_asyncio
+                _fm_mem = _fm_state.get_memory(project_id=project_id)
+                _fm_content = (
+                    f"失败模式：{p.failure_type}\n"
+                    f"错误类型：{p.failure_type}\n"
+                    f"错误信息：{p.error_msg[:200]}\n"
+                    f"出现次数：{p.frequency}\n"
+                    f"最后出现：{p.last_seen}"
+                )
+                await _fm_asyncio.to_thread(
+                    _fm_mem.add,
+                    _fm_content,
+                    "episodic",
+                    "project",
+                )
                 written += 1
             except Exception as e:
                 log.debug("Failed to write failure pattern: %s", e)

@@ -57,7 +57,10 @@ def _load_config() -> dict:
     """从 config.toml 读取 [embedder] 节覆盖值。"""
     try:
         from pathlib import Path as _Path
-        import tomllib
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore[no-redef]
         cfg_path = _Path.home() / ".evocli" / "config.toml"
         if cfg_path.exists():
             with open(cfg_path, "rb") as f:

@@ -38,13 +38,15 @@ dependencies = [
     # ── Skill + Evolution + Workflow ─────────────────────────────────────────
     "smolagents>=1.15",
     "prefixspan>=0.4",
-    "rocketry>=0.9",
     "langgraph>=0.3",
     "langgraph-checkpoint-sqlite>=2.0",
 
     # ── Context 优化 ──────────────────────────────────────────────────────────
     "tokenizers>=0.20",
     "tokenpruner>=1.0",
+
+    "keyring>=24.0",
+    "tomli>=2.0; python_version < '3.11'",
 
     # ── 网页抓取 ──────────────────────────────────────────────────────────────
     "readability-lxml>=0.9",

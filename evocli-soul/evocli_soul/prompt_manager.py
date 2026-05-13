@@ -1,4 +1,4 @@
-﻿"""
+"""
 PromptManager — G-08: prompt_template 注册表。
 
 研究更新: 使用 Jinja2 替代自定义 {{ }} 模板引擎。
@@ -116,7 +116,10 @@ class PromptManager:
         self._dir.mkdir(parents=True, exist_ok=True)
         for toml_file in self._dir.glob("*.toml"):
             try:
-                import tomllib
+                try:
+                    import tomllib
+                except ImportError:
+                    import tomli as tomllib  # type: ignore[no-redef]
                 with open(toml_file, "rb") as f:
                     data = tomllib.load(f)
                 for name, tmpl in data.get("templates", {}).items():
@@ -165,7 +168,10 @@ class PromptManager:
         try:
             existing: dict = {}
             if custom_file.exists():
-                import tomllib
+                try:
+                    import tomllib
+                except ImportError:
+                    import tomli as tomllib  # type: ignore[no-redef]
                 with open(custom_file, "rb") as f:
                     existing = tomllib.load(f)
             if "templates" not in existing:

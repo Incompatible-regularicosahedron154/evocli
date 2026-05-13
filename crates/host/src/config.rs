@@ -561,18 +561,6 @@ pub struct MemoryConfig {
 
 // ── Defaults ─────────────────────────────────────────────
 
-fn default_provider() -> String {
-    "openai".into()
-}
-// Global defaults use OpenAI since it's the most widely available provider.
-// These are overridden by evocli init based on the selected provider.
-// Users should set [llm.tiers] in config.toml for their actual provider.
-fn default_fast_model() -> String {
-    "gpt-4o-mini".into()
-}
-fn default_smart_model() -> String {
-    "gpt-4o".into()
-}
 fn default_max_total() -> usize {
     128_000
 }

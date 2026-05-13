@@ -85,14 +85,25 @@ class KnowledgeClassifier:
 
         target_scope = "global" if result.transferability == Transferability.GLOBAL else "tool"
         try:
-            await bridge.call("memory.write", {
-                "priority_scope": target_scope,
-                "memory_type":    memory_item.get("memory_type", "episode"),
-                "title":          f"[{target_scope.upper()}] {memory_item.get('title','')}",
-                "body":           memory_item.get("body", ""),
-                "tags":           memory_item.get("tags", []) + ["cross-project", "promoted"],
-                "outcome":        memory_item.get("outcome"),
-            })
+            import evocli_soul.state as _kc_state
+            import asyncio as _kc_asyncio
+            # Use the current project's memory instance (None → normalize to cwd).
+            # The entry's project_id field is set by memory_client.add():
+            #   "global" if priority == "global" else self.project_id
+            # So global-scoped memories get project_id="global" in the store,
+            # and are visible from all projects via the vector search filter
+            # (project_id = current OR project_id = 'global').
+            _kc_mem = _kc_state.get_memory(project_id=None)
+            _kc_content = (
+                f"[{target_scope.upper()}] {memory_item.get('title','')}\n"
+                f"{memory_item.get('body', '')}"
+            )
+            await _kc_asyncio.to_thread(
+                _kc_mem.add,
+                _kc_content,
+                memory_item.get("memory_type", "episodic"),
+                target_scope,
+            )
             log.info("Promoted memory to %s: %s", target_scope, memory_item.get("title", "")[:50])
             return {"promoted": True, "to_scope": target_scope, "confidence": result.confidence}
         except Exception as e:

@@ -31,25 +31,28 @@ async def check(skill_id: str, project: str, bridge) -> dict:
                     "detail":   f"{lock_file} 在过去 7 天有提交变更",
                 })
                 break
-        except Exception:
-            pass
+        except Exception as _e:
+            log.debug("decay_detector: dependency check failed for %s: %s", lock_file, _e)
 
     # 信号 2：长期未执行
     try:
-        records = await bridge.call("memory.recall", {
-            "query":          f"skill {skill_id} executed",
-            "priority_scope": "project",
-            "project_id":     project,
-            "top_k":          1,
-        })
+        import evocli_soul.state as _dd_state
+        import asyncio as _dd_asyncio
+        _dd_mem = _dd_state.get_memory(project_id=project)
+        records = await _dd_asyncio.to_thread(
+            _dd_mem.search,
+            f"skill {skill_id} executed",
+            1,
+            project,
+        )
         if not records:
             signals.append({
                 "type":     "idle_days_exceeded",
                 "severity": "low",
                 "detail":   "该 Skill 无近期执行记录",
             })
-    except Exception:
-        pass
+    except Exception as _e:
+        log.debug("decay_detector: idle check failed for skill %s: %s", skill_id, _e)
 
     severity = "none"
     if signals:

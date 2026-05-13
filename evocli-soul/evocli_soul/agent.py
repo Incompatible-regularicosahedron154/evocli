@@ -36,8 +36,8 @@ def _check_api_key(provider: str) -> None:
             if val:
                 os.environ[env_var] = val  # 注入到环境变量
                 return
-        except Exception:
-            pass
+        except Exception as _e:
+            log.debug("keyring lookup failed for %s: %s", provider, _e)
         raise _ApiKeyMissingError(provider, env_var)
 
 # 导入生产级提示词库（替代原始 6 行 _SYSTEM_TEMPLATE）
@@ -233,6 +233,7 @@ class EvoCLIAgent:
         LLM 可直接看到这 12 个工具的描述并按需调用。
         """
         import json as _json
+        from evocli_soul.handlers import code_analysis as _ca
 
         bridge = self.bridge  # closure capture — agent instances share bridge
 
@@ -270,6 +271,32 @@ class EvoCLIAgent:
                 log.warning("tool %s failed: %s", method, _tool_err)
                 await _emit_sc("tool_call_done", {"tool": method, "ok": False})
                 return f"Error: {_tool_err}"
+
+        async def _call_handler(handler_fn, params: dict) -> str:
+            """Call a Python-side RPC handler directly (bypasses deprecated Rust bridge).
+            
+            Used for tools migrated from Rust to Python (H1/H2 migration):
+            assume.*, impact.*, equiv.*, verify.*, symbol.usages, symbol.lifecycle
+            """
+            import json as _hj
+            import evocli_soul.state as _h_state
+            _result: dict = {}
+
+            class _MockSend:
+                async def response(self, req_id, data):
+                    _result['data'] = data
+                async def error(self, req_id, code, msg):
+                    _result['error'] = msg
+
+            try:
+                await handler_fn("local", params, _MockSend(), _h_state)
+            except Exception as _he:
+                log.warning("handler %s failed: %s", getattr(handler_fn, '__name__', '?'), _he)
+                return f"Error: {_he}"
+
+            if 'error' in _result:
+                return f"Error: {_result['error']}"
+            return _hj.dumps(_result.get('data', {}), ensure_ascii=False)
 
         @agent.tool_plain
         async def fs_read(path: str) -> str:
@@ -706,7 +733,12 @@ class EvoCLIAgent:
             """
             try:
                 from evocli_soul.code_chunks import get_index
-                idx = get_index(self._session_id)
+                import os as _os_ci
+                # Use the current working directory as project_id (stable per project,
+                # not per session). Using session_id here was a bug: the global _index
+                # singleton would be keyed by the first session_id that accessed it,
+                # giving all subsequent sessions a potentially wrong index scope.
+                idx = get_index(_os_ci.getcwd())
                 results = idx.search(
                     query,
                     top_k=top_k,
@@ -760,9 +792,12 @@ class EvoCLIAgent:
             Run once after major refactors to update the understanding.
             """
             try:
-                result = await bridge.call("code.generate_community_summaries", {
+                from evocli_soul.handlers import system as _sys_h
+                result_str = await _call_handler(_sys_h.handle_code_generate_community_summaries, {
                     "max_communities": max_communities,
                 })
+                import json as _csj
+                result = _csj.loads(result_str) if isinstance(result_str, str) else result_str
                 if isinstance(result, dict):
                     count = result.get("summaries_count", 0)
                     return _json.dumps({
@@ -1046,7 +1081,7 @@ class EvoCLIAgent:
         @agent.tool_plain
         async def symbol_usages(symbol_id: str, limit: int = 20) -> str:
             """Find all call sites and usages of a symbol across the codebase."""
-            return await _sc("symbol.usages", {"symbol_id": symbol_id, "limit": limit})
+            return await _call_handler(_ca.handle_symbol_usages, {"symbol_id": symbol_id, "limit": limit})
 
         @agent.tool_plain
         async def code_intel_list_symbols(path: str) -> str:
@@ -1070,43 +1105,43 @@ class EvoCLIAgent:
         @agent.tool_plain
         async def assume_has_tests(symbol: str) -> str:
             """Check if a function or class has test coverage."""
-            return await _sc("assume.has_tests", {"symbol": symbol})
+            return await _call_handler(_ca.handle_assume_has_tests, {"symbol": symbol})
 
         @agent.tool_plain
         async def assume_is_pure(symbol: str) -> str:
             """Check if a function is pure (no side effects, deterministic output)."""
-            return await _sc("assume.is_pure", {"symbol": symbol})
+            return await _call_handler(_ca.handle_assume_is_pure, {"symbol": symbol})
 
         @agent.tool_plain
         async def assume_caller_count(symbol: str) -> str:
             """Count how many places call a given symbol (helps assess change risk)."""
-            return await _sc("assume.caller_count", {"symbol": symbol})
+            return await _call_handler(_ca.handle_assume_caller_count, {"symbol": symbol})
 
         @agent.tool_plain
         async def assume_has_side_effects(symbol: str) -> str:
             """Check if a function has observable side effects (I/O, mutation, etc.)."""
-            return await _sc("assume.has_side_effects", {"symbol": symbol})
+            return await _call_handler(_ca.handle_assume_has_side_effects, {"symbol": symbol})
 
         @agent.tool_plain
         async def assume_verify(assumption: str, subject: str) -> str:
             """Verify a natural language assumption about a code element.
             assumption: what you believe to be true. subject: symbol or file being tested."""
-            return await _sc("assume.verify", {"assumption": assumption, "subject": subject})
+            return await _call_handler(_ca.handle_assume_verify, {"assumption": assumption, "subject": subject})
 
         @agent.tool_plain
         async def assume_is_deprecated(symbol: str) -> str:
             """Check if a symbol is deprecated or has a recommended replacement."""
-            return await _sc("assume.is_deprecated", {"symbol": symbol})
+            return await _call_handler(_ca.handle_assume_is_deprecated, {"symbol": symbol})
 
         @agent.tool_plain
-        async def assume_is_only_caller(symbol: str) -> str:
-            """Check if the current context is the only caller of a function."""
-            return await _sc("assume.is_only_caller", {"symbol": symbol})
+        async def assume_is_only_caller(caller: str, target: str) -> str:
+            """Check if a given caller is the only place that calls a target symbol."""
+            return await _call_handler(_ca.handle_assume_is_only_caller, {"caller": caller, "target": target})
 
         @agent.tool_plain
-        async def assume_types_match(symbol: str) -> str:
+        async def assume_types_match(symbol_a: str, symbol_b: str) -> str:
             """Check if two type signatures are compatible for a substitution."""
-            return await _sc("assume.types_match", {"symbol": symbol})
+            return await _call_handler(_ca.handle_assume_types_match, {"symbol_a": symbol_a, "symbol_b": symbol_b})
 
         # ══════════════════════════════════════════════════════════════════════
         # Impact analysis — use BEFORE modifying widely-used symbols
@@ -1115,18 +1150,20 @@ class EvoCLIAgent:
         @agent.tool_plain
         async def impact_check(symbol: str, change_type: str = "behavior") -> str:
             """Check the full impact radius of modifying a symbol.
-            change_type: 'behavior' | 'signature' | 'removal'"""
-            return await _sc("impact.check", {"symbol": symbol, "change_type": change_type})
+            change_type: 'behavior' | 'signature' | 'delete'"""
+            return await _call_handler(_ca.handle_impact_check, {"symbol": symbol, "change_type": change_type})
 
         @agent.tool_plain
         async def impact_affected_tests(symbol: str) -> str:
             """List all tests that would be affected by changing a symbol."""
-            return await _sc("impact.affected_tests", {"symbol": symbol})
+            return await _call_handler(_ca.handle_impact_affected_tests, {"symbol": symbol})
 
         @agent.tool_plain
         async def impact_batch_check(symbols_json: str) -> str:
             """Batch impact check for multiple symbols at once (JSON array of symbol names)."""
-            return await _sc("impact.batch_check", {"symbols": symbols_json})
+            import json as _ibj
+            symbols_list = _ibj.loads(symbols_json) if isinstance(symbols_json, str) else symbols_json
+            return await _call_handler(_ca.handle_impact_batch_check, {"symbols": symbols_list})
 
         # ══════════════════════════════════════════════════════════════════════
         # Verification tools
@@ -1135,17 +1172,17 @@ class EvoCLIAgent:
         @agent.tool_plain
         async def verify_task(task_id: str) -> str:
             """Verify that a task contract has been completed as specified."""
-            return await _sc("verify.task", {"task_id": task_id})
+            return await _call_handler(_ca.handle_verify_task, {"contract_id": task_id})
 
         @agent.tool_plain
         async def verify_coverage(symbol: str) -> str:
             """Verify that test coverage for a symbol meets the required threshold."""
-            return await _sc("verify.coverage", {"symbol": symbol})
+            return await _call_handler(_ca.handle_verify_coverage, {"contract_id": symbol})
 
         @agent.tool_plain
         async def verify_drift(spec: str) -> str:
             """Check if the implementation has drifted from the original specification."""
-            return await _sc("verify.drift", {"spec": spec})
+            return await _call_handler(_ca.handle_verify_drift, {"contract_id": spec, "use_llm": True})
 
         # ══════════════════════════════════════════════════════════════════════
         # Equivalence search
@@ -1154,12 +1191,12 @@ class EvoCLIAgent:
         @agent.tool_plain
         async def equiv_find(intent: str, limit: int = 5) -> str:
             """Find existing implementations that match a described intent (avoid re-inventing)."""
-            return await _sc("equiv.find", {"intent": intent, "limit": limit})
+            return await _call_handler(_ca.handle_equiv_find, {"intent": intent, "limit": limit})
 
         @agent.tool_plain
         async def equiv_find_similar_code(code: str, limit: int = 5) -> str:
             """Find code snippets semantically similar to a given code block."""
-            return await _sc("equiv.find_similar_code", {"code": code, "limit": limit})
+            return await _call_handler(_ca.handle_equiv_find_similar_code, {"code": code, "limit": limit})
 
         # ══════════════════════════════════════════════════════════════════════
         # Git safety tools
@@ -1173,7 +1210,7 @@ class EvoCLIAgent:
         @agent.tool_plain
         async def git_restore(ref: str = "") -> str:
             """Restore files from a git snapshot (pass stash ref or leave empty for latest)."""
-            return await _sc("git.restore", {"ref": ref} if ref else {})
+            return await _sc("git.restore", {"stash_ref": ref} if ref else {})
 
         # ══════════════════════════════════════════════════════════════════════
         # System tools
@@ -1183,7 +1220,7 @@ class EvoCLIAgent:
         async def approval_request(action: str, reason: str = "") -> str:
             """Request user confirmation before a risky or irreversible operation.
             action: what you are about to do. reason: why it is necessary."""
-            return await _sc("approval.request", {"action": action, "reason": reason})
+            return await _sc("approval.request", {"action": action, "message": reason})
 
         @agent.tool_plain
         async def memory_constraints() -> str:
@@ -1374,7 +1411,8 @@ class EvoCLIAgent:
                 try:
                     original = await self.bridge.call("fs.read", {"path": path})
                     original = str(original) if isinstance(original, str) else ""
-                except Exception:
+                except Exception as _e:
+                    log.debug("event record skipped: %s", _e)
                     original = ""
                 diff_result = await self.bridge.call("fs.diff", {
                     "old": original, "new": args.get("content", ""), "path": path
@@ -1392,8 +1430,8 @@ class EvoCLIAgent:
                             new = orig.replace(edit["search"], edit["replace"], 1)
                             d = await self.bridge.call("fs.diff", {"old": orig, "new": new, "path": edit["path"]})
                             diff_parts.append(str(d))
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        log.debug("event record skipped: %s", _e)
                 diff_text = "\n".join(diff_parts)
 
             if not diff_text or diff_text.strip() == "--- \n+++ \n":
@@ -1470,8 +1508,8 @@ class EvoCLIAgent:
                 "params": {k: v for k, v in args.items() if k not in ("content", "diff", "edits_json")},  # 不存大内容
                 "session_id": self._session_id,
             })
-        except Exception:
-            pass  # Never let event recording break tool execution
+        except Exception as _e:
+            log.debug("stream tool parse skipped: %s", _e)  # Never let event recording break tool execution
 
         # ── Python-native tools (architecture fix: Oracle routing bug) ──────────
         # These tools use Python logic but call bridge for IO operations.
@@ -1510,8 +1548,8 @@ class EvoCLIAgent:
                     "method": "fs_apply_search_replace",
                     "ok":     result.get("ok", False),
                 })
-            except Exception:
-                pass
+            except Exception as _e:
+                log.debug("stream tool parse skipped: %s", _e)
             return _json.dumps(result, ensure_ascii=False)
 
         # ── fs_read_symbol: Python-composite tool (symbol lookup + range read) ──
@@ -1843,6 +1881,46 @@ class EvoCLIAgent:
                 await emit_event("tool_call_done", {"tool": name, "ok": False})
                 return f"MCP error: {e}"
 
+        # ── Migrated Python handlers (H1/H2: Rust arms removed, route to Python directly) ──
+        _MIGRATED_TO_HANDLER = {
+            "assume_has_tests":        lambda a: (_ca.handle_assume_has_tests,     {"symbol": a.get("symbol","")}),
+            "assume_is_pure":          lambda a: (_ca.handle_assume_is_pure,        {"symbol": a.get("symbol","")}),
+            "assume_caller_count":     lambda a: (_ca.handle_assume_caller_count,   {"symbol": a.get("symbol","")}),
+            "assume_has_side_effects": lambda a: (_ca.handle_assume_has_side_effects, {"symbol": a.get("symbol","")}),
+            "assume_verify":           lambda a: (_ca.handle_assume_verify,         {"assumption": a.get("assumption",""), "subject": a.get("subject","")}),
+            "assume_is_deprecated":    lambda a: (_ca.handle_assume_is_deprecated,  {"symbol": a.get("symbol","")}),
+            "assume_is_only_caller":   lambda a: (_ca.handle_assume_is_only_caller, {"caller": a.get("caller", a.get("symbol","")), "target": a.get("target","")}),
+            "assume_types_match":      lambda a: (_ca.handle_assume_types_match,    {"symbol_a": a.get("symbol_a", a.get("symbol","")), "symbol_b": a.get("symbol_b","")}),
+            "impact_check":            lambda a: (_ca.handle_impact_check,          {"symbol": a.get("symbol",""), "change_type": a.get("change_type","behavior")}),
+            "impact_affected_tests":   lambda a: (_ca.handle_impact_affected_tests, {"symbol": a.get("symbol","")}),
+            "impact_batch_check":      lambda a: (_ca.handle_impact_batch_check,    {"symbols": a.get("symbols", []), "change_type": a.get("change_type", "behavior")}),
+            "verify_task":             lambda a: (_ca.handle_verify_task,           {"contract_id": a.get("contract_id", a.get("task_id",""))}),
+            "verify_coverage":         lambda a: (_ca.handle_verify_coverage,       {"contract_id": a.get("contract_id", a.get("symbol",""))}),
+            "verify_drift":            lambda a: (_ca.handle_verify_drift,          {"contract_id": a.get("contract_id", a.get("spec","")), "use_llm": True}),
+            "equiv_find":              lambda a: (_ca.handle_equiv_find,            {"intent": a.get("intent",""), "limit": a.get("limit", 5)}),
+            "equiv_check_deps":        lambda a: (_ca.handle_equiv_check_deps,     {"intent": a.get("intent","")}),
+            "equiv_find_similar_code": lambda a: (_ca.handle_equiv_find_similar_code, {"code": a.get("code",""), "limit": a.get("limit", 5)}),
+            "symbol_usages":           lambda a: (_ca.handle_symbol_usages,        {"symbol_id": a.get("symbol_id",""), "limit": a.get("limit", 20)}),
+            "symbol_lifecycle":        lambda a: (_ca.handle_symbol_lifecycle,      {"symbol": a.get("name", a.get("symbol",""))}),
+            "code_intel_ranked_context": lambda a: (_ca.handle_ranked_context,    {"modified_file": a.get("modified_file", "."), "mentioned": a.get("mentioned", []), "limit": a.get("limit", 20)}),
+        }
+        if name in _MIGRATED_TO_HANDLER:
+            from evocli_soul.handlers import code_analysis as _ca
+            import json as _mj
+            import evocli_soul.state as _m_state
+            _m_result: dict = {}
+            class _MSend:
+                async def response(self, req_id, data): _m_result['data'] = data
+                async def error(self, req_id, code, msg): _m_result['error'] = msg
+            fn, params_dict = _MIGRATED_TO_HANDLER[name](args)
+            try:
+                await fn("local", params_dict, _MSend(), _m_state)
+            except Exception as e:
+                return f"Error: {e}"
+            if 'error' in _m_result:
+                return f"Error: {_m_result['error']}"
+            return _mj.dumps(_m_result.get('data', {}), ensure_ascii=False)
+
         # ── Standard tools via Rust bridge ──────────────────────────────────────
         if name not in self._TOOL_TO_RPC:
             return f"Error: Unknown tool '{name}'"
@@ -2009,7 +2087,8 @@ class EvoCLIAgent:
         try:
             import evocli_soul.state as _st_run
             _run_history = _st_run.get_history(self._session_id)
-        except Exception:
+        except Exception as _e:
+            log.debug("context inject skipped: %s", _e)
             _run_history = []
         # Build context WITHOUT history (anchored_summary still loads via session_id)
         ctx = await self._build_context(

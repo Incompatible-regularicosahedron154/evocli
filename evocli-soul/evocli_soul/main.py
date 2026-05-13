@@ -181,7 +181,8 @@ async def main() -> None:
     # 模型 Context Window 预热（后台，不阻塞启动）
     async def _warmup_model_context():
         """在后台探测模型 context window，解决新模型名称问题。
-        通过 bridge.call("config.get") 获取配置，不直接读取 config.toml。
+        通过 bridge.call("config.get") 获取非敏感配置（api_key 已脱敏），
+        API key 从 keyring 或环境变量读取（config.get 不包含 key 以防泄露）。
         """
         try:
             import os
@@ -190,9 +191,25 @@ async def main() -> None:
             cfg = await bridge.call("config.get", {})
             llm = cfg.get("llm", {}) if isinstance(cfg, dict) else {}
             base_url = llm.get("base_url")
-            api_key  = llm.get("api_key") or os.environ.get("OPENAI_API_KEY")
             tiers    = llm.get("tiers", {})
             models   = list({tiers.get("fast"), tiers.get("smart")} - {None})
+            # api_key: config.get redacts it for security. Read from env or keyring instead.
+            api_key = (
+                os.environ.get("OPENAI_API_KEY")
+                or os.environ.get("ANTHROPIC_API_KEY")
+                or os.environ.get("DEEPSEEK_API_KEY")
+                or os.environ.get("GROQ_API_KEY")
+            )
+            if not api_key:
+                try:
+                    import keyring as _kr
+                    for _provider in ("openai", "anthropic", "deepseek", "groq"):
+                        _v = _kr.get_password("evocli", _provider)
+                        if _v:
+                            api_key = _v
+                            break
+                except Exception:
+                    pass
             if models and base_url and api_key:
                 from evocli_soul.model_context import warmup
                 await warmup(models, base_url, api_key)
@@ -205,8 +222,11 @@ async def main() -> None:
             from evocli_soul.multi_agent import get_daemon_manager
             import evocli_soul.state as state
             mgr = get_daemon_manager(state.get_bridge())
-            mgr.start()
-            log.info("Daemon workers started (memory_distill/5m, evolution_scan/10m)")
+            # DaemonWorkerManager.start() is currently a no-op:
+            # background scheduling has moved to evolution/scheduler.py (asyncio-based).
+            # Kept here as a hook for future daemon worker registration.
+            # mgr.start()  # NOOP — safe to remove after v3 daemon design is finalized
+            log.info("Daemon manager initialized (start() deferred — scheduling via evolution/scheduler.py)")
         except Exception as e:
             log.warning("Daemon workers init failed (non-fatal): %s", e)
 

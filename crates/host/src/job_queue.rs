@@ -63,6 +63,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT PRIMARY KEY,
     job_type    TEXT NOT NULL,
+    project_id  TEXT NOT NULL DEFAULT '',
     status      TEXT NOT NULL DEFAULT 'pending',
     retry_count INTEGER NOT NULL DEFAULT 0,
     max_retries INTEGER NOT NULL DEFAULT 3,
@@ -70,8 +71,18 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at  TEXT NOT NULL,
     error       TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+";
+
+/// 迁移：旧表无 project_id 时自动补充（idempotent）
+const MIGRATION: &str = "
+ALTER TABLE jobs ADD COLUMN project_id TEXT NOT NULL DEFAULT '';
+";
+
+/// 在 project_id 列确保存在后才能创建此索引（必须在 MIGRATION 之后执行）
+const POST_MIGRATION_INDEX: &str = "
+CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id);
 ";
 
 impl JobQueue {
@@ -82,16 +93,34 @@ impl JobQueue {
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open job queue at {}", db_path.display()))?;
         conn.execute_batch(SCHEMA)?;
+        // 迁移：旧表无 project_id 列时静默补充（如已存在则忽略错误）
+        let _ = conn.execute_batch(MIGRATION);
+        // project_id 列现在保证存在（新建或迁移后），安全创建索引
+        let _ = conn.execute_batch(POST_MIGRATION_INDEX);
         Ok(Self { conn })
     }
 
+    /// 推入任务，`project_id` 取自 JobType 中的 project 字段（若有），
+    /// 否则传空字符串（全局任务）。
     pub fn push(&self, job_type: JobType) -> Result<String> {
+        let project_id = match &job_type {
+            JobType::CodeIndexUpdate { project, .. } => project.clone(),
+            JobType::SkillRun { project, .. }        => project.clone(),
+            JobType::EvolutionScan { project }       => project.clone(),
+            JobType::MemoryDistill { .. }            => String::new(),
+            JobType::AgentSession { .. }             => String::new(),
+        };
+        self.push_with_project(job_type, &project_id)
+    }
+
+    fn push_with_project(&self, job_type: JobType, project_id: &str) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let type_json = serde_json::to_string(&job_type)?;
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO jobs (id, job_type, status, retry_count, max_retries, created_at, updated_at) VALUES (?1, ?2, 'pending', 0, 3, ?3, ?3)",
-            rusqlite::params![id, type_json, now],
+            "INSERT INTO jobs (id, job_type, project_id, status, retry_count, max_retries, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'pending', 0, 3, ?4, ?4)",
+            rusqlite::params![id, type_json, project_id, now],
         )?;
         Ok(id)
     }
@@ -250,4 +279,59 @@ pub fn jobs_db_path() -> std::path::PathBuf {
         .unwrap_or_default()
         .join(".evocli")
         .join("jobs.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies fresh DB creation works correctly (new install scenario).
+    #[test]
+    fn test_fresh_db_creation() {
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let db_path = dir.path().join("jobs.db");
+        let q = JobQueue::new(&db_path).expect("fresh DB should initialise");
+        // Push a job with project_id to confirm column exists
+        let id = q.push(JobType::EvolutionScan { project: "test_project".into() })
+            .expect("push should succeed on fresh DB");
+        assert!(!id.is_empty(), "job id should not be empty");
+    }
+
+    /// Simulates a legacy DB (no project_id column) and verifies that the migration
+    /// runs automatically, adding the column so subsequent operations succeed.
+    #[test]
+    fn test_legacy_db_migration() {
+        use rusqlite::Connection;
+
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let db_path = dir.path().join("jobs_legacy.db");
+
+        // Create an OLD-style jobs table WITHOUT project_id column
+        {
+            let conn = Connection::open(&db_path).expect("open legacy db");
+            conn.execute_batch("
+                CREATE TABLE jobs (
+                    id          TEXT PRIMARY KEY,
+                    job_type    TEXT NOT NULL,
+                    status      TEXT NOT NULL DEFAULT 'pending',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    max_retries INTEGER NOT NULL DEFAULT 3,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL,
+                    error       TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
+                CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+            ").expect("create legacy schema");
+        }
+
+        // Now open via JobQueue — migration should add project_id and create index
+        let q = JobQueue::new(&db_path)
+            .expect("JobQueue::new should succeed on legacy DB via migration");
+
+        // Verify we can push a job (requires project_id column to exist)
+        let id = q.push(JobType::EvolutionScan { project: "migrated_project".into() })
+            .expect("push should succeed after migration");
+        assert!(!id.is_empty(), "job id should not be empty after migration");
+    }
 }

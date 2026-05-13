@@ -1111,6 +1111,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soul_bridge",
+ "tempfile",
  "tokio",
  "toml",
  "tools",

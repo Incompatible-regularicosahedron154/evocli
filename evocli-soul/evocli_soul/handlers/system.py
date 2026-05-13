@@ -1,4 +1,4 @@
-﻿"""System handlers — 配置、Context 构建、Evolution 观察、代码搜索。"""
+"""System handlers — 配置、Context 构建、Evolution 观察、代码搜索。"""
 from __future__ import annotations
 import logging
 import os
@@ -31,7 +31,10 @@ async def handle_config_get(req_id: str, params: dict, send, _state) -> None:
     cfg: dict   = {}
     if config_path.exists():
         try:
-            import tomllib
+            try:
+                import tomllib
+            except ImportError:
+                import tomli as tomllib  # type: ignore[no-redef]
             with open(config_path, "rb") as f:
                 cfg = tomllib.load(f)
         except Exception:

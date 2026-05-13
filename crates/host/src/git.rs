@@ -128,22 +128,6 @@ pub fn git_log(repo: &Path, count: usize) -> Result<String> {
     run_git(repo, &["log", "--oneline", "-n", &count.to_string()])
 }
 
-pub fn git_diff(repo: &Path) -> Result<String> {
-    let unstaged = run_git(repo, &["diff"])?;
-    let staged = run_git(repo, &["diff", "--cached"])?;
-    let mut result = String::new();
-    if !staged.is_empty() {
-        result.push_str("=== STAGED ===\n");
-        result.push_str(&staged);
-        result.push('\n');
-    }
-    if !unstaged.is_empty() {
-        result.push_str("=== UNSTAGED ===\n");
-        result.push_str(&unstaged);
-    }
-    Ok(result)
-}
-
 /// Extended diff with parameter control.
 ///
 /// Parameters:

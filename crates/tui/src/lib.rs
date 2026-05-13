@@ -95,12 +95,15 @@ pub async fn run(
     let mut textarea = event_handler::create_textarea_for_width(initial_width);
 
     // P2-1: Session resume — inject a context-restore message
+    // AND store the resume ID so all submit paths use it instead of cwd_*
     if let Some(sid) = resume_session {
         app.messages.push(app::ChatMessage::System(format!(
             "↩ Resuming session {} — previous context loaded",
             &sid[..sid.len().min(16)]
         )));
         app.invalidate_cache();
+        // Store override: all agent.stream calls in this TUI session will use this ID
+        app.override_session_id = Some(sid.to_string());
     }
 
     // ── Keyboard event channel ──────────────────────────
@@ -233,9 +236,23 @@ pub async fn run(
                                 // bridge.call_stream() awaits the Soul (fastembed + LLM setup).
                                 // app.state was already set to Thinking by handle_key_event.
                                 terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
+                                // Session ID: prefer override (from resume_session) over CWD hash.
+                                // override_session_id is set when user runs `evocli session resume <id>`.
+                                // FNV-1a hash of CWD is the default per-project bucket for new sessions.
+                                let session_id = app.override_session_id.clone().unwrap_or_else(|| {
+                                    let cwd = std::env::current_dir()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string();
+                                    let hash: u64 = cwd.bytes().fold(
+                                        14_695_981_039_346_656_037_u64,
+                                        |acc, b| acc.wrapping_mul(1_099_511_628_211) ^ b as u64,
+                                    );
+                                    format!("cwd_{:012x}", hash & 0xFFFF_FFFF_FFFF)
+                                });
                                 let stream = bridge.call_stream(
                                     "agent.stream",
-                                    serde_json::json!({ "prompt": text }),
+                                    serde_json::json!({ "prompt": text, "session_id": session_id }),
                                 ).await?;
                                 app.start_streaming();
                                 let tx = chunk_tx.clone();
@@ -403,9 +420,21 @@ pub async fn run(
                             &mut textarea, &app.state, app.queued_count()
                         );
                         terminal.draw(|f| ui::draw(f, &mut app, &textarea))?;
+                        // Derive the same project-scoped session_id as the primary submit path
+                        let queued_session_id = app.override_session_id.clone().unwrap_or_else(|| {
+                            let cwd = std::env::current_dir()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            let hash: u64 = cwd.bytes().fold(
+                                14_695_981_039_346_656_037_u64,
+                                |acc, b| acc.wrapping_mul(1_099_511_628_211) ^ b as u64,
+                            );
+                            format!("cwd_{:012x}", hash & 0xFFFF_FFFF_FFFF)
+                        });
                         let stream = bridge.call_stream(
                             "agent.stream",
-                            serde_json::json!({ "prompt": next_text }),
+                            serde_json::json!({ "prompt": next_text, "session_id": queued_session_id }),
                         ).await?;
                         app.start_streaming();
                         let tx = chunk_tx.clone();

@@ -57,7 +57,10 @@ def _load_budget_total() -> int:
     """
     # 优先读用户配置覆盖
     try:
-        import tomllib
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore[no-redef]
         cfg_path = Path.home() / ".evocli" / "config.toml"
         if cfg_path.exists():
             with open(cfg_path, "rb") as f:
@@ -119,14 +122,18 @@ def _count_tokens(text: str, model: str = "") -> int:
         import litellm
         m = model or "gpt-4"  # default encoding for generic count
         return litellm.token_counter(model=m, text=text)
-    except Exception:
-        pass
+    except Exception as _e:
+        log.debug("token count: litellm failed (%s), trying tiktoken", _e)
     if importlib.util.find_spec("tiktoken"):
         try:
             import tiktoken
             return len(tiktoken.get_encoding("cl100k_base").encode(text))
-        except Exception:
-            pass
+        except Exception as _e:
+            log.warning(
+                "token count: both litellm and tiktoken unavailable (%s). "
+                "Falling back to len//4 — estimates may be inaccurate for non-ASCII text.",
+                _e,
+            )
     return max(1, len(text) // 4)
 
 
@@ -371,6 +378,12 @@ class ContextEngine:
         active_tools = params.get("active_tools", [])
         session_id   = params.get("session_id", "default")
 
+        # Normalize project_id to a stable absolute-path key.
+        # Callers use ".", "global", or actual paths — normalize_project_id() maps them
+        # all to os.path.abspath(), which matches how get_memory() and get_index() key.
+        from evocli_soul.state import normalize_project_id as _norm_pid
+        project_id = _norm_pid(project_id)
+
         # ── @ context providers (Continue.dev 模式) ─────────────────
         goal, mention_context = await self.parse_mentions(goal)
 
@@ -425,7 +438,11 @@ class ContextEngine:
         # 不经 IPC 桥，减少延迟，统一存储。
         _mc = None
         try:
-            _mc = _state_cache.get_memory()  # reuse _state_cache import
+            # Use get_memory_if_ready() instead of get_memory() to avoid blocking
+            # the asyncio event loop during fastembed/LanceDB model initialization
+            # (which can take 30+ seconds on first run).
+            # Pass project_id so the correct per-project memory instance is returned.
+            _mc = _state_cache.get_memory_if_ready(project_id)  # returns None if not yet initialized
         except Exception as e:
             log.debug("memory_client init: %s", e)
 
@@ -550,18 +567,36 @@ class ContextEngine:
             if current_file and remaining > 500:
                 try:
                     mentioned = params.get("mentioned_symbols", [])
-                    pre_ranked = await self.bridge.call("code_intel.ranked_context", {
+                    # Fix: code_intel.ranked_context migrated to Python handlers/code_analysis.py
+                    # bridge.call routes Python→Rust but Rust has no arm for this
+                    import evocli_soul.state as _ce_state
+                    _ce_result: dict = {}
+                    class _CeMockSend:
+                        async def response(self, req_id, data): _ce_result['data'] = data
+                        async def error(self, req_id, code, msg): _ce_result['error'] = msg
+                    from evocli_soul.handlers.code_analysis import handle_ranked_context
+                    await handle_ranked_context("local", {
                         "modified_file": current_file,
                         "mentioned":     mentioned,
                         "limit":         20,
-                    })
+                    }, _CeMockSend(), _ce_state)
+                    # handle_ranked_context returns {"ranked": [...], "modified_file": ..., ...}
+                    pre_ranked = _ce_result.get('data', {}).get('ranked', []) if isinstance(_ce_result.get('data'), dict) else []
                     if not isinstance(pre_ranked, list):
                         pre_ranked = []
                 except Exception as e:
                     log.debug("ranked_context prefetch: %s", e)
 
             # Step 2: RepoMap — 优先用 pre_ranked 跳过全仓 tree-sitter 扫描
-            if remaining > 500:
+            # Guard: require a current_file anchor before running RepoMap.
+            # Without a file anchor, RepoMap would tree-sitter scan the entire codebase
+            # (30-120s on large projects) with no way to rank relevance — not useful.
+            # Also skip if caller opts out or if the codebase is not indexed yet (pre_ranked==[]).
+            _skip_repomap = (
+                not current_file           # no file anchor — full-codebase scan is wasteful
+                or params.get("skip_repomap", False)  # explicit opt-out
+            )
+            if remaining > 500 and not _skip_repomap:
                 try:
                     import asyncio as _asyncio
                     from evocli_soul.repo_map import RepoMap
@@ -698,12 +733,21 @@ class ContextEngine:
         # ── Superpowers 指引技能（Guidance Skills 语义注入）──────────────────
         # 用 local_classifier.rank_by_similarity 替代关键词匹配，
         # 语义相关的 SKILL.md 指引自动注入上下文。
+        # Guard: only run embedding-based guidance if:
+        # 1. The embedder is already loaded (avoids 30s model download on first turn)
+        # 2. The skill engine is already initialized (avoids blocking bridge.call to Rust)
         if goal and remaining > 500:
             try:
+                from evocli_soul.local_classifier import _embedder_cache as _emb_cache
                 import evocli_soul.state as _state
-                engine = _state.get_skill_engine()
-                if hasattr(engine, "find_relevant_guidance"):
-                    matched_guidance = engine.find_relevant_guidance(goal, top_k=2)
+                _embedder_ready = _emb_cache is not None
+                _skill_engine_ready = _state._skill_engine is not None  # already initialized
+                if _embedder_ready and _skill_engine_ready:
+                    engine = _state.get_skill_engine()
+                    if hasattr(engine, "find_relevant_guidance"):
+                        matched_guidance = engine.find_relevant_guidance(goal, top_k=2)
+                    else:
+                        matched_guidance = []
                 else:
                     matched_guidance = []
 

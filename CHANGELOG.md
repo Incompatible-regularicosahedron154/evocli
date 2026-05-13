@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.0] — 2026-05-14
+
+### Fixed — Quality & Integration Sweep (49 issues across 6 waves)
+
+**Dependencies**
+- Remove `rocketry` zombie dependency (was declared but never imported after scheduling moved to Rust Job Queue)
+- Add `keyring>=24.0` (required by agent.py API key lookup, was missing from pyproject.toml)
+- Add `tomli>=2.0; python_version < '3.11'` for Python 3.10 compatibility (7 files used `import tomllib` which is 3.11+ stdlib only)
+
+**Rust Host**
+- Remove 5 dead_code functions: `default_provider`, `default_fast_model`, `default_smart_model` (config.rs), `project_id()` (event_bus.rs), `default_tiers_for` (init.rs), `git_diff` (git.rs)
+- Remove unused `Confirm` import from init.rs (code used fully-qualified `dialoguer::Confirm::new()`)
+- Fix unnecessary `mut` at tool_dispatch.rs:1418 (`let mut entries` in `write_tree`)
+- Add `#[allow(dead_code)]` to `event_bus::global()` with explanation comment
+- Add `#[allow(unused_mut)]` to `with_code_index!` macro to suppress 17 spurious warnings
+- Fix `jobs.db` schema migration order: `POST_MIGRATION_INDEX` now runs after `MIGRATION` so `project_id` column exists before index creation
+- Add `[dev-dependencies] tempfile = "3"` for jobs.db migration tests
+
+**MCP Exposure**
+- Expose 8 previously missing tools via `evocli_as_mcp_tools()`: `code_intel_communities`, `code_intel_processes`, `web_fetch`, `git_snapshot_list`, `git_snapshot_restore`, `fs_read_range`, `contracts_list`, `contracts_get_checkpoints`
+- Update `EVOCLI_MCP_TOOL_COUNT`: 62 → 70; unit test `tool_count_matches_expected` validates this
+
+**Python Soul — Core Logic**
+- Fix `code_intel.ranked_context`: was returning hardcoded `score=1.0` for all symbols; now uses `sqrt(caller_count) + mention_bonus` scoring with descending sort
+- Fix session_id in `handle_agent_run`: was `cwd_<md5>` (shared across conversations in same dir); now `sess_<uuid4>` per conversation
+- Fix session_id in `handle_agent_stream` and all slash commands (`/add`, `/btw`, `/compress`, `/undo`, `/plan`): DRY'd into `_derive_stream_session_id()` helper with design rationale documented
+- Fix TUI `lib.rs`: both `agent.stream` submit paths now explicitly pass `session_id` (FNV-1a hash of CWD for project continuity); `override_session_id` field added to `App` struct for `evocli session resume`
+- Fix `evolution/decay_detector.py`: 2 bare `except: pass` → `log.debug` with context
+- Fix `handlers/agent.py::auto-continue`: `if False:` guard documented with protocol limitation explanation and Options A/B/C roadmap
+
+**Python Soul — Memory System**
+- Add `normalize_project_id()` to `state.py`: maps `None/"."/"global"` → `os.path.abspath(os.getcwd())`; prevents `"."`, `"global"`, and actual cwd paths from hashing to different memory buckets
+- Fix ALL 11 memory handlers in `handlers/memory.py` to extract and pass `project_id` from params to `state.get_memory(project_id=project_id)` (previously all called `state.get_memory()` ignoring caller's project context)
+- Fix `metrics.py::handle_evolution_transfer()`: was no-op `params.get("project_id")` (value discarded); now properly passed to `get_memory()`
+- Fix `evolution/failure_miner.py::mine()`: ignored its `project_id` parameter; now passed to `get_memory()`
+- Fix `code_chunks.py::generate_community_summaries()`: stored summaries with wrong project_id; now uses `pid` from outer loop
+- Fix `memory_client.py::add()`: global-scoped memories now stored with `project_id="global"` instead of `self.project_id`, enabling cross-project retrieval via vector search filter
+- Fix `memory_client.py::search()`: tool memory matching now also checks `tags` field as fallback for legacy entries without `tool_id`
+- Fix `evolution/knowledge_classifier.py::promote_if_transferable()`: used `get_memory(project_id="global")` which normalized to cwd; now uses `get_memory(project_id=None)` and lets `add(priority="global")` set `project_id="global"` in the stored entry
+- Fix `state.py::reset_all()`: was resetting `_memory` (old single-instance var); now also calls `_memories.clear()` to clear the per-project memory dict
+
+**Python Soul — Context Engine**
+- Fix `context_engine.py`: `get_memory()` replaced with `get_memory_if_ready(project_id)` — avoids blocking the asyncio event loop on fastembed/LanceDB model initialization (30+ seconds on first run)
+- Fix `context_engine.py`: Superpowers Skill guidance injection guarded by `_embedder_cache is not None AND _skill_engine is not None` — prevents blocking `SkillEngine(real_bridge)` initialization during context build
+- Fix `context_engine.py`: added `skip_repomap` guard — RepoMap skipped when no `current_file` anchor, preventing full tree-sitter codebase scan on empty requests
+- Fix `code_analysis.py::_resolve_symbol_id`: bare `except: pass` → `log.debug` with context
+
+**Python Soul — Path Safety**
+- Fix `state.py::_history_path()`: now uses SHA-256 suffix to prevent both path traversal and filename collisions between session IDs that normalize to the same safe prefix
+- Fix `session.py::SessionManager._path()`: same SHA-256 collision-resistant sanitization
+
+**Python Soul — agent.py**
+- Fix `code_chunks.get_index()`: changed from single `_index` global singleton ("first caller wins") to `_index_cache: dict[str, CodeChunkIndex]` keyed by `os.path.abspath(project_id)`
+- Fix `agent.py::code_semantic_search`: was calling `get_index(self._session_id)` (session-keyed, bug: all sessions after first got wrong project index); now calls `get_index(os.getcwd())`
+- Fix 6 critical bare `except Exception: pass` in agent.py → `log.debug` with error context (API key lookup, event recording, stream tool parsing, context injection)
+
+**Python Soul — BOM**
+- Remove UTF-8 BOM from `prompt_manager.py` and `handlers/system.py` (caused `ast.parse()` failures in tooling)
+
+**Tests**
+- Add 2 jobs.db migration tests: `test_fresh_db_creation`, `test_legacy_db_migration` (fresh DB + legacy schema upgrade)
+- Add 4 code_analysis handler tests: response structure, `risk_level` field, list return, `_RANKED_CONTEXT_WEIGHTS` validity
+- Add 4 evolution submodule tests: pattern sequences, circuit breaker lifecycle, skill_draft, `observe()` result shape
+- Add `test_memory_write_then_recall`: E2E write→recall with isolated temp store, strict assertions
+- Add `test_memory_project_id_isolation`: verifies project_b cannot see project_a's constraints
+- Add `test_context_build_no_crash`: now has 4 real assertions (`system_prompt`/`user_context` keys, no error)
+- Add `TestSoulE2EUserFlow`: real subprocess tests for `tracer.check_deps` and `config.get`
+- Fix `test_start_creates_background_tasks`: updated for DaemonWorkerManager no-op design
+- Fix `test_circuit_breaker_state`: uses UUID skill_id to avoid persistent state pollution
+
+---
+
 ## [Unreleased]
 
 ### Added — Wave 5 (2026-05-12)

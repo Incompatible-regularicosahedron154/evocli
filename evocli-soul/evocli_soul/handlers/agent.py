@@ -20,6 +20,30 @@ _HISTORY_COMPRESS_TOKENS  = 8_000  # or when estimated tokens exceed this
 _HISTORY_TAIL_MESSAGES    = 10   # preserve last 5 exchanges (10 messages) verbatim
 
 
+def _derive_stream_session_id(params: dict) -> str:
+    """
+    Derive session_id for the streaming path.
+
+    Design: Uses CWD-based MD5 for cross-restart project continuity.
+    Same project directory → same session bucket across TUI restarts.
+
+    This differs from handle_agent_run (which uses uuid) because:
+    - agent.stream: TUI primary path — users expect history to persist after restart
+    - agent.run: Programmatic API — each call should be independent
+
+    Note: Two different users/sessions in the same project directory will share
+    history. This is intentional for single-developer local-first use cases.
+    """
+    explicit = params.get("session_id")
+    if explicit:
+        return explicit
+    import os as _os_sid
+    import hashlib as _hash_sid
+    return "cwd_" + _hash_sid.md5(
+        _os_sid.getcwd().encode(), usedforsecurity=False
+    ).hexdigest()[:12]
+
+
 def register(router) -> None:
     router.add("agent.run",           handle_agent_run)
     router.add("agent.stream",        handle_agent_stream)
@@ -108,9 +132,12 @@ async def handle_agent_run(req_id: str, params: dict, send, state) -> None:
         if _run_explicit_sid:
             _run_session_id = _run_explicit_sid
         else:
-            _run_session_id = "cwd_" + _hashlib_run.md5(
-                _os_run.getcwd().encode(), usedforsecurity=False
-            ).hexdigest()[:12]
+            import uuid as _uuid_run
+            # Generate a unique session ID per conversation to prevent history bleed-across
+            # between different sessions in the same working directory.
+            # The cwd-based hash was causing conversation histories from different sessions
+            # to be loaded into each other (W5 regression fix).
+            _run_session_id = "sess_" + _uuid_run.uuid4().hex[:16]
         cfg    = state.get_config()
         agent  = EvoCLIAgent(state.get_bridge(), state.get_memory(), cfg, session_id=_run_session_id)
         result = await agent.run(prompt)
@@ -170,10 +197,7 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
     if _prompt_stripped.lower().startswith("/add"):
         import evocli_soul.state as _st_add
         import os as _os_add
-        import hashlib as _hashlib_add
-        _add_sid = (params.get("session_id") or
-                    "cwd_" + _hashlib_add.md5(_os_add.getcwd().encode(),
-                                               usedforsecurity=False).hexdigest()[:12])
+        _add_sid = _derive_stream_session_id(params)
         _add_args = _prompt_stripped.split()[1:]  # everything after /add
 
         if not _add_args or _add_args[0].lower() == "list":
@@ -229,14 +253,8 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
     # This avoids the dependency on Rust passing history (which it currently doesn't).
     if prompt.strip().lower() in ("/compress", "/compact"):
         import evocli_soul.state as _st_compress
-        import os as _os_compress
-        import hashlib as _hashlib_compress
         # Use same cwd-derived session_id as main execution path for consistency
-        _explicit = params.get("session_id")
-        session_id = (_explicit if _explicit else
-                      "cwd_" + _hashlib_compress.md5(
-                          _os_compress.getcwd().encode(), usedforsecurity=False
-                      ).hexdigest()[:12])
+        session_id = _derive_stream_session_id(params)
         try:
             await send.stream_chunk(req_id, "⏳ Compressing session context…\n\n", done=False)
             events = list(_st_compress._session_events)  # read without draining
@@ -328,11 +346,7 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
     # ── /undo — 撤销上一轮操作（Aider 风格：git snapshot + 历史回滚）──────────
     if prompt.strip().lower() == "/undo":
         import evocli_soul.state as _st_undo
-        import os as _os_undo
-        import hashlib as _hashlib_undo
-        _undo_sid = (params.get("session_id") or
-                     "cwd_" + _hashlib_undo.md5(_os_undo.getcwd().encode(),
-                                                  usedforsecurity=False).hexdigest()[:12])
+        _undo_sid = _derive_stream_session_id(params)
         try:
             # Step 1: Pop the last conversation turn from history
             history = _st_undo.get_history(_undo_sid)
@@ -355,8 +369,8 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
                 snap_result = await bridge.call("git.snapshot_list", {})
                 snapshots = snap_result if isinstance(snap_result, list) else []
                 if snapshots:
-                    latest = snapshots[-1]  # most recent snapshot
-                    snap_id = latest.get("id") or latest.get("ref", "")
+                    latest = snapshots[0]  # shadow_log returns newest-first; index 0 is most recent
+                    snap_id = latest.get("hash") or latest.get("id") or latest.get("ref", "")
                     if snap_id:
                         await bridge.call("git.snapshot_restore", {"ref": snap_id})
                         git_msg = f"\n✓ Git snapshot restored: `{snap_id}`"
@@ -389,11 +403,7 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
             return
         try:
             from evocli_soul.agent import EvoCLIAgent
-            import os as _os_plan
-            import hashlib as _hashlib_plan
-            _plan_sid = (params.get("session_id") or
-                         "cwd_" + _hashlib_plan.md5(_os_plan.getcwd().encode(),
-                                                      usedforsecurity=False).hexdigest()[:12])
+            _plan_sid = _derive_stream_session_id(params)
             cfg = state.get_config()
             memory_obj = state.get_memory() if hasattr(state, "get_memory") else None
             # Force read_only=True — agent cannot write files in plan mode
@@ -440,11 +450,7 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
             return
         try:
             from evocli_soul.agent import EvoCLIAgent
-            import os as _os_btw
-            import hashlib as _hashlib_btw
-            _btw_sid = (params.get("session_id") or
-                        "cwd_" + _hashlib_btw.md5(_os_btw.getcwd().encode(),
-                                                    usedforsecurity=False).hexdigest()[:12])
+            _btw_sid = _derive_stream_session_id(params)
             cfg = state.get_config()
             memory_obj = state.get_memory() if hasattr(state, "get_memory") else None
             btw_agent = EvoCLIAgent(state.get_bridge(), memory_obj, cfg, session_id=_btw_sid)
@@ -468,15 +474,7 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
     # provide one. This prevents multi-project history pollution where two separate
     # project folders would share the same "default" history bucket.
     # cwd-hash is stable per project: same project → same session bucket across restarts.
-    _explicit_sid = params.get("session_id")
-    if _explicit_sid:
-        session_id = _explicit_sid
-    else:
-        import os as _os
-        import hashlib as _hashlib
-        _cwd = _os.getcwd()
-        # Short hex digest: deterministic per-project, collision-resistant enough
-        session_id = "cwd_" + _hashlib.md5(_cwd.encode(), usedforsecurity=False).hexdigest()[:12]
+    session_id = _derive_stream_session_id(params)
     _st.increment_turn(session_id)
 
     # ── Load persistent conversation history (multi-turn continuity) ─────────
@@ -676,7 +674,15 @@ async def handle_agent_stream(req_id: str, params: dict, send, state) -> None:
         # asked to execute — the semantic chain is broken.
         # TODO: Re-enable by restructuring: keep done=False until followup completes,
         # then send done=True at the very end. Requires TUI protocol coordination.
-        if False and collected_chunks:
+        # AUTO-CONTINUE PROTOCOL LIMITATION:
+        # JSON-RPC over stdin/stdout is strictly request-response. Once a stream
+        # ends (done=True), the Rust host closes the listener for this request.
+        # To enable true auto-continuation:
+        #   Option A: add a "agent.continue" RPC that the TUI can initiate after user trigger
+        #   Option B: use WebSocket transport instead of stdin/stdout
+        #   Option C: return a {needs_continuation: true, next_prompt: "..."} signal in the response
+        # Current workaround: user manually sends follow-up message.
+        if False and collected_chunks:  # noqa: DEAD — auto-continue disabled: JSON-RPC protocol limitation
             assistant_reply = "".join(collected_chunks)
             _PLAN_PHRASES = [
                 "我将", "我会先", "让我先", "首先我会", "我打算", "我需要先",

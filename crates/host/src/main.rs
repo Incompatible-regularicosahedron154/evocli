@@ -21,6 +21,7 @@ mod web_tools;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 use commands::{
     config_cmd::ConfigAction,
@@ -265,6 +266,15 @@ async fn run_tui(_debug: bool) -> Result<()> {
     let session_id = format!("ses_{}", uuid::Uuid::new_v4().simple());
     let session_id_dispatch = session_id.clone();
 
+    // ── 初始化进程级 EventBus（单例，避免每次工具调用都新建 DB 连接）──
+    // project_id 用项目根路径绝对路径字符串，保证跨 session 稳定。
+    let project_id = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .to_string_lossy()
+        .to_string();
+    let event_bus = event_bus::init(project_id);
+    let event_bus_dispatch = std::sync::Arc::clone(&event_bus);
+
     // ── 启动 Python Soul 自动重启看门狗 ──────────────────────────
     // 当 Python Soul 崩溃时（stdout EOF），watchdog 自动重启 Python 进程。
     // Rust TUI 和所有 channel 保持不变——用户不会感知到崩溃。
@@ -286,16 +296,17 @@ async fn run_tui(_debug: bool) -> Result<()> {
                 let bridge_c = std::sync::Arc::clone(&bridge_dispatch);
                 let cfg_c = std::sync::Arc::clone(&cfg_dispatch);
                 let sid_c = session_id_dispatch.clone();
+                let eb_c = std::sync::Arc::clone(&event_bus_dispatch);
 
                 // 每个工具调用独立 spawn — 并行执行，互不阻塞
+                // EventBus 通过 Arc 共享，不再重复创建连接
                 tokio::spawn(async move {
-                    let event_bus = event_bus::EventBus::new();
                     let result = tool_dispatch::dispatch(&req, Some(&*bridge_c), &cfg_c).await;
                     let ok = result.is_ok();
 
-                    event_bus.tool_called(&sid_c, &tool_name, ok);
+                    eb_c.tool_called(&sid_c, &tool_name, ok);
                     if !ok {
-                        event_bus.emit(&sid_c, "tool_error", serde_json::json!({
+                        eb_c.emit(&sid_c, "tool_error", serde_json::json!({
                             "tool":  &tool_name,
                             "error": result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
                         }));
@@ -342,12 +353,56 @@ async fn run_tui(_debug: bool) -> Result<()> {
 
             if let Some(job) = maybe_job {
                 tracing::info!("Processing job: {} ({:?})", job.id, job.job_type);
+
+                // Read relevant events from events.db for distill/scan jobs.
+                // Filter by session_id for MemoryDistill, by project_id for EvolutionScan.
+                let (event_filter_col, event_filter_val): (&str, String) = match &job.job_type {
+                    job_queue::JobType::MemoryDistill { session_id } => ("session_id", session_id.clone()),
+                    job_queue::JobType::EvolutionScan { project }    => ("project_id", project.clone()),
+                    _ => ("session_id", String::new()),
+                };
+                let recent_events: Vec<serde_json::Value> = {
+                    let events_db: PathBuf = dirs::home_dir()
+                        .unwrap_or_default()
+                        .join(".evocli")
+                        .join("events.db");
+                    if events_db.exists() && !event_filter_val.is_empty() {
+                        if let Ok(conn) = rusqlite::Connection::open(&events_db) {
+                            let sql = format!(
+                                "SELECT session_id, type, payload FROM events WHERE {} = ?1 ORDER BY rowid DESC LIMIT 200",
+                                event_filter_col
+                            );
+                            match conn.prepare(&sql) {
+                                Ok(mut stmt) => {
+                                    match stmt.query_map([&event_filter_val as &dyn rusqlite::ToSql], |row| {
+                                        Ok(serde_json::json!({
+                                            "session_id": row.get::<_, String>(0).unwrap_or_default(),
+                                            "type":       row.get::<_, String>(1).unwrap_or_default(),
+                                            "payload":    row.get::<_, String>(2).unwrap_or_default(),
+                                        }))
+                                    }) {
+                                        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                                        Err(_) => vec![],
+                                    }
+                                }
+                                Err(_) => vec![],
+                            }
+                        } else { vec![] }
+                    } else { vec![] }
+                };
+
                 let (method, params, timeout_ms) = match &job.job_type {
-                    job_queue::JobType::MemoryDistill { session_id } => (
-                        "memory.distill",
-                        serde_json::json!({"session_id": session_id, "events": []}),
-                        60_000u64,
-                    ),
+                    job_queue::JobType::MemoryDistill { session_id } => {
+                        let project_id = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                            .to_string_lossy()
+                            .to_string();
+                        (
+                            "memory.distill",
+                            serde_json::json!({"session_id": session_id, "events": recent_events, "project_id": project_id}),
+                            60_000u64,
+                        )
+                    }
                     job_queue::JobType::CodeIndexUpdate {
                         project,
                         changed_files,
@@ -367,7 +422,7 @@ async fn run_tui(_debug: bool) -> Result<()> {
                     ),
                     job_queue::JobType::EvolutionScan { project } => (
                         "evolution.observe",
-                        serde_json::json!({"project": project, "events": []}),
+                        serde_json::json!({"project_id": project, "project": project, "events": recent_events}),
                         60_000u64,
                     ),
                     job_queue::JobType::AgentSession {
