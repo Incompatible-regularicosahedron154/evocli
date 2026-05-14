@@ -15,21 +15,20 @@ from typing import Any
 log = logging.getLogger("evocli.handlers.agent_loop")
 
 
-def _is_conversational(prompt: str) -> bool:
-    """True for short greetings/questions that need no tool calls."""
-    p = prompt.strip()
-    if len(p) <= 15:
-        return True
-    action_verbs = {
-        "fix", "add", "create", "update", "delete", "implement", "write", "edit",
-        "refactor", "build", "run", "test", "check", "analyze", "generate", "make",
-        "修改", "创建", "删除", "实现", "添加", "编写", "重构", "构建", "运行",
-        "分析", "生成", "检查", "修复",
-    }
-    p_lower = p.lower()
-    has_action = any(v in p_lower for v in action_verbs)
-    has_path = any(c in p for c in ["/", "\\", ".py", ".rs", ".ts", ".toml", ".json"])
-    return not has_action and not has_path
+def _classify_intent(prompt: str, config: dict | None = None):
+    """
+    Classify the user's intent using semantic embedding similarity.
+    Returns an IntentProfile that drives all downstream behavior.
+    Falls back to keyword classification when fastembed is unavailable.
+    """
+    try:
+        from evocli_soul.intent_profile import classify
+        return classify(prompt, config)
+    except Exception as e:
+        log.debug("Intent classification failed, using 'coder' default: %s", e)
+        # Safe fallback: treat as implementation task
+        from evocli_soul.intent_profile import _build_profiles
+        return _build_profiles().get("coder")
 
 
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -339,50 +338,55 @@ async def run_agent_stream_body(
 
         _cfg_agent        = (cfg or {}).get("agent", {}) if isinstance(cfg, dict) else {}
         from evocli_soul.config_defaults import cfg_int
-        _max_auto_iters       = int(_cfg_agent.get("max_auto_iterations", cfg_int("agent.max_auto_iterations")))
+
+        # ── Goal-aware intent classification ─────────────────────────────────
+        # Classify the user's intent ONCE here. The resulting IntentProfile
+        # drives ALL downstream decisions: loop iterations, context depth,
+        # write permissions, forcing message, auto-commit.
+        # This replaces the crude _is_conversational() keyword heuristic.
+        _intent_profile = _classify_intent(prompt, cfg)
+        log.info(
+            "intent: %s (%s) — max_iters=%d context=%s writes=%s",
+            _intent_profile.intent,
+            _intent_profile.reason,
+            _intent_profile.max_iterations,
+            _intent_profile.context_depth,
+            _intent_profile.writes_allowed,
+        )
+
+        # Profile overrides config values — profile is goal-aware, config is a global ceiling
+        _cfg_max = int(_cfg_agent.get("max_auto_iterations", cfg_int("agent.max_auto_iterations")))
+        _max_auto_iters       = min(_intent_profile.max_iterations, _cfg_max)
         _consecutive_no_tools = 0
         _MAX_NO_TOOL_ITERS    = cfg_int("agent.max_no_tool_turns")
-        _is_conv = _is_conversational(prompt)
-        if _is_conv:
-            _max_auto_iters = 1
-            log.debug("Conversational message detected — disabling autonomous loop")
 
+        # Build context params from intent profile
+        from evocli_soul.intent_profile import context_params_for
+        _intent_ctx = context_params_for(_intent_profile)
         _context_params = {
             key: params.get(key)
             for key in ("project_id", "current_file", "git_diff")
             if params.get(key) is not None
         }
-        if _is_conv:
-            _context_params["lightweight"] = True
-            _context_params["skip_repomap"] = True
-        _context_params = _context_params or None
+        _context_params.update(_intent_ctx)
 
         # Clear stale task_complete from any previous request
         _st.clear_task_complete(session_id)
 
         # ── Auto-snapshot before risky tasks (Aider safety pattern) ──────────
-        # If the task looks like it will modify files AND we're in a git repo,
-        # create a stash snapshot BEFORE starting. This gives the user a safe
-        # rollback point even if task_complete is never called.
+        # Use intent profile to decide — no more keyword guessing.
         _auto_snap_enabled = _cfg_agent.get("auto_snapshot", True)
-        if _auto_snap_enabled:
+        if _auto_snap_enabled and _intent_profile.writes_allowed:
             async def _try_auto_snapshot() -> None:
-                _risky_words = {
-                    "修改", "删除", "重构", "重写", "实现", "添加", "创建", "更新", "fix", "add",
-                    "implement", "refactor", "rewrite", "create", "update", "delete", "remove",
-                    "change", "modify", "edit",
-                }
-                _prompt_lower = prompt.lower()
-                _looks_risky  = any(w in _prompt_lower for w in _risky_words)
-                if _looks_risky:
-                    try:
-                        _snap_result = await state.get_bridge().call("git.snapshot", {})
-                        if isinstance(_snap_result, dict):
-                            _ref = _snap_result.get("stash_ref", "")
-                            if _ref:
-                                log.info("Auto-snapshot created: %s (task: %s)", _ref, prompt[:50])
-                    except Exception as _se:
-                        log.debug("Auto-snapshot failed (non-fatal): %s", _se)
+                try:
+                    _snap_result = await state.get_bridge().call("git.snapshot", {})
+                    if isinstance(_snap_result, dict):
+                        _ref = _snap_result.get("stash_ref", "")
+                        if _ref:
+                            log.info("Auto-snapshot created: %s (intent: %s, task: %s)",
+                                     _ref, _intent_profile.intent, prompt[:50])
+                except Exception as _se:
+                    log.debug("Auto-snapshot failed (non-fatal): %s", _se)
             asyncio.create_task(_try_auto_snapshot())
 
         # ── Auto-detect test command ──────────────────────────────────────────
@@ -637,8 +641,9 @@ async def run_agent_stream_body(
                     log.info("auto-loop stopping: %d consecutive text-only turns", _consecutive_no_tools)
                     break
 
-                if _auto_iter + 1 < _max_auto_iters:
-                    # Inject Cline-style forcing message
+                if _auto_iter + 1 < _max_auto_iters and _intent_profile.forcing_enabled:
+                    # Only inject forcing message if the intent profile allows it.
+                    # chat/question profiles have forcing_enabled=False — no bullying.
                     _forcing = _loop_msg("loop", "forcing_message")
                     if _forcing:
                         _current_prompt = _forcing

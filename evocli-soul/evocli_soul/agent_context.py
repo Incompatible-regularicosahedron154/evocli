@@ -66,7 +66,13 @@ class AgentContextMixin:
                 "read_only":        self.read_only,
                 "model_id":         _model_id,    # for per-model prompt specialization
                 "provider_id":      _provider,    # for env block
-                "skip_repomap":     bool(lightweight or context_params.get("skip_repomap")),
+                # Intent-profile driven context skips:
+                "skip_repomap":     bool(
+                    lightweight
+                    or context_params.get("skip_repomap")
+                ),
+                "skip_memory":      bool(context_params.get("skip_memory")),
+                "skip_skills":      bool(context_params.get("skip_skills")),
             })
         except Exception as e:
             log.debug("Context build failed: %s", e)

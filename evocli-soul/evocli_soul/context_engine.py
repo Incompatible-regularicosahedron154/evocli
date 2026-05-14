@@ -342,8 +342,10 @@ class ContextEngine:
 
         # ── P1/P2/P3 记忆：一次语义搜索，按 scope 拆分 ──────────
         # Memory search is ALWAYS executed — never cached across turns.
+        # Exception: skip_memory=True (e.g. chat/question intent from intent_profile)
         _all_memories: list[dict] = []
-        if _mc is not None and remaining > 0:
+        _skip_memory = bool(params.get("skip_memory", False))
+        if _mc is not None and remaining > 0 and not _skip_memory:
             await _progress("🧠 检索项目记忆…")
             try:
                 from evocli_soul.config_defaults import cfg_int as _cfg_int_mem
@@ -615,12 +617,9 @@ class ContextEngine:
                 log.debug("Context provider '%s': %d chars injected", key, len(val))
 
         # ── Superpowers 指引技能（Guidance Skills 语义注入）──────────────────
-        # 用 local_classifier.rank_by_similarity 替代关键词匹配，
-        # 语义相关的 SKILL.md 指引自动注入上下文。
-        # Guard: only run embedding-based guidance if:
-        # 1. The embedder is already loaded (avoids 30s model download on first turn)
-        # 2. The skill engine is already initialized (avoids blocking bridge.call to Rust)
-        if goal and remaining > 500:
+        # Skipped when skip_skills=True (e.g. chat/question from intent_profile).
+        _skip_skills = bool(params.get("skip_skills", False))
+        if goal and remaining > 500 and not _skip_skills:
             try:
                 from evocli_soul.local_classifier import _embedder_cache as _emb_cache
                 import evocli_soul.state as _state
