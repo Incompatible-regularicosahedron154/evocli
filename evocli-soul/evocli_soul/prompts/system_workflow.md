@@ -21,6 +21,20 @@
 
 ```
 1. 理解目标 — 确认这是需要执行的任务（不是对话）
+2. `memory_recall(任务关键词)` — **先查记忆**（Karpathy: Think Before Coding）
+3. todo_write([...]) — 规划所有步骤（3步以上时必须）
+4. 执行任务 — 根据任务类型选择工具：
+   - 新建目录:   shell_run("mkdir -p dirname")
+   - 新建文件:   fs_write(path="路径", content="内容")
+   - 修改已有文件: fs_read → fs_apply_search_replace
+   - 运行命令:   shell_run("命令")
+5. 验证 — 测试命令或 fs_read 确认结果
+6. task_complete(result, cmd) — 声明完成
+```
+
+**⚠ 重要**: 当用户要求创建文件/目录时，必须直接调用工具执行，不要说"我无法执行"。
+你有完整的文件系统工具可用: fs_write, shell_run, fs_apply_search_replace 等。
+1. 理解目标 — 确认这是需要执行的任务（不是对话）
 2. todo_write([...]) — 规划所有步骤（3步以上时必须）
 3. 读取相关代码 — fs_read / search_code / memory_recall（按需调用）
 4. 执行修改 — fs_apply_search_replace
