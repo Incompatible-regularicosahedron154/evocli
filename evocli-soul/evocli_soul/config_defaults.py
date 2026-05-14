@@ -1,3 +1,4 @@
+# pyright: reportImportCycles=false, reportMissingImports=false, reportMissingTypeArgument=false
 """
 config_defaults.py — Centralized configuration defaults for EvoCLI Soul
 
@@ -57,6 +58,9 @@ DEFAULTS: dict[str, tuple[Any, str]] = {
     "context.summary_window":       (40,  "Max history messages used for summarization"),
     "context.compaction_window":    (20,  "Messages kept verbatim during Head/Tail compaction"),
     "context.summary_max_tokens":   (600, "Max tokens for auto-generated session summaries"),
+    "context.repomap_tokens":       (1024, "Max tokens for compact symbol navigation"),
+    "context.history_turns":        (3,    "Recent conversation turns to include"),
+    "context.auto_compress_threshold": (0.70, "Compress when context exceeds this % of max"),
 
     # ── History Management ───────────────────────────────────────────────────
     "agent.history_compress_turns":  (10,   "Compress history after this many conversation turns"),

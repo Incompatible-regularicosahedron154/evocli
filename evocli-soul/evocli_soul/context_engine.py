@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false, reportMissingTypeArgument=false, reportAttributeAccessIssue=false
 """
 EvoCLI Context Engine — Section 5.2 + Section 6.5 完整实现。
 
@@ -22,6 +23,7 @@ from pathlib import Path
 log = logging.getLogger("evocli.context")
 
 # 默认 context 预算 — 从 config_defaults 读取，支持 config.toml 覆盖
+from evocli_soul.config_defaults import cfg_float as _cfg_float_ctx
 from evocli_soul.config_defaults import cfg_int as _cfg_int_ctx
 _DEFAULT_BUDGET_TOTAL = _cfg_int_ctx("llm.default_context_window")
 
@@ -100,13 +102,96 @@ def _get_budgets() -> dict:
     return dict(
         total=total,
         fixed=fixed,
-        p1_episodes=min(4_000, total // 8),
-        p2_tool=min(2_000, total // 16),
-        p3_global=min(1_500, total // 20),
+        repomap=min(_cfg_int_ctx("context.repomap_tokens"), total // 8),
         code=min(max(16_000, total // 2), total - fixed - 10_000),
         git_diff=min(3_000, total // 10),
         history=min(1_500, total // 20),
+        history_turns=max(1, _cfg_int_ctx("context.history_turns")),
+        auto_compress_threshold=_cfg_float_ctx("context.auto_compress_threshold"),
     )
+
+
+def _extract_symbol_name(line: str) -> str | None:
+    stripped = line.strip()
+    for prefix in ("async def ", "def ", "class "):
+        if stripped.startswith(prefix):
+            remainder = stripped[len(prefix):]
+            name_chars = []
+            for ch in remainder:
+                if ch.isalnum() or ch == "_":
+                    name_chars.append(ch)
+                else:
+                    break
+            if name_chars:
+                return "".join(name_chars)
+    return None
+
+
+async def _build_compact_symbol_nav(root: str, budget: int = 512) -> str:
+    """
+    Aider-style compact symbol navigation.
+    NOT file contents — just 'filename: func1, func2, Class1' per file.
+    Gives LLM a directory of what exists so it knows WHAT to read via tools.
+    Fast: just shell_ls + quick regex, no tree-sitter needed.
+
+    Example output:
+    # Project symbols (use fs_read/search_code to explore)
+    src/agent.py: EvoCLIAgent, run(), stream(), _build_context()
+    src/memory_client.py: EvoCLIMemory, search(), write(), get_constraints()
+    src/handlers/agent_loop.py: run_agent_stream_body()
+    """
+    try:
+        import json as _json
+        from evocli_soul import state as _state
+
+        bridge = _state.get_bridge()
+        raw = await bridge.call("shell.grep", {
+            "pattern": "^(class |def |async def )",
+            "path": root,
+            "include": ".py",
+            "max_results": 200,
+        })
+        if not raw:
+            return ""
+
+        text = _json.dumps(raw, ensure_ascii=False) if isinstance(raw, (dict, list)) else str(raw)
+        root_path = Path(root).resolve()
+        symbols_by_file: dict[str, list[str]] = {}
+        for row in text.splitlines():
+            match = __import__("re").match(r"^(.*?\.py)(?::\d+)?:(.*)$", row)
+            if not match:
+                continue
+            file_path = match.group(1).strip()
+            symbol_name = _extract_symbol_name(match.group(2))
+            if not symbol_name:
+                continue
+            try:
+                rel_path = Path(file_path).resolve().relative_to(root_path).as_posix()
+            except Exception:
+                rel_path = Path(file_path).as_posix()
+            symbols = symbols_by_file.setdefault(rel_path, [])
+            if symbol_name not in symbols:
+                symbols.append(symbol_name)
+
+        if not symbols_by_file:
+            return ""
+
+        lines = ["# Project symbols (use fs_read/search_code to explore)"]
+        for file_path, symbols in sorted(symbols_by_file.items()):
+            rendered = ", ".join(
+                f"{symbol}()" if symbol and symbol[0].islower() else symbol
+                for symbol in symbols[:12]
+            )
+            candidate = f"{file_path}: {rendered}"
+            preview = "\n".join(lines + [candidate])
+            if _count_tokens(preview) > budget:
+                break
+            lines.append(candidate)
+
+        return "\n".join(lines) if len(lines) > 1 else ""
+    except Exception as e:
+        log.debug("compact symbol nav failed: %s", e)
+        return ""
 
 
 def _count_tokens(text: str, model: str = "") -> int:
@@ -236,12 +321,12 @@ class ContextEngine:
         _b = _get_budgets()
         BUDGET_TOTAL       = _b["total"]
         BUDGET_FIXED       = _b["fixed"]
-        BUDGET_P1_EPISODES = _b["p1_episodes"]
-        BUDGET_P2_TOOL     = _b["p2_tool"]
-        BUDGET_P3_GLOBAL   = _b["p3_global"]
+        BUDGET_REPOMAP     = _b["repomap"]
         BUDGET_CODE        = _b["code"]
         BUDGET_GIT_DIFF    = _b["git_diff"]
         BUDGET_HISTORY     = _b["history"]
+        HISTORY_TURNS      = _b["history_turns"]
+        AUTO_COMPRESS_AT   = _b["auto_compress_threshold"]
 
         async def _progress(msg: str) -> None:
             """Emit a progress soul_status event during long context build phases."""
@@ -271,7 +356,7 @@ class ContextEngine:
         slots: list[dict] = []
 
         # ── Session-level context cache ──────────────────────────────
-        # Skip expensive RepoMap (tree-sitter scan) and memory search
+        # Skip expensive project symbol scan when goal fingerprint
         # when goal fingerprint AND current file content hash are unchanged.
         # This is the primary source of per-turn token savings (75%+).
         from evocli_soul import state as _state_cache
@@ -309,13 +394,7 @@ class ContextEngine:
 
         if can_reuse:
             log.debug("RepoMap cache HIT (session=%s) — skipping tree-sitter scan", session_id)
-        # Memory search is NEVER cached — always fresh (turn-N writes must appear in turn-N+1)
-
-        # ── 统一内存读取（H1 遗留修复）──────────────────────────────
-        # H1 将写入统一到 Python LanceDB，读取也必须走同一路径。
-        # 原 bridge.call("memory.recall/constraints") 走 Rust SQLite（已空）。
-        # 改为：一次 memory_client.search() + get_constraints()，
-        # 不经 IPC 桥，减少延迟，统一存储。
+        # ── 统一内存读取（仅保留约束）──────────────────────────────
         _mc = None
         try:
             # Use get_memory_if_ready() instead of get_memory() to avoid blocking
@@ -328,90 +407,17 @@ class ContextEngine:
 
         # ── P1 约束（固定，永不压缩）──────────────────────────────
         constraints: list[str] = []
-        try:
-            if _mc is not None:
-                constraints = _mc.get_constraints()
-            else:
-                # H1 note: Rust memory.constraints now returns [] (unified to Python LanceDB).
-                # This fallback only triggers when memory_client init fails.
-                log.warning("memory_client unavailable — constraints will be empty (H1 unification)")
-                constraints = []
-        except Exception as e:
-            log.debug("constraints: %s", e)
+        _skip_constraints = bool(params.get("skip_constraints", False))
+        if not _skip_constraints:
+            try:
+                if _mc is not None:
+                    constraints = _mc.get_constraints()
+                else:
+                    log.warning("memory_client unavailable — constraints will be empty (H1 unification)")
+                    constraints = []
+            except Exception as e:
+                log.debug("constraints: %s", e)
         constraint_text = "\n".join(f"- {c}" for c in constraints)
-
-        # ── P1/P2/P3 记忆：一次语义搜索，按 scope 拆分 ──────────
-        # Memory search is ALWAYS executed — never cached across turns.
-        # Exception: skip_memory=True (e.g. chat/question intent from intent_profile)
-        _all_memories: list[dict] = []
-        _skip_memory = bool(params.get("skip_memory", False))
-        if _mc is not None and remaining > 0 and not _skip_memory:
-            await _progress("🧠 检索项目记忆…")
-            try:
-                from evocli_soul.config_defaults import cfg_int as _cfg_int_mem
-                _all_memories = _mc.search(
-                    goal, top_k=_cfg_int_mem("context.retrieval_top_k"),
-                    current_project=project_id,
-                    active_tools=active_tools or [],
-                )
-            except Exception as e:
-                log.debug("memory search: %s", e)
-
-        def _fmt_mem(e: dict) -> str:
-            title = e.get("title", "")
-            body  = e.get("body") or e.get("memory") or ""
-            return f"[{title}]\n{body}" if title else body
-
-        # ── P1 项目经验 ───────────────────────────────────────────
-        p1_text = ""
-        if remaining > 0:
-            try:
-                p1_eps = [m for m in _all_memories
-                          if m.get("priority_scope", "project") in ("project", "")][:5]
-                if p1_eps:
-                    raw    = "\n\n".join(_fmt_mem(e) for e in p1_eps)
-                    budget = min(BUDGET_P1_EPISODES, remaining)
-                    p1_text = _truncate(raw, budget)
-                    used = _count_tokens(p1_text)
-                    remaining -= used
-                    slots.append({"name": "p1_episodes", "tokens": used, "priority": "p1"})
-            except Exception as e:
-                log.debug("p1 episodes: %s", e)
-
-        # ── P2 工具记忆 ───────────────────────────────────────────
-        p2_text = ""
-        if remaining > 0 and active_tools:
-            try:
-                p2_tool_mems = [m for m in _all_memories
-                                if m.get("priority_scope") == "tool"][:3]
-                if p2_tool_mems:
-                    raw = "\n\n".join(
-                        f"[Tool:{e.get('tool_id', e.get('priority_scope',''))}] {_fmt_mem(e)}"
-                        for e in p2_tool_mems
-                    )
-                    budget  = min(BUDGET_P2_TOOL, remaining)
-                    p2_text = _truncate(raw, budget)
-                    used = _count_tokens(p2_text)
-                    remaining -= used
-                    slots.append({"name": "p2_tool", "tokens": used, "priority": "p2"})
-            except Exception as e:
-                log.debug("p2 tool: %s", e)
-
-        # ── P3 全局经验 ───────────────────────────────────────────
-        p3_text = ""
-        if remaining > BUDGET_P3_GLOBAL // 2:
-            try:
-                p3_global = [m for m in _all_memories
-                             if m.get("priority_scope") == "global"][:3]
-                if p3_global:
-                    raw = "\n\n".join(f"[Global] {_fmt_mem(e)}" for e in p3_global)
-                    budget  = min(BUDGET_P3_GLOBAL, remaining)
-                    p3_text = _truncate(raw, budget)
-                    used = _count_tokens(p3_text)
-                    remaining -= used
-                    slots.append({"name": "p3_global", "tokens": used, "priority": "p3"})
-            except Exception as e:
-                log.debug("p3 global: %s", e)
 
         # ── 代码文件 ──────────────────────────────────────────────
         # Reuse pre-read content from cache check (avoids double fs.read)
@@ -430,11 +436,9 @@ class ContextEngine:
             except Exception as e:
                 log.debug("code read: %s", e)
 
-        # ── ranked_context + RepoMap（合并：先取 Rust 索引，再渲染骨架）────────
-        # Cache hit: reuse previous RepoMap (expensive tree-sitter scan)
-        # Cache miss: compute, then cache for next turn
+        # ── Compact symbol navigation（Aider-style, cached）───────────────────
         repo_map_text = ""
-        pre_ranked: list[dict] = []
+        _compact_symbols = bool(params.get("compact_symbols", False))
 
         if can_reuse:
             repo_map_text = _cache.get("repomap_text", "")
@@ -443,70 +447,22 @@ class ContextEngine:
                 remaining -= used
                 slots.append({"name": "repo_map", "tokens": used, "priority": "p1", "source": "cache"})
                 log.debug("RepoMap cache HIT — %d tokens reused", used)
-        else:
-            # Cache miss: compute RepoMap from scratch
-            await _progress("📊 扫描代码库结构（首次可能需要 10-30s）…")
-            # Step 1: 获取 Rust code_intel 已有的 PageRank 符号排名（轻量 RPC）
-            if current_file and remaining > 500:
-                try:
-                    mentioned = params.get("mentioned_symbols", [])
-                    # Fix: code_intel.ranked_context migrated to Python handlers/code_analysis.py
-                    # bridge.call routes Python→Rust but Rust has no arm for this
-                    import evocli_soul.state as _ce_state
-                    _ce_result: dict = {}
-                    class _CeMockSend:
-                        async def response(self, req_id, data): _ce_result['data'] = data
-                        async def error(self, req_id, code, msg): _ce_result['error'] = msg
-                    from evocli_soul.handlers.code_analysis import handle_ranked_context
-                    await handle_ranked_context("local", {
-                        "modified_file": current_file,
-                        "mentioned":     mentioned,
-                        "limit":         20,
-                    }, _CeMockSend(), _ce_state)
-                    # handle_ranked_context returns {"ranked": [...], "modified_file": ..., ...}
-                    pre_ranked = _ce_result.get('data', {}).get('ranked', []) if isinstance(_ce_result.get('data'), dict) else []
-                    if not isinstance(pre_ranked, list):
-                        pre_ranked = []
-                except Exception as e:
-                    log.debug("ranked_context prefetch: %s", e)
-
-            # Step 2: RepoMap — 优先用 pre_ranked 跳过全仓 tree-sitter 扫描
-            # Guard: require a current_file anchor before running RepoMap.
-            # Without a file anchor, RepoMap would tree-sitter scan the entire codebase
-            # (30-120s on large projects) with no way to rank relevance — not useful.
-            # Also skip if caller opts out or if the codebase is not indexed yet (pre_ranked==[]).
-            _skip_repomap = (
-                not current_file           # no file anchor — full-codebase scan is wasteful
-                or params.get("skip_repomap", False)  # explicit opt-out
-            )
-            if remaining > 500 and not _skip_repomap:
-                try:
-                    import asyncio as _asyncio
-                    from evocli_soul.repo_map import RepoMap
-                    chat_files = [current_file] if current_file else []
-                    goal_words = goal.split()[:10] if goal else []
-                    repo_map   = RepoMap(root=".", map_tokens=min(BUDGET_P1_EPISODES, remaining))
-                    repo_map_text = await _asyncio.to_thread(
-                        repo_map.get_repo_map,
-                        chat_files=chat_files,
-                        mentioned_symbols=goal_words,
-                        pre_ranked_symbols=pre_ranked,
-                    )
-                    if repo_map_text:
-                        used = _count_tokens(repo_map_text)
-                        remaining -= used
-                        slots.append({
-                            "name":     "repo_map",
-                            "tokens":   used,
-                            "priority": "p1",
-                            "source":   "rust_index" if pre_ranked else "tree_sitter",
-                        })
-                        # Cache for next turn
-                        _state_cache.update_context_cache({"repomap_text": repo_map_text}, session_id)
-                        log.debug("RepoMap: %d tokens (source=%s) — cached",
-                                  used, "rust_index" if pre_ranked else "tree_sitter")
-                except Exception as e:
-                    log.debug("RepoMap failed (non-fatal): %s", e)
+        elif remaining > 128 and _compact_symbols and not params.get("skip_repomap", False):
+            try:
+                await _progress("📊 提炼项目符号导航…")
+                repo_map_text = await _build_compact_symbol_nav(project_id or ".", min(BUDGET_REPOMAP, remaining))
+                if repo_map_text:
+                    used = _count_tokens(repo_map_text)
+                    remaining -= used
+                    slots.append({
+                        "name":     "repo_map",
+                        "tokens":   used,
+                        "priority": "p1",
+                        "source":   "compact_symbols",
+                    })
+                    _state_cache.update_context_cache({"repomap_text": repo_map_text}, session_id)
+            except Exception as e:
+                log.debug("compact symbol nav failed (non-fatal): %s", e)
 
 
         # ── Git Diff ─────────────────────────────────────────────
@@ -535,40 +491,16 @@ class ContextEngine:
 
         if history and remaining > 0:
             budget         = min(BUDGET_HISTORY, remaining)
-            history_tokens = sum(_count_tokens(str(m.get("content", ""))) for m in history)
+            recent_history = history[-HISTORY_TURNS:]
+            history_tokens = sum(_count_tokens(str(m.get("content", ""))) for m in recent_history)
             # Track tokens already in history_text (anchor injected above) to avoid double-counting.
             _already_counted = _count_tokens(history_text) if history_text else 0
-
-            if history_tokens > budget * 2 and len(history) > 10:
-                # 历史太长 — 使用 Anchored Summary 压缩 (OpenCode 模式)
-                # 保留最近 4 轮对话（tail preservation）
-                tail    = history[-4:]
-                to_compact = history[:-4]
-                # anchored_summary already injected above as its own slot if present.
-                # Here we only append recent tail — no need to repeat the anchor header.
-                if not anchored_summary:
-                    # No pre-existing anchor — build a quick inline summary from older turns
-                    key_msgs = [m for m in to_compact if m.get("role") != "tool"][-5:]
-                    anchor_inline = "## 历史摘要\n" + "\n".join(
-                        f"[{m.get('role','')}]: {str(m.get('content',''))[:200]}"
-                        for m in key_msgs
-                    )
-                else:
-                    anchor_inline = ""  # already in history_text from the block above
-                tail_text = "\n".join(
-                    f"{m.get('role','')}: {str(m.get('content',''))[:400]}"
-                    for m in _compact_history(tail, budget // 2)
-                )
-                extra = (anchor_inline + "\n\n" if anchor_inline else "") + "## 最近对话\n" + tail_text
+            compacted = _compact_history(recent_history, budget)
+            if compacted:
+                lines = [f"{m.get('role','')}: {str(m.get('content',''))[:400]}"
+                         for m in compacted]
+                extra = "\n".join(lines)
                 history_text = (history_text + "\n\n" + extra).strip() if history_text else extra
-            else:
-                # 历史较短 — 正常压缩
-                compacted = _compact_history(history[-20:], budget)
-                if compacted:
-                    lines = [f"{m.get('role','')}: {str(m.get('content',''))[:400]}"
-                             for m in compacted]
-                    extra = "\n".join(lines)
-                    history_text = (history_text + "\n\n" + extra).strip() if history_text else extra
 
             # Only count the NEW tokens added in this block (not the anchor already counted above).
             used = max(0, _count_tokens(history_text) - _already_counted)
@@ -603,54 +535,11 @@ class ContextEngine:
         # RepoMap (Aider-style PageRank)
         if repo_map_text:
             parts.append(f"\n## 代码库地图（Repo Map — 最相关的符号和文件结构）\n{repo_map_text}")
-        # ranked_text 已合并进 repo_map_text（Rust 索引 → RepoMap fast-path）
-        if p1_text:
-            parts.append(f"\n## 相关项目经验\n{p1_text}")
-        if p2_text:
-            parts.append(f"\n## 工具使用经验\n{p2_text}")
-        if p3_text:
-            parts.append(f"\n## 通用工程经验\n{p3_text}")
         # @ context providers (Continue.dev 模式: @file, @terminal, @problems)
         if mention_context:
             for key, val in mention_context.items():
                 parts.append(f"\n{val}")
                 log.debug("Context provider '%s': %d chars injected", key, len(val))
-
-        # ── Superpowers 指引技能（Guidance Skills 语义注入）──────────────────
-        # Skipped when skip_skills=True (e.g. chat/question from intent_profile).
-        _skip_skills = bool(params.get("skip_skills", False))
-        if goal and remaining > 500 and not _skip_skills:
-            try:
-                from evocli_soul.local_classifier import _embedder_cache as _emb_cache
-                import evocli_soul.state as _state
-                _embedder_ready = _emb_cache is not None
-                _skill_engine_ready = _state._skill_engine is not None  # already initialized
-                if _embedder_ready and _skill_engine_ready:
-                    engine = _state.get_skill_engine()
-                    if hasattr(engine, "find_relevant_guidance"):
-                        matched_guidance = engine.find_relevant_guidance(goal, top_k=2)
-                    else:
-                        matched_guidance = []
-                else:
-                    matched_guidance = []
-
-                if matched_guidance:
-                    guidance_budget = min(1000, remaining)
-                    guidance_parts  = []
-                    for gs in matched_guidance:
-                        snippet = f"### 方法论指引：{gs.name}\n{gs.content[:600]}"
-                        guidance_parts.append(snippet)
-                    guidance_text = "\n\n".join(guidance_parts)
-                    if guidance_text:
-                        truncated = _truncate(guidance_text, guidance_budget)
-                        parts.append(f"\n## 相关方法论指引（Superpowers Skills）\n{truncated}")
-                        used = _count_tokens(truncated)
-                        remaining -= used
-                        slots.append({"name": "guidance_skills", "tokens": used, "priority": "p2"})
-                        log.debug("Injected %d guidance skill(s) via semantic search, %d tokens",
-                                  len(matched_guidance), used)
-            except Exception as e:
-                log.debug("Guidance skill injection failed (non-fatal): %s", e)
 
         # ── user_context 组装 ─────────────────────────────────────
         ctx = []
@@ -661,13 +550,18 @@ class ContextEngine:
         if history_text:
             ctx.append(f"## 对话历史\n{history_text}")
 
-        total_used = BUDGET_TOTAL - remaining
+        system_prompt = "\n".join(parts)
+        user_context = "\n\n".join(ctx)
+        _estimated_total = _count_tokens(system_prompt) + _count_tokens(user_context)
+        if _estimated_total > int(BUDGET_TOTAL * AUTO_COMPRESS_AT):
+            user_context = "[Context approaching limit — key info preserved in anchored summary above]\n\n" + user_context
+
+        total_used = _count_tokens(system_prompt) + _count_tokens(user_context)
         log.info("Context: %d / %d tokens", total_used, BUDGET_TOTAL)
 
         return {
-            "system_prompt": "\n".join(parts),
-            "user_context":  "\n\n".join(ctx),
+            "system_prompt": system_prompt,
+            "user_context":  user_context,
             "total_tokens":  total_used,
             "slots":         slots,
         }
-

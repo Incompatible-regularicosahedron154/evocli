@@ -1,3 +1,4 @@
+# pyright: reportMissingTypeArgument=false, reportAttributeAccessIssue=false, reportIndexIssue=false
 """agent_executor.py - Tool execution dispatcher mixin
 Extracted from agent.py.
 Single responsibility: _execute_tool — the main tool dispatch+bridge entry point.
@@ -515,6 +516,35 @@ class AgentExecutorMixin:
             if 'error' in _m_result:
                 return f"Error: {_m_result['error']}"
             return _mj.dumps(_m_result.get('data', {}), ensure_ascii=False)
+
+        if name == "skill_search":
+            import json as _ssj
+            try:
+                import evocli_soul.state as _ss_state
+                engine = _ss_state.get_skill_engine()
+                if not hasattr(engine, "find_relevant_guidance"):
+                    return _ssj.dumps({
+                        "query": args.get("query", ""),
+                        "results": [],
+                        "hint": "Guidance search is unavailable in the current skill engine.",
+                    }, ensure_ascii=False)
+
+                matches = engine.find_relevant_guidance(args.get("query", ""), top_k=3) or []
+                return _ssj.dumps({
+                    "query": args.get("query", ""),
+                    "count": len(matches),
+                    "results": [
+                        {
+                            "id": gs.id,
+                            "name": gs.name,
+                            "description": gs.description,
+                            "content": gs.content[:1500],
+                        }
+                        for gs in matches
+                    ],
+                }, ensure_ascii=False)
+            except Exception as e:
+                return _ssj.dumps({"error": str(e), "query": args.get("query", "")}, ensure_ascii=False)
 
         # ── Standard tools via Rust bridge ──────────────────────────────────────
         if name not in self._TOOL_TO_RPC:

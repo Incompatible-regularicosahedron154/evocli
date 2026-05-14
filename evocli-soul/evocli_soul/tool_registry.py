@@ -1,3 +1,4 @@
+# pyright: reportMissingTypeArgument=false
 """
 tool_registry.py — EvoCLI 统一工具注册表（Single Source of Truth）
 
@@ -204,6 +205,13 @@ REGISTRY: list[ToolSpec] = [
         tags=[Tag.SEARCH],
         tier=2, base_score=0.88,
         keywords=["search", "find", "where is", "codebase", "across"],
+    ),
+    ToolSpec(
+        name="skill_search", rpc="",  # python-native: skill_engine guidance lookup
+        description="Search methodology guidance, best practices, and workflow snippets",
+        tags=[Tag.ANALYZE, Tag.DEBUG, Tag.VERIFY],
+        tier=3, base_score=0.72,
+        keywords=["guidance", "best practice", "workflow", "methodology", "standards", "skill"],
     ),
     ToolSpec(
         name="code_hybrid_search", rpc="",  # python-native: BM25+vector RRF

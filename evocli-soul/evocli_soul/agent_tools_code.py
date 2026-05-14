@@ -1,3 +1,4 @@
+# pyright: reportMissingTypeArgument=false, reportAttributeAccessIssue=false, reportOptionalMemberAccess=false
 """
 agent_tools_code.py — Code intelligence and task planning tools registration
 Part 2 of agent_tools.py (atomized per 500-line limit).
@@ -93,6 +94,41 @@ def register(agent, _sc, _call_handler, _sid, _json, bridge=None, config=None, m
                 "query":   query,
                 "count":   len(formatted),
                 "results": formatted,
+            }, ensure_ascii=False)
+        except Exception as e:
+            return _json.dumps({"error": str(e), "query": query}, ensure_ascii=False)
+
+    @agent.tool_plain
+    async def skill_search(query: str) -> str:
+        """Search for relevant methodology guidance and best practices.
+        Use when you need engineering standards, workflow patterns, or
+        domain-specific guidance for the current task.
+        Returns: relevant skill documentation snippets."""
+        try:
+            import evocli_soul.state as _state
+
+            engine = _state.get_skill_engine()
+            if not hasattr(engine, "find_relevant_guidance"):
+                return _json.dumps({
+                    "query": query,
+                    "results": [],
+                    "hint": "Guidance search is unavailable in the current skill engine.",
+                }, ensure_ascii=False)
+
+            matches = engine.find_relevant_guidance(query, top_k=3) or []
+            results = [
+                {
+                    "id": gs.id,
+                    "name": gs.name,
+                    "description": gs.description,
+                    "content": gs.content[:1500],
+                }
+                for gs in matches
+            ]
+            return _json.dumps({
+                "query": query,
+                "count": len(results),
+                "results": results,
             }, ensure_ascii=False)
         except Exception as e:
             return _json.dumps({"error": str(e), "query": query}, ensure_ascii=False)

@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false, reportMissingTypeArgument=false
 """
 intent_profile.py — Goal-aware behavior profiles for EvoCLI
 
@@ -382,30 +383,42 @@ def context_params_for(profile: IntentProfile) -> dict:
     """
     Translate IntentProfile.context_depth into context_engine.build() params.
 
-    depth="none"     → skip everything (chat, just reply)
-    depth="minimal"  → env details only, skip RepoMap + memory
-    depth="standard" → memory + RepoMap if file anchor, skip full tree-sitter
-    depth="full"     → everything (current default behavior)
+    depth="none"     → system + recent history only
+    depth="minimal"  → system + recent history + constraints
+    depth="standard" → tier 0 + compact symbol navigation
+    depth="full"     → tier 0 + compact symbol navigation + current file
     """
     depth = profile.context_depth
     if depth == "none":
         return {
+            "context_depth": "none",
+            "skip_repomap": True,
+            "skip_memory": True,
+            "skip_skills": True,
+            "skip_constraints": True,
+            "lightweight": True,
+        }
+    if depth == "minimal":
+        return {
+            "context_depth": "minimal",
             "skip_repomap": True,
             "skip_memory": True,
             "skip_skills": True,
             "lightweight": True,
         }
-    if depth == "minimal":
-        return {
-            "skip_repomap": True,
-            "skip_memory": False,
-            "lightweight": True,
-        }
     if depth == "standard":
         return {
-            "skip_repomap": False,   # allowed if file anchor present
-            "skip_memory": False,
+            "context_depth": "standard",
+            "skip_repomap": False,
+            "skip_memory": True,
+            "skip_skills": True,
+            "compact_symbols": True,
             "lightweight": False,
         }
-    # "full" — default behavior, no extra skips
-    return {}
+    return {
+        "context_depth": "full",
+        "skip_memory": True,
+        "skip_skills": True,
+        "compact_symbols": True,
+        "lightweight": False,
+    }

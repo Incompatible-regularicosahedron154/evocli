@@ -1,3 +1,4 @@
+# pyright: reportMissingTypeArgument=false, reportAttributeAccessIssue=false
 """agent_tool_defs.py - Tool definition builders mixin
 Extracted from agent.py.
 Single responsibility: build OpenAI-format tool schemas for LiteLLM fallback.
@@ -68,6 +69,7 @@ class AgentToolDefsMixin:
             {"type": "function", "function": {"name": "shell_run", "description": "Run a shell command (restricted whitelist)", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}, "cwd": {"type": "string"}, "timeout_s": {"type": "integer"}}, "required": ["cmd"]}}},
             {"type": "function", "function": {"name": "memory_recall", "description": "Search memory for relevant context", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}}, "required": ["query"]}}},
             {"type": "function", "function": {"name": "memory_write", "description": "Write a note to memory", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "body": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}}, "required": ["title", "body"]}}},
+            {"type": "function", "function": {"name": "skill_search", "description": "Search methodology guidance, best practices, and workflow docs for the current task", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
             {"type": "function", "function": {"name": "git_status", "description": "Get git status of current repo", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "git_commit", "description": "Commit changes to git", "parameters": {"type": "object", "properties": {"message": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}}}, "required": ["message"]}}},
             {"type": "function", "function": {"name": "git_snapshot", "description": "Create a git stash snapshot for rollback safety", "parameters": {"type": "object", "properties": {}}}},

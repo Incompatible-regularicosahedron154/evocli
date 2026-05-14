@@ -25,7 +25,14 @@ class AgentContextMixin:
             from evocli_soul.context_engine import ContextEngine
             ctx_engine = ContextEngine(self.bridge)
             context_params = context_params or {}
-            lightweight = bool(context_params.get("lightweight"))
+            context_depth = str(context_params.get("context_depth") or "full").lower()
+            if context_depth not in {"none", "minimal", "standard", "full"}:
+                context_depth = "full"
+
+            lightweight = bool(context_params.get("lightweight")) or context_depth in {"none", "minimal"}
+            compact_symbols = context_depth in {"standard", "full"}
+            include_current_file = context_depth == "full"
+            skip_constraints = bool(context_params.get("skip_constraints")) or context_depth == "none"
     
             # Inject /add-ed files into context params (Aider /add pattern)
             try:
@@ -57,7 +64,7 @@ class AgentContextMixin:
             return await ctx_engine.build({
                 "goal":             enriched_goal,
                 "project_id":       context_params.get("project_id", "."),
-                "current_file":     context_params.get("current_file"),
+                "current_file":     context_params.get("current_file") if include_current_file else None,
                 "git_diff":         context_params.get("git_diff", ""),
                 "history":          history or [],
                 "active_tools":     list(self._TOOL_TO_RPC.keys()),
@@ -68,11 +75,14 @@ class AgentContextMixin:
                 "provider_id":      _provider,    # for env block
                 # Intent-profile driven context skips:
                 "skip_repomap":     bool(
-                    lightweight
+                    (not compact_symbols)
                     or context_params.get("skip_repomap")
                 ),
-                "skip_memory":      bool(context_params.get("skip_memory")),
-                "skip_skills":      bool(context_params.get("skip_skills")),
+                "skip_memory":      bool(context_params.get("skip_memory", True)),
+                "skip_skills":      bool(context_params.get("skip_skills", True)),
+                "skip_constraints": skip_constraints,
+                "compact_symbols":  bool(context_params.get("compact_symbols", compact_symbols)),
+                "context_depth":    context_depth,
             })
         except Exception as e:
             log.debug("Context build failed: %s", e)
