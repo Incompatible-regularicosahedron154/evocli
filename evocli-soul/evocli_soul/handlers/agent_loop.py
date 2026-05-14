@@ -1,0 +1,559 @@
+"""
+handlers/agent_loop.py — Autonomous agent execution loop
+
+Extracted from handlers/agent.py to keep handle_agent_stream slim.
+
+Single responsibility: run the multi-turn autonomous execution loop
+(Plan-Act-Verify with task_complete exit signal).
+"""
+from __future__ import annotations
+import asyncio
+import traceback as _tb
+import logging
+
+log = logging.getLogger("evocli.handlers.agent_loop")
+
+
+async def run_agent_stream_body(
+    req_id: str,
+    params: dict,
+    send,
+    state,
+) -> None:
+    """
+    Main agent stream body — session setup + autonomous execution loop.
+
+    Called from handle_agent_stream after slash command dispatch.
+    Handles: session identity, API key check, ToolFlow, autonomous loop,
+    task_complete, auto-commit, and post-loop cleanup.
+    """
+    from evocli_soul.rpc import emit_event
+    from evocli_soul.handlers.agent import _derive_stream_session_id, _maybe_compress_history, _distill_session
+    from evocli_soul import trace
+    import traceback as _tb
+
+    # Extract prompt from params — mirrors the extraction in handle_agent_stream
+    # so this function can be called standalone (e.g., in tests).
+    prompt: str = params.get("prompt", params.get("message", params.get("input", "")))
+    if not prompt:
+        await send.stream_chunk(req_id, "ERROR: prompt is required", done=True)
+        return
+
+    # Track whether we actually sent any content chunks so we can detect silent failures.
+    chunks_sent = 0
+
+    # ── Session identity + turn counter ──────────────────────────────────────
+    import evocli_soul.state as _st
+    session_id = _derive_stream_session_id(params)
+    _turn = _st.increment_turn(session_id)
+
+    # ── Bind trace context (Rule 10: Observability) ───────────────────────────
+    # All log calls inside this function now auto-include session_id + request_id.
+    _cfg_tmp = state.get_config() if hasattr(state, 'get_config') else {}
+    _model_id_trace = (_cfg_tmp or {}).get("llm", {}).get("tiers", {}).get("fast", "") if isinstance(_cfg_tmp, dict) else ""
+    _trace_tokens = trace.bind_to_soul_loop(session_id, model_id=_model_id_trace, turn=_turn)
+    _trace_log = trace.get_logger("evocli.agent_loop")
+
+    # ── Auto background summary every 8 turns (OpenCode pattern) ─────────────
+    # Triggered asynchronously — does NOT block the current response.
+    # Uses fast/small model for summarization to minimize cost.
+    if _turn > 0 and _turn % 8 == 0:
+        _hist_for_summary = _st.get_history(session_id)
+        if len(_hist_for_summary) >= 8:
+            async def _auto_summarize(sid: str, hist: list) -> None:
+                try:
+                    from evocli_soul.context_engine import compact_session_to_anchor
+                    existing = _st.get_anchored_summary(sid)
+                    llm = state.get_llm_client()
+                    new_summary = await compact_session_to_anchor(hist, llm, existing_summary=existing)
+                    if new_summary:
+                        _st.set_anchored_summary(new_summary, sid)
+                        log.info("Auto-summary completed for session %s (turn %d)", sid[:12], _turn)
+                except Exception as _se:
+                    log.warning("Auto-summary failed (session=%s): %s", sid[:12], _se)
+            import asyncio as _auto_asyncio
+            _summary_task = _auto_asyncio.create_task(_auto_summarize(session_id, _hist_for_summary))
+            _summary_task.add_done_callback(
+                lambda t: log.debug("Auto-summary task done: %s", t.exception() or "ok")
+            )
+
+    # ── Load persistent conversation history (multi-turn continuity) ─────────
+    prior_history = _st.get_history(session_id)
+
+    try:
+        from evocli_soul.agent import EvoCLIAgent, _PROVIDER_ENV
+        cfg = state.get_config()
+        memory = _st.get_memory_if_ready()
+
+        agent = EvoCLIAgent(state.get_bridge(), memory, cfg, session_id=session_id)
+
+        # ── Fast-fail: no API key configured ─────────────────────────────────
+        # Without this check the code falls through to _stream_litellm, which
+        # makes a real TCP connection to the LLM provider and waits up to 20s
+        # before raising an auth error — especially painful on restricted networks.
+        if agent._agent is None:
+            llm_cfg = (cfg or {}).get("llm", {}) if isinstance(cfg, dict) else {}
+            provider = llm_cfg.get("provider", "anthropic")
+            env_var  = _PROVIDER_ENV.get(provider, "")
+
+            has_key = bool(llm_cfg.get("api_key"))
+            if not has_key and env_var:
+                import os
+                has_key = bool(os.environ.get(env_var))
+            if not has_key and env_var:
+                try:
+                    import keyring as _kr
+                    has_key = bool(_kr.get_password("evocli", provider))
+                except Exception as _kr_err:
+                    log.debug("keyring lookup failed for %s: %s", provider, _kr_err)
+
+            if not has_key:
+                key_hint = env_var or "YOUR_PROVIDER_API_KEY"
+                await send.stream_chunk(
+                    req_id,
+                    f"⚠️  **No API key configured** for provider `{provider}`.\n\n"
+                    f"Run `evocli init` to set your key interactively, or export:\n"
+                    f"```\n{key_hint}=sk-...\n```\n"
+                    f"Then restart EvoCLI.",
+                    done=True,
+                )
+                return
+
+        # ── Progress events — send stream_chunk (NOT just soul_status) ──────────
+        # soul_status does NOT reset the TUI's first_chunk_deadline timer.
+        # Only stream_chunk resets it. We send a lightweight status chunk immediately
+        # so the TUI shows activity and the 120s timer doesn't fire during context build.
+        await emit_event("soul_status", {
+            "status":  "loading",
+            "message": "⚙ 正在构建上下文…",
+        })
+        # Send first visible progress chunk — this resets the TUI first_chunk timer.
+        # The chunk is styled as a status line that will be replaced by actual response.
+        await send.stream_chunk(req_id, "", done=False)  # unlock TUI timer immediately
+
+        # ── ToolFlow 触发检查（在 LLM 调用前）────────────────────────────────
+        # 检查用户意图是否匹配已学习的工具流
+        # 高置信度(≥0.70)→ 询问是否执行；中置信度(0.45-0.70)→ 告知有工具流可用
+        try:
+            from evocli_soul.tool_flow_miner import (
+                check_flow_trigger, FlowExecutor,
+                AUTO_EXECUTE_THRESH, SUGGEST_THRESH,
+            )
+            _matched_flow, _flow_score = check_flow_trigger(prompt)
+            if _matched_flow and _flow_score >= AUTO_EXECUTE_THRESH:
+                # 高置信度：直接建议执行工具流，以 system 消息通知用户
+                _flow_hint = (
+                    f"🔄 **检测到匹配的工具流**: {_matched_flow.name}\n"
+                    f"步骤: {' → '.join(s.tool for s in _matched_flow.steps[:5])}\n"
+                    f"置信度: {_flow_score:.0%}  历史成功率: {_matched_flow.success_rate:.0%}\n\n"
+                    f"正在自动执行...\n\n"
+                )
+                await send.stream_chunk(req_id, _flow_hint, done=False)
+                # 执行工具流
+                _executor = FlowExecutor(state.get_bridge(), cfg)
+                _flow_ctx = {"current_file": params.get("current_file", "")}
+
+                async def _progress_cb(step_n, total, desc, result):
+                    await send.stream_chunk(req_id,
+                        f"{'✓' if result else '⏳'} [{step_n}/{total}] {desc}\n",
+                        done=False)
+
+                _flow_result = await _executor.execute(
+                    _matched_flow, prompt,
+                    context=_flow_ctx,
+                    progress_callback=_progress_cb,
+                )
+                if _flow_result.get("ok"):
+                    _final = _flow_result.get("final_output", "")
+                    await send.stream_chunk(req_id,
+                        f"\n✅ 工具流执行完成\n{_final[:500] if _final else ''}",
+                        done=True)
+                    # 持久化本轮历史
+                    _st.append_history([
+                        {"role": "user",      "content": prompt},
+                        {"role": "assistant", "content": f"[工具流: {_matched_flow.name}]\n{_final[:1000]}"},
+                    ], session_id)
+                    return
+                else:
+                    # 工具流失败 → 降级到正常 agent 流程
+                    await send.stream_chunk(req_id,
+                        f"⚠️ 工具流执行失败（步骤{_flow_result.get('failed_step')}），使用 AI 继续...\n\n",
+                        done=False)
+            elif _matched_flow and _flow_score >= SUGGEST_THRESH:
+                # 中置信度：在响应开头提示有工具流可用（不打断流程）
+                _hint = (
+                    f"💡 *发现相关工具流: {_matched_flow.name}*  "
+                    f"(置信度 {_flow_score:.0%}，输入 `/flows` 查看)\n\n"
+                )
+                await send.stream_chunk(req_id, _hint, done=False)
+        except Exception as _tf_err:
+            log.debug("ToolFlow trigger check failed (non-fatal): %s", _tf_err)
+
+        # ── Autonomous execution loop ─────────────────────────────────────────
+        # Implements: Cline initiateTaskLoop + Gemini Plan→Act→Verify pattern.
+        #
+        # Protocol insight: `done=True` is sent ONLY ONCE at the very end.
+        # While the AI is still working, all chunks use `done=False`.
+        # This keeps the Rust TUI stream open across multiple agent.stream() calls
+        # — solving the "auto-continue disabled" protocol limitation.
+        #
+        # Loop exit conditions (in priority order):
+        #   1. AI calls task_complete tool → graceful success
+        #   2. MAX_AUTO_ITERATIONS reached → hard stop with "next steps" hint
+        #   3. 2+ consecutive iterations with zero tool calls → AI is stuck on text
+        #   4. Unrecoverable error in both pydantic-ai and LiteLLM paths
+        #
+        # Per-iteration flow:
+        #   a. reset_iteration_tool_count() → tracks if AI actually did work
+        #   b. agent.stream() → yields chunks streamed to TUI (done=False)
+        #   c. check task_complete signal → if set, run verification + break
+        #   d. check tool_count → if 0, inject forcing message; else inject continuation
+
+        _cfg_agent        = (cfg or {}).get("agent", {}) if isinstance(cfg, dict) else {}
+        from evocli_soul.config_defaults import cfg_int, cfg_bool
+        _max_auto_iters       = int(_cfg_agent.get("max_auto_iterations", cfg_int("agent.max_auto_iterations")))
+        _consecutive_no_tools = 0
+        _MAX_NO_TOOL_ITERS    = cfg_int("agent.max_no_tool_turns")
+
+        # Clear stale task_complete from any previous request
+        _st.clear_task_complete(session_id)
+
+        # ── Auto-snapshot before risky tasks (Aider safety pattern) ──────────
+        # If the task looks like it will modify files AND we're in a git repo,
+        # create a stash snapshot BEFORE starting. This gives the user a safe
+        # rollback point even if task_complete is never called.
+        _auto_snap_enabled = _cfg_agent.get("auto_snapshot", True)
+        if _auto_snap_enabled:
+            async def _try_auto_snapshot() -> None:
+                _risky_words = {
+                    "修改", "删除", "重构", "重写", "实现", "添加", "创建", "更新", "fix", "add",
+                    "implement", "refactor", "rewrite", "create", "update", "delete", "remove",
+                    "change", "modify", "edit",
+                }
+                _prompt_lower = prompt.lower()
+                _looks_risky  = any(w in _prompt_lower for w in _risky_words)
+                if _looks_risky:
+                    try:
+                        _snap_result = await state.get_bridge().call("git.snapshot", {})
+                        if isinstance(_snap_result, dict):
+                            _ref = _snap_result.get("stash_ref", "")
+                            if _ref:
+                                log.info("Auto-snapshot created: %s (task: %s)", _ref, prompt[:50])
+                    except Exception as _se:
+                        log.debug("Auto-snapshot failed (non-fatal): %s", _se)
+            asyncio.create_task(_try_auto_snapshot())
+
+        # ── Auto-detect test command ──────────────────────────────────────────
+        # When task_complete is called with empty command= parameter, we auto-detect
+        # the project's test runner from known config files. Injected into env.
+        async def _detect_test_command() -> str:
+            """Detect test runner from project root (Aider pattern)."""
+            try:
+                from evocli_soul.state import get_session_root as _gsr_tc
+                _root = _gsr_tc()
+                import os as _os_tc
+                _detectors = [
+                    ("Cargo.toml",      "cargo test"),
+                    ("package.json",    "npm test"),
+                    ("pyproject.toml",  "python -m pytest"),
+                    ("pytest.ini",      "python -m pytest"),
+                    ("setup.py",        "python -m pytest"),
+                    ("go.mod",          "go test ./..."),
+                    ("Makefile",        "make test"),
+                    ("pom.xml",         "mvn test"),
+                    ("build.gradle",    "gradle test"),
+                ]
+                for fname, cmd in _detectors:
+                    if _os_tc.path.exists(_os_tc.path.join(_root, fname)):
+                        return cmd
+            except Exception:
+                pass  # test cmd detection is best-effort, never block
+        _detected_test_cmd = await _detect_test_command()
+        if _detected_test_cmd:
+            log.debug("Auto-detected test command: %s", _detected_test_cmd)
+
+        _current_prompt = prompt
+        _all_chunks: list[str] = []
+
+        for _auto_iter in range(_max_auto_iters):
+            _is_first_iter = (_auto_iter == 0)
+
+            # Reset tool count tracker for this iteration
+            _st.reset_iteration_tool_count(session_id)
+            # Gemini scratchpad: mark new iteration boundary
+            try:
+                from evocli_soul.state import new_scratchpad_iteration as _nsi
+                _nsi(session_id)
+            except Exception as _nsi_err:
+                log.debug("scratchpad iteration failed (non-fatal): %s", _nsi_err)
+                pass
+
+            # Emit iteration progress (after first, so TUI shows continuation status)
+            if not _is_first_iter:
+                await emit_event("soul_status", {
+                    "status":  "loading",
+                    "message": f"⟳ 继续执行… ({_auto_iter + 1}/{_max_auto_iters})",
+                })
+
+            # ── Stream one agent turn ──────────────────────────────────────────
+            collected_chunks_iter: list[str] = []
+            primary_err: Exception | None = None
+            _prior = _st.get_history(session_id)
+
+            try:
+                async for chunk in agent.stream(_current_prompt,
+                                                 prior_history=_prior,
+                                                 session_id=session_id):
+                    if chunk:
+                        await send.stream_chunk(req_id, chunk, done=False)
+                        collected_chunks_iter.append(chunk)
+                        chunks_sent += 1
+            except Exception as _iter_err:
+                primary_err = _iter_err
+                log.error("agent.stream iter %d failed: %s\n%s",
+                          _auto_iter, _iter_err, _tb.format_exc())
+
+            # LiteLLM fallback for this iteration
+            if primary_err is not None or (not collected_chunks_iter and _is_first_iter):
+                if primary_err is not None:
+                    first_line = str(primary_err).splitlines()[0] if str(primary_err) else repr(primary_err)
+                    await emit_event("soul_status", {
+                        "status":  "error",
+                        "message": f"Primary path failed: {first_line} — retrying with LiteLLM…",
+                    })
+                try:
+                    try:
+                        fallback_ctx = await agent._build_context(
+                            _current_prompt, history=_prior, session_id=session_id)
+                    except Exception:
+                        fallback_ctx = {}
+                    try:
+                        fallback_prompt = await agent._inject_context(_current_prompt, fallback_ctx)
+                    except Exception:
+                        fallback_prompt = _current_prompt
+                    async for chunk in agent._stream_litellm(fallback_prompt, fallback_ctx, prior_history=None):
+                        if chunk:
+                            await send.stream_chunk(req_id, chunk, done=False)
+                            collected_chunks_iter.append(chunk)
+                            chunks_sent += 1
+                except Exception as fallback_err:
+                    log.error("LiteLLM fallback iter %d failed: %s", _auto_iter, fallback_err)
+                    if _is_first_iter:
+                        await send.stream_chunk(
+                            req_id,
+                            f"\n\n⛔ **Both LLM paths failed.**\n"
+                            f"- Primary: `{primary_err}`\n- Fallback: `{fallback_err}`\n\n"
+                            f"Check API key and network, or run `evocli doctor`.",
+                            done=True,
+                        )
+                        return
+                    break  # Give up on continuation, exit loop
+
+            # Persist this iteration's history
+            if collected_chunks_iter:
+                iter_reply = "".join(collected_chunks_iter)
+                _all_chunks.append(iter_reply)
+                _st.append_history([
+                    {"role": "user",      "content": _current_prompt},
+                    {"role": "assistant", "content": iter_reply},
+                ], session_id)
+
+            # ── Check task_complete signal ─────────────────────────────────────
+            completion = _st.get_task_complete(session_id)
+            if completion:
+                _result  = completion.get("result", "")
+                _cmd     = completion.get("command", "")
+                _st.clear_task_complete(session_id)
+
+                # Auto-fill test command if AI left it empty (use detected test runner)
+                if not _cmd and _detected_test_cmd:
+                    _cmd = _detected_test_cmd
+                    log.debug("Auto-filled test command: %s", _cmd)
+
+                # Run verification command if AI provided one (Gemini mandatory verify)
+                if _cmd:
+                    await send.stream_chunk(
+                        req_id,
+                        f"\n\n---\n🔍 **自动验证**: `{_cmd}`\n",
+                        done=False,
+                    )
+                    try:
+                        verify_raw = await state.get_bridge().call(
+                            "shell.run",
+                            {"cmd": _cmd, "cwd": ".", "timeout_s": cfg_int("shell.verify_timeout_s"), "dry_run": False},
+                        )
+                        import json as _vj
+                        if isinstance(verify_raw, str):
+                            try:
+                                verify_raw = _vj.loads(verify_raw)
+                            except Exception:
+                                verify_raw = {"stdout": verify_raw}
+                        v_out  = verify_raw.get("stdout", "") if isinstance(verify_raw, dict) else str(verify_raw)
+                        v_err  = verify_raw.get("stderr", "") if isinstance(verify_raw, dict) else ""
+                        v_code = verify_raw.get("exit_code", 0) if isinstance(verify_raw, dict) else 0
+                        v_text = (v_out + "\n" + v_err).strip()
+                        status_icon = "✅" if v_code == 0 else "❌"
+                        await send.stream_chunk(
+                            req_id,
+                            f"```\n{v_text[:1500]}\n```\n{status_icon} 验证{'通过' if v_code == 0 else '失败'}（exit {v_code}）\n",
+                            done=False,
+                        )
+                        # If verification failed and we have iterations left → continue
+                        if v_code != 0 and _auto_iter + 1 < _max_auto_iters:
+                            _st.clear_task_complete(session_id)  # reset signal
+                            _current_prompt = (
+                                f"验证命令失败（exit {v_code}）:\n```\n{v_text[:800]}\n```\n"
+                                f"请分析错误，修复问题，然后再次调用 task_complete。"
+                            )
+                            _consecutive_no_tools = 0
+                            continue  # go back to next iteration to fix the issue
+                    except Exception as _ve:
+                        log.debug("Verification command failed (non-fatal): %s", _ve)
+
+                # Task complete: emit summary and write memory
+                _completion_banner = (
+                    f"\n\n---\n✅ **任务完成**\n\n{_result}\n"
+                )
+                await send.stream_chunk(req_id, _completion_banner, done=False)
+
+                # ── Auto-commit (Aider pattern) ──────────────────────────────
+                # Generate a Conventional Commit message from the diff and commit.
+                # Only fires when verification passed (or no verification command).
+                _auto_commit_enabled = (cfg or {}).get("agent", {}).get("auto_commit", True) if isinstance(cfg, dict) else True
+                if _auto_commit_enabled:
+                    try:
+                        # Check if there are any uncommitted changes
+                        diff_result = await state.get_bridge().call("git.diff", {"staged": False})
+                        staged_result = await state.get_bridge().call("git.diff", {"staged": True})
+                        _diff_text = ""
+                        if isinstance(diff_result, str) and diff_result.strip():
+                            _diff_text = diff_result
+                        elif isinstance(staged_result, str) and staged_result.strip():
+                            _diff_text = staged_result
+
+                        if _diff_text:
+                            from evocli_soul.auto_commit import generate_commit_message
+                            _llm = state.get_llm_client()
+                            _commit_msg = await generate_commit_message(
+                                _diff_text[:3000], _llm, goal=prompt
+                            )
+                            _commit_result = await state.get_bridge().call(
+                                "git.commit", {"message": _commit_msg, "files": []}
+                            )
+                            _hash = ""
+                            if isinstance(_commit_result, dict):
+                                _hash = _commit_result.get("hash", "")[:8]
+                            await send.stream_chunk(
+                                req_id,
+                                f"💾 **自动提交**: `{_commit_msg}`{' (' + _hash + ')' if _hash else ''}\n",
+                                done=False,
+                            )
+                            log.info("Auto-commit after task_complete: %s (%s)", _commit_msg, _hash)
+                    except Exception as _ac_err:
+                        log.debug("Auto-commit failed (non-fatal): %s", _ac_err)
+
+                # Non-blocking: write completion to memory for future recall
+                async def _persist_completion(sid: str, res: str) -> None:
+                    try:
+                        from evocli_soul.memory_distill import distill_success
+                        await distill_success(res, session_id=sid)
+                    except Exception as _dist_err:
+                        log.warning("distill_success failed (memory flywheel): %s", _dist_err)
+                break  # Clean exit from autonomous loop
+
+            # ── No task_complete: decide whether to continue ───────────────────
+            tool_count = _st.get_iteration_tool_count(session_id)
+
+            if tool_count == 0:
+                # AI produced only text — no real work this iteration
+                _consecutive_no_tools += 1
+                log.debug("auto-loop iter %d: 0 tools called (%d consecutive)", _auto_iter, _consecutive_no_tools)
+
+                if _consecutive_no_tools >= _MAX_NO_TOOL_ITERS:
+                    # AI is stuck on text — exit loop gracefully
+                    log.info("auto-loop stopping: %d consecutive text-only turns", _consecutive_no_tools)
+                    break
+
+                if _auto_iter + 1 < _max_auto_iters:
+                    # Inject Cline-style forcing message
+                    _current_prompt = (
+                        "你描述了计划但还没有执行。**现在立即采取行动**：\n"
+                        "- 使用 `fs_read`/`fs_write`/`shell_run` 等工具实际执行修改\n"
+                        "- 不要只是描述——要调用工具完成工作\n"
+                        "- 完成所有任务后调用 `task_complete` 工具\n\n"
+                        "如果任务已经完成，调用 `task_complete` 总结结果。"
+                    )
+            else:
+                # Tools were called — AI is making progress
+                _consecutive_no_tools = 0
+                log.debug("auto-loop iter %d: %d tools called, continuing", _auto_iter, tool_count)
+
+                if _auto_iter + 1 < _max_auto_iters:
+                    # Check remaining todos for continuation prompt
+                    todos = _st.get_todos(session_id)
+                    pending_count = sum(1 for t in todos if t.get("status") not in ("completed", "cancelled"))
+
+                    if pending_count > 0:
+                        _current_prompt = (
+                            f"继续执行任务。还有 {pending_count} 个待办项。\n"
+                            f"使用 `todo_read` 查看剩余步骤，完成后调用 `task_complete`。"
+                        )
+                    else:
+                        _current_prompt = (
+                            "继续执行。检查工作是否完整，如果完成请调用 `task_complete` 工具。"
+                        )
+                else:
+                    # Last iteration — force completion summary
+                    _current_prompt = (
+                        f"这是最后一步（{_max_auto_iters}/{_max_auto_iters}）。\n"
+                        f"请总结已完成的工作并调用 `task_complete`，即使还有未完成的项目也要列出 Next Steps。"
+                    )
+
+        # Loop ended (task_complete, max iterations, or no-tool exit)
+        if chunks_sent == 0:
+            log.warning("agent.stream completed but emitted 0 content chunks")
+            await send.stream_chunk(
+                req_id,
+                "⚠️ The model returned an empty response. "
+                "This may be a content-filter rejection. Try rephrasing.",
+                done=True,
+            )
+            return
+
+        await send.stream_chunk(req_id, "", done=True)
+
+        # ── Post-loop: compress hint ──────────────────────────────────────────
+        asyncio.create_task(_maybe_compress_history(session_id))
+        cfg_agent       = (state.get_config() or {}).get("agent", {}) if isinstance(state.get_config(), dict) else {}
+        compress_turns  = int(cfg_agent.get("history_compress_turns",  cfg_int("agent.history_compress_turns")))
+        compress_tokens = int(cfg_agent.get("history_compress_tokens", cfg_int("agent.history_compress_tokens")))
+        history_len     = len(_st.get_history(session_id))
+        token_est       = _st.get_history_token_estimate(session_id)
+        if history_len >= compress_turns * 2 or token_est >= compress_tokens:
+            asyncio.create_task(emit_event("soul_status", {
+                "status":  "ready",
+                "message": (
+                    f"💡 Context is getting long ({history_len // 2} exchanges, ~{token_est} tokens). "
+                    f"Type /compress to free up space for better results."
+                ),
+            }))
+
+    except Exception as e:
+        _trace_log.error("agent_loop_crash", error=str(e)[:200])
+        log.error("agent.stream handler crashed: %s\n%s", e, _tb.format_exc())
+        await send.stream_chunk(
+            req_id,
+            f"\n\n⛔ **Unexpected error in agent.stream:** `{e}`\n"
+            f"Press F12 to view full logs.",
+            done=True,
+        )
+    finally:
+        # GAP-3: Trigger memory distillation at session end (non-blocking, best-effort).
+        asyncio.create_task(_distill_session(session_id))
+        # Cleanup trace context to prevent leaks in long-running Soul processes
+        for _tok in _trace_tokens:
+            try:
+                _tok.var.reset(_tok)
+            except Exception:
+                pass
+
