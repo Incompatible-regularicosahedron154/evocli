@@ -156,7 +156,9 @@ class TestWorkerPool:
             )
             for i in range(3)
         ]
-        results = await pool.submit_tasks(tasks)
+        # Use short timeout so test doesn't hang waiting for real LLM.
+        # Tasks will fail fast (no API key in CI) → status="failed" is acceptable.
+        results = await pool.submit_tasks(tasks, task_timeout_s=2.0)
 
         assert len(results) == 3
         statuses = {t.status for t in results}
@@ -166,7 +168,7 @@ class TestWorkerPool:
 
     @pytest.mark.asyncio
     async def test_submit_tasks_respects_max_workers(self):
-        """submit_tasks — max_workers 约束下任务都能完成"""
+        """submit_tasks — max_workers 约束下任务都能完成（含 LLM 超时保护）"""
         from evocli_soul.multi_agent import WorkerPool, AgentTask
 
         bridge = MockBridge()
@@ -176,15 +178,17 @@ class TestWorkerPool:
             for i in range(4)
         ]
         start   = time.monotonic()
-        results = await pool.submit_tasks(tasks)
+        # Use short per-task timeout (2s) so test completes quickly even without LLM.
+        # Without an API key, each agent.run() attempt fails via timeout → status="failed".
+        results = await pool.submit_tasks(tasks, task_timeout_s=2.0)
         elapsed = time.monotonic() - start
 
-        # All 4 tasks must complete
+        # All 4 tasks must complete (done or failed — NOT stuck in pending/running)
         assert len(results) == 4
         statuses = {t.status for t in results}
         assert statuses.issubset({"done", "failed"}), f"Stuck tasks: {statuses}"
-        # With max_workers=2, at most 2 run at a time (timing test: should finish quickly)
-        assert elapsed < 10.0, f"Took too long: {elapsed:.1f}s"
+        # With per-task timeout=2s and max_workers=2: ceil(4/2)*2 = 4s → well under 15s
+        assert elapsed < 15.0, f"Took too long: {elapsed:.1f}s (per-task timeout=2s)"
 
 
 # ── DaemonWorkerManager ──────────────────────────────────────────────────────
