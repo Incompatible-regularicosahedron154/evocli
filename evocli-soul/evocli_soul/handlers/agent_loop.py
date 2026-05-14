@@ -409,6 +409,9 @@ async def run_agent_stream_body(
             # - coder/debugger/risky: read_only=False (execution tasks)
             read_only=_intent_profile_early.intent in {"reviewer", "planner", "researcher"},
         )
+        # Wire intent to agent so tool selector can give chat/question zero tools
+        # (prevents LLM from calling memory_recall on "你好" due to system prompt instructions)
+        agent._intent = _intent_profile_early.intent
 
         # ── Fast-fail: no API key configured ─────────────────────────────────
         # Without this check the code falls through to _stream_litellm, which
