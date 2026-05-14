@@ -457,21 +457,30 @@ async def run_agent_stream_body(
             _flow_success_rate = getattr(_matched_flow, "success_rate", 0.0) if _matched_flow else 0.0
 
             # ── Voyager 模式：流作为 LLM 的记忆提示，而非执行脚本 ────────────────
+            # 参考：Voyager (2023), ReWOO (2023), DEPS (2023)
             #
-            # 旧设计 (❌): 高置信度 → 机械重放流步骤，LLM 完全缺席
-            #   问题：上下文差异（不同语言、不同文件结构）无法处理，成功率卡在 90%
-            #
-            # 新设计 (✅): 匹配到流 → 注入到 LLM 上下文作为"历史成功模式"
-            #   LLM 理解模式并基于当前上下文决定如何执行，必然能适应差异
-            #   参考：Voyager (Wang et al., 2023) — 技能程序作为 LLM 少样本示例
-            #         ReWOO (Xu et al., 2023) — 历史计划注入 planner 上下文
-            #         DEPS (Zhu et al., 2023) — 历史模式作为描述性提示
-            #
-            # 门控：只需 success_rate >= 0.60 (说明这个模式有价值值得提示)
-            # 不再有"自动执行"路径——所有执行都经过 LLM 推理
-            _FLOW_HINT_THRESH = 0.60   # 至少 60% 成功率才值得作为提示
+            # 触发条件（三层过滤，缺一不可）：
+            # 1. Intent 必须是"执行型"任务 — coder/debugger/risky
+            #    chat/question/researcher/planner/reviewer 不需要工具流提示：
+            #    - chat/question: 单轮对话，根本不需要多步骤工具流
+            #    - researcher/planner: 读写较少，流提示是噪声
+            #    - reviewer: 只读分析，不需要执行模式参考
+            # 2. 流的步骤数 >= 3 — 少于 3 步的"流"是琐碎操作，不值得提示
+            # 3. success_rate >= 0.60 — 这个模式有足够的历史验证
+            _FLOW_EXEC_INTENTS = {"coder", "debugger", "risky"}   # 只有执行型任务才注入
+            _FLOW_MIN_STEPS    = 3                                  # 最少 3 步才算有价值的模式
+            _FLOW_HINT_THRESH  = 0.60                               # 最少 60% 成功率
 
-            if _matched_flow and _flow_score >= SUGGEST_THRESH and _flow_success_rate >= _FLOW_HINT_THRESH:
+            _flow_steps_count  = len(getattr(_matched_flow, "steps", [])) if _matched_flow else 0
+            _flow_eligible = (
+                _matched_flow is not None
+                and _flow_score >= SUGGEST_THRESH
+                and _flow_success_rate >= _FLOW_HINT_THRESH
+                and _flow_steps_count >= _FLOW_MIN_STEPS
+                and _intent_profile_early.intent in _FLOW_EXEC_INTENTS
+            )
+
+            if _flow_eligible:
                 # 构建 Voyager 风格的记忆提示：历史成功模式 + 成功率 + 步骤
                 _steps_desc = "\n".join(
                     f"  {i+1}. {s.tool}"
