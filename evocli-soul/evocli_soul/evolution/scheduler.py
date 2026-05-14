@@ -86,15 +86,19 @@ def _load_recent_events(limit: int = 200, project_id: str | None = None) -> list
                     "SELECT session_id, type, payload "
                     "FROM events "
                     "WHERE project_id = ? OR project_id = '' "
-                    "ORDER BY created_at ASC LIMIT ?",
+                    "ORDER BY created_at DESC LIMIT ?",
                     (safe_pid, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     "SELECT session_id, type, payload "
-                    "FROM events ORDER BY created_at ASC LIMIT ?",
+                    "FROM events ORDER BY created_at DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
+
+            # Load most-recent events first (DESC), then reverse to get chronological
+            # order for distillation chain extraction which expects events oldest→newest.
+            rows = list(reversed(rows))
 
             for sid, etype, payload_str in rows:
                 entry: dict = {"session_id": sid, "type": etype}

@@ -700,6 +700,53 @@ REGISTRY: list[ToolSpec] = [
         tier=3, base_score=0.7,
         keywords=["mcp tools", "list plugins", "available tools", "external"],
     ),
+
+    # ── Task lifecycle tools (Tier 1 — always critical for loop exit) ──────────
+    # These were previously in agent_tools_code.py (@agent.tool_plain).
+    # Without these in the registry, tool_router falls back to auto_classify_unknown
+    # which may not prioritize them correctly. task_complete is THE loop exit signal.
+    ToolSpec(
+        name="task_complete", rpc="",
+        description="Signal that the current task is fully complete. The ONLY way to exit autonomous execution.",
+        tags=[Tag.VERIFY],
+        tier=1, always_on=True, pydantic=False, base_score=1.0,
+        keywords=["done", "finished", "complete", "task done", "completed"],
+    ),
+    ToolSpec(
+        name="todo_write", rpc="",
+        description="Write or update the task plan. Use at start of multi-step tasks.",
+        tags=[Tag.ANALYZE],
+        tier=1, always_on=True, pydantic=False, base_score=1.0,
+        keywords=["todo", "plan", "tasks", "steps", "checklist"],
+    ),
+    ToolSpec(
+        name="todo_read", rpc="",
+        description="Read the current task plan and check progress.",
+        tags=[Tag.ANALYZE],
+        tier=1, always_on=True, pydantic=False, base_score=1.0,
+        keywords=["todo", "progress", "pending", "remaining"],
+    ),
+    ToolSpec(
+        name="give_up", rpc="",
+        description="Withdraw from a task that cannot be completed as specified.",
+        tags=[Tag.VERIFY],
+        tier=2, pydantic=False, base_score=0.8,
+        keywords=["give up", "withdraw", "impossible", "cannot complete"],
+    ),
+    ToolSpec(
+        name="experience_lookup", rpc="",
+        description="Look up past proven workflows for a similar complex task.",
+        tags=[Tag.ANALYZE, Tag.MEMORY],
+        tier=2, pydantic=False, base_score=0.7,
+        keywords=["experience", "past", "proven", "workflow", "pattern"],
+    ),
+    ToolSpec(
+        name="spawn_agent", rpc="",
+        description="Delegate a complex subtask to an independent sub-agent.",
+        tags=[Tag.RUN],
+        tier=3, pydantic=False, base_score=0.6,
+        keywords=["spawn", "delegate", "sub-agent", "parallel"],
+    ),
 ]
 
 

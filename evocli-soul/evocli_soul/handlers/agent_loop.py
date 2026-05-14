@@ -818,7 +818,13 @@ async def run_agent_stream_body(
                             )
                             log.info("Auto-commit after task_complete: %s (%s)", _commit_msg, _hash)
                     except Exception as _ac_err:
-                        log.debug("Auto-commit failed (non-fatal): %s", _ac_err)
+                        # Auto-commit failure is non-fatal but user should know
+                        log.warning("Auto-commit failed: %s", _ac_err)
+                        await send.stream_chunk(
+                            req_id,
+                            f"\n⚠️ Auto-commit skipped: {type(_ac_err).__name__}: {str(_ac_err)[:100]}\n",
+                            done=False,
+                        )
 
                 # Non-blocking: write completion to memory for future recall
                 async def _persist_completion(sid: str, res: str) -> None:
