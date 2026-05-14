@@ -20,17 +20,26 @@ class AgentToolDefsMixin:
           - 如果 _selected_tool_names 为空（降级/首次调用），返回全部
           - LiteLLM 路径上限：MAX_TOOLS_LITELLM=20
         """
+        _ALWAYS_INCLUDE = frozenset({
+            "task_complete", "todo_write", "todo_read", "give_up",
+            "memory_recall", "memory_write",
+        })
+
         _all_defs = self._all_tool_definitions()
-        
+
         # 路由过滤（来自 _select_tools_for_request）
-        selected = self._selected_tool_names
+        selected = getattr(self, "_selected_tool_names", frozenset())
         if selected:
-            filtered = [d for d in _all_defs if d.get("function", {}).get("name") in selected]
+            filtered = [
+                d for d in _all_defs
+                if d.get("function", {}).get("name") in selected
+                or d.get("function", {}).get("name") in _ALWAYS_INCLUDE
+            ]
             if filtered:
                 log.debug("_build_tool_definitions: %d/%d tools (ToolRouter filtered)",
                           len(filtered), len(_all_defs))
                 return filtered
-        
+
         return _all_defs
 
     def _all_tool_definitions(self) -> list[dict]:
@@ -184,5 +193,10 @@ class AgentToolDefsMixin:
                     }
                 }, "required": ["edits_json"]},
             }},
+            {"type": "function", "function": {"name": "fetch_url", "description": "Fetch a URL and return clean Markdown content. Use for docs, APIs, web pages.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}, "selector": {"type": "string"}}, "required": ["url"]}}},
+            {"type": "function", "function": {"name": "code_semantic_search", "description": "Semantic vector search over indexed code. Understands intent, not just keywords. Requires 'evocli index' to have been run.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}, "language": {"type": "string"}, "kind": {"type": "string"}}, "required": ["query"]}}},
+            {"type": "function", "function": {"name": "code_hybrid_search", "description": "Hybrid BM25+vector search (best of both worlds). Primary code search tool. Better than shell_grep for semantic queries.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}}},
+            {"type": "function", "function": {"name": "code_blast_radius", "description": "Impact analysis: shows all callers and callees of a symbol. Use BEFORE modifying a symbol.", "parameters": {"type": "object", "properties": {"symbol_id": {"type": "string"}, "max_depth": {"type": "integer"}}, "required": ["symbol_id"]}}},
+            {"type": "function", "function": {"name": "spawn_agent", "description": "Delegate a bounded subtask to an independent sub-agent. Use for large, parallelizable, clearly-scoped subtasks.", "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "context": {"type": "string"}, "model": {"type": "string"}}, "required": ["task"]}}},
         ]
     

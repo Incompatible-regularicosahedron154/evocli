@@ -4,7 +4,8 @@ Single responsibility: _run_litellm tool-calling loop and _stream_litellm.
 """
 from __future__ import annotations
 import logging
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any, Protocol, cast
 log = logging.getLogger('evocli.agent.litellm')
 
 # Shared helpers — imported explicitly to avoid runtime NameError.
@@ -14,15 +15,26 @@ from evocli_soul.agent_executor import _tool_display_name  # noqa: E402
 from evocli_soul.default_prompts import build_system_prompt  # noqa: E402
 
 
+class _LiteLLMHost(Protocol):
+    config: dict[str, Any] | None
+    memory: Any
+    read_only: bool
+    _session_id: str
+
+    def _build_tool_definitions(self) -> list[dict[str, Any]]: ...
+    async def _execute_tool(self, name: str, args: dict[str, Any]) -> str: ...
+
+
 class AgentLiteLLMMixin:
     """Mixin: LiteLLM fallback for EvoCLIAgent."""
 
-    async def _run_litellm(self, user_input: str, ctx: dict,
-                           prior_history: list[dict] | None = None) -> str:
+    async def _run_litellm(self, user_input: str, ctx: dict[str, Any],
+                           prior_history: list[dict[str, Any]] | None = None) -> str:
         """Raw LiteLLM fallback with tool calling loop."""
         from evocli_soul.llm_client import LLMClient
+        host = cast(_LiteLLMHost, cast(object, self))
         
-        llm = LLMClient(self.config)
+        llm = LLMClient(host.config)
     
         # Fix: 使用 context_engine 构建的完整 system_prompt（含约束、记忆、RepoMap）。
         # 原版将 system_prompt 截断到 500 字符作为 "goal" 参数，丢失了大量上下文。
@@ -31,20 +43,20 @@ class AgentLiteLLMMixin:
             system = ctx["system_prompt"]
         else:
             constraints = "（无）"
-            if self.memory:
+            if host.memory:
                 try:
-                    c = self.memory.get_constraints()
+                    c = host.memory.get_constraints()
                     if c:
                         constraints = "\n".join(f"- {x}" for x in c)
                 except Exception as e:
                     log.debug("_run_litellm: failed to load constraints: %s", e)
             system = build_system_prompt(
                 constraints=constraints,
-                goal=user_input[:200],
-                read_only=self.read_only,
+                goal=user_input[:800],
+                read_only=host.read_only,
                 compact=False,
             )
-        conversation = [
+        conversation: list[Any] = [
             {"role": "system", "content": system},
         ]
         # Do NOT inject prior_history into the messages array — history is already
@@ -53,11 +65,11 @@ class AgentLiteLLMMixin:
         # (prior_history param is kept for API compatibility but intentionally unused.)
         conversation.append({"role": "user", "content": user_input})
         
-        tools = self._build_tool_definitions()
+        tools = host._build_tool_definitions()
 
         # ── Loop limits — read from config_defaults (no magic numbers) ───────
         from evocli_soul.config_defaults import cfg_int, cfg_float
-        _agent_cfg      = (self.config or {}).get("agent", {}) if self.config else {}
+        _agent_cfg      = (host.config or {}).get("agent", {}) if host.config else {}
         MAX_REFLECTIONS = int(_agent_cfg.get("max_reflections", cfg_int("agent.max_reflections")))
         MAX_TOOL_CALLS  = int(_agent_cfg.get("max_tool_calls",  cfg_int("agent.max_tool_calls")))
 
@@ -97,9 +109,9 @@ class AgentLiteLLMMixin:
 
             tier_alias = llm._resolve_model("auto")
             _task_params = llm.get_task_params("agent")
-            call_kwargs: dict = {
+            call_kwargs: dict[str, Any] = {
                 "model":       tier_alias,
-                "messages":    conversation,
+                "messages":    cast(Any, conversation),
                 "tools":       tools,
                 "max_tokens":  _task_params.get("max_tokens",  cfg_int("llm.max_tokens")),
                 "temperature": _task_params.get("temperature", cfg_float("llm.temperature")),
@@ -196,10 +208,10 @@ class AgentLiteLLMMixin:
                 # Fix: wrap each _execute_tool call with asyncio.wait_for and per-tool timeout.
                 _par_tool_timeout = cfg_float("shell.timeout_s")
 
-                async def _execute_with_timeout(name: str, args: dict) -> str:
+                async def _execute_with_timeout(name: str, args: dict[str, Any]) -> str:
                     try:
                         return await _par_asyncio.wait_for(
-                            self._execute_tool(name, args),
+                            host._execute_tool(name, args),
                             timeout=_par_tool_timeout,
                         )
                     except _par_asyncio.TimeoutError:
@@ -218,7 +230,7 @@ class AgentLiteLLMMixin:
                 # Parallel reads rarely fail — reset circuit breaker
                 try:
                     from evocli_soul.state import reset_tool_failure as _rf_par
-                    _rf_par(self._session_id)
+                    _rf_par(host._session_id)
                 except Exception:  # noqa: BLE001 — non-fatal event/metric, never block execution
                     pass
     
@@ -235,7 +247,7 @@ class AgentLiteLLMMixin:
                         })
                     except Exception:  # noqa: BLE001 — non-fatal event/metric, never block execution
                         pass
-                    result = await self._execute_tool(tc.function.name, targs)
+                    result = await host._execute_tool(tc.function.name, targs)
                     # Observation masking
                     result = _mask_obs(result, tc.function.name)
                     conversation.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -252,11 +264,11 @@ class AgentLiteLLMMixin:
                             )
                         )
                         if _is_error:
-                            _fail_count = _incf(self._session_id)
+                            _fail_count = _incf(host._session_id)
                             _cb_thresh  = cfg_int("agent.max_consecutive_failures")
                             if _fail_count >= _cb_thresh:
                                 log.warning("Circuit breaker: %d consecutive failures (session %s)",
-                                            _fail_count, self._session_id[:12])
+                                            _fail_count, host._session_id[:12])
                                 conversation.append({
                                     "role": "user",
                                     "content": (
@@ -267,9 +279,9 @@ class AgentLiteLLMMixin:
                                         f"最近错误: {result[:200]}"
                                     ),
                                 })
-                                _resetf(self._session_id)
+                                _resetf(host._session_id)
                         else:
-                            _resetf(self._session_id)
+                            _resetf(host._session_id)
                     except Exception:  # noqa: BLE001 — non-fatal event/metric, never block execution
                         pass
     
@@ -344,14 +356,15 @@ class AgentLiteLLMMixin:
             return "pytest"
         return "your test command"
     
-    async def _stream_litellm(self, user_input: str, ctx: dict,
-                               prior_history: list[dict] | None = None) -> AsyncGenerator[str, None]:
+    async def _stream_litellm(self, user_input: str, ctx: dict[str, Any],
+                               prior_history: list[dict[str, Any]] | None = None) -> AsyncGenerator[str, None]:
         """Streaming LiteLLM fallback with multi-turn history support."""
         import asyncio
         import litellm
         from evocli_soul.llm_client import LLMClient
+        host = cast(_LiteLLMHost, cast(object, self))
     
-        llm   = LLMClient(self.config)
+        llm   = LLMClient(host.config)
         tier  = llm._resolve_model("auto")   # Router alias ("fast"/"smart")
     
         # Fix: 使用 context_engine 构建的 system_prompt（含项目约束、记忆、RepoMap）。
@@ -361,42 +374,42 @@ class AgentLiteLLMMixin:
         else:
             # Fallback: build prompt with model info for per-model specialization
             constraints = "（无）"
-            if self.memory:
+            if host.memory:
                 try:
-                    c = self.memory.get_constraints()
+                    c = host.memory.get_constraints()
                     if c:
                         constraints = "\n".join(f"- {x}" for x in c)
                 except Exception as _constr_err:
                     log.warning("_stream_litellm: constraint load failed — AI will run without project constraints: %s", _constr_err)
-            llm_cfg    = (self.config or {}).get("llm", {})
+            llm_cfg    = (host.config or {}).get("llm", {})
             _model_id  = llm_cfg.get("tiers", {}).get("fast", "")
             _provider  = llm_cfg.get("provider", "")
             system = build_system_prompt(
                 constraints=constraints,
-                goal=user_input[:200],
-                read_only=self.read_only,
+                goal=user_input[:800],
+                read_only=host.read_only,
                 compact=True,
                 model_id=_model_id,
                 provider_id=_provider,
             )
     
         # Build messages: [system] + [prior history] + [current user turn]
-        messages: list[dict] = [{"role": "system", "content": system}]
+        messages: list[Any] = [{"role": "system", "content": system}]
         # Do NOT extend messages with prior_history here — history is already embedded
         # in user_input (via _inject_context / user_context). Adding it again as
         # separate message turns would double the history in the conversation array.
         messages.append({"role": "user", "content": user_input})
         # Read stream timeout from config [agent] section (default 30s)
-        _stream_timeout = float((self.config or {}).get("agent", {}).get("stream_timeout_s", 30))
+        _stream_timeout = float((host.config or {}).get("agent", {}).get("stream_timeout_s", 30))
     
         # Stream WITH tools so the model can legally signal finish_reason="tool_calls".
         # Some providers reject stream=True when tools= is present; we detect that error
         # and fall back to text-only streaming (degraded mode: model can narrate but not act).
-        tools = self._build_tool_definitions()
+        tools = host._build_tool_definitions()
         _stream_task_params = llm.get_task_params("stream")
-        stream_call_kwargs: dict = {
+        stream_call_kwargs: dict[str, Any] = {
             "model":       tier,
-            "messages":    messages,
+            "messages":    cast(Any, messages),
             "tools":       tools,
             "stream":      True,
             "max_tokens":  _stream_task_params.get("max_tokens",  2048),
@@ -424,7 +437,7 @@ class AgentLiteLLMMixin:
                 try:
                     response = await asyncio.wait_for(
                         llm._router.acompletion(
-                            model=tier, messages=messages,
+                            model=tier, messages=cast(Any, messages),
                             stream=True,
                             max_tokens=_stream_task_params.get("max_tokens", 2048),
                             temperature=_stream_task_params.get("temperature", 0.7),
@@ -449,8 +462,9 @@ class AgentLiteLLMMixin:
         _stream_usage = None   # accumulated usage from stream_options include_usage chunk
         async for chunk in response:
             # Capture usage from the final usage-reporting chunk (stream_options include_usage=True)
-            if hasattr(chunk, 'usage') and chunk.usage is not None:
-                _stream_usage = chunk.usage
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                _stream_usage = chunk_usage
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]

@@ -3,12 +3,21 @@ Extracted from agent.py.
 Single responsibility: select tool subset per request, preview risky diffs.
 """
 from __future__ import annotations
+from typing import Any, Protocol, cast
 import logging
 log = logging.getLogger('evocli.agent.selector')
 
 
+class _SelectorHost(Protocol):
+    config: dict[str, Any] | None
+    bridge: Any
+    _selected_tool_names: frozenset[str]
+
+
 class AgentToolSelectorMixin:
     """Mixin: tool selection and diff preview for EvoCLIAgent."""
+
+    _selected_tool_names: frozenset[str] = frozenset()
 
     def _select_tools_for_request(self, user_input: str) -> frozenset[str]:
         """
@@ -21,6 +30,7 @@ class AgentToolSelectorMixin:
         
         副作用：更新 self._selected_tool_names（prepare hook 读取此值）
         """
+        host = cast(_SelectorHost, cast(object, self))
         try:
             from evocli_soul.tool_router import get_tool_names_for_llm, auto_classify_unknown
             from evocli_soul.tool_registry import PYDANTIC_TOOL_NAMES, REGISTRY_BY_NAME
@@ -34,9 +44,9 @@ class AgentToolSelectorMixin:
             names = get_tool_names_for_llm(
                 user_input,
                 pydantic_only=True,
-                config=self.config,
+                config=host.config,
             )
-            self._selected_tool_names = names
+            host._selected_tool_names = names
             log.info("ToolRouter: %d tools selected for '%s...'",
                      len(names), user_input[:50])
             return names
@@ -45,10 +55,10 @@ class AgentToolSelectorMixin:
             # 降级：全部已知工具
             try:
                 from evocli_soul.tool_registry import PYDANTIC_TOOL_NAMES
-                self._selected_tool_names = PYDANTIC_TOOL_NAMES
+                host._selected_tool_names = PYDANTIC_TOOL_NAMES
             except Exception:
-                self._selected_tool_names = frozenset()
-            return self._selected_tool_names
+                host._selected_tool_names = frozenset()
+            return host._selected_tool_names
 
     _TOOL_TO_RPC = {
         "fs_read":       ("fs.read",       lambda args: {"path": args["path"]}),
@@ -107,6 +117,10 @@ class AgentToolSelectorMixin:
         "code_intel_list_symbols":   ("code_intel.list_symbols",   lambda args: {"file": args.get("file", ".")}),  # Fix MEDIUM: 支持指定目标文件（之前总传空）
         # Fix MEDIUM: code_intel.find_symbol 存在于 Rust L109 但之前缺失映射
         "code_intel_find_symbol":    ("code_intel.find_symbol",    lambda args: {"query": args["query"]}),
+        "code_blast_radius":         ("code_intel.blast_radius",   lambda a: {"symbol_id": a.get("symbol_id", ""), "max_depth": a.get("max_depth", 5)}),
+        "code_symbol_context":       ("code_intel.symbol_context", lambda a: {"symbol_id": a.get("symbol_id", "")}),
+        "code_communities":          ("code_intel.communities",    lambda a: {}),
+        "generate_community_summaries": ("code_intel.generate_summaries", lambda a: {"max_communities": a.get("max_communities", 20)}),
         "symbol_lifecycle":          ("symbol.lifecycle",          lambda args: {"symbol": args["name"]}),  # Fix: Rust reads args["symbol"], not args["name"]
         # 安全审批
         "approval_request":     ("approval.request",     lambda args: {"skill_id": args.get("skill_id", ""), "step_id": args.get("step_id", ""), "action": args.get("action", ""), "message": args.get("message", "请求操作审批")}),
@@ -141,12 +155,13 @@ class AgentToolSelectorMixin:
         "tool_run_user":  ("tool.run_user",  lambda args: {"name": args["name"], "args": args.get("args", ""), "dry_run": args.get("dry_run", False)}),
     }
 
-    async def _diff_preview_and_confirm(self, tool_name: str, args: dict) -> str:
+    async def _diff_preview_and_confirm(self, tool_name: str, args: dict[str, Any]) -> str:
         """Show a unified diff of proposed changes and wait for user approval.
 
         Returns 'approved', 'rejected', or 'skipped' (if preview failed).
         Called when config [safety] require_diff_preview = true.
         """
+        host = cast(_SelectorHost, cast(object, self))
         from evocli_soul.rpc import emit_event
         try:
             # Build preview diff
@@ -156,21 +171,21 @@ class AgentToolSelectorMixin:
                 replace = args.get("replace", "")
                 if not path or not search:
                     return "skipped"
-                original = await self.bridge.call("fs.read", {"path": path})
+                original = await host.bridge.call("fs.read", {"path": path})
                 if not isinstance(original, str):
                     return "skipped"
                 preview = original.replace(search, replace, 1)
-                diff_result = await self.bridge.call("fs.diff", {"old": original, "new": preview, "path": path})
+                diff_result = await host.bridge.call("fs.diff", {"old": original, "new": preview, "path": path})
                 diff_text = str(diff_result) if diff_result else ""
             elif tool_name == "fs_write":
                 path = args.get("path", "")
                 try:
-                    original = await self.bridge.call("fs.read", {"path": path})
+                    original = await host.bridge.call("fs.read", {"path": path})
                     original = str(original) if isinstance(original, str) else ""
                 except Exception as _e:
                     log.debug("event record skipped: %s", _e)
                     original = ""
-                diff_result = await self.bridge.call("fs.diff", {
+                diff_result = await host.bridge.call("fs.diff", {
                     "old": original, "new": args.get("content", ""), "path": path
                 })
                 diff_text = str(diff_result) if diff_result else ""
@@ -181,10 +196,10 @@ class AgentToolSelectorMixin:
                 diff_parts = []
                 for edit in edits[:3]:  # preview first 3 files
                     try:
-                        orig = await self.bridge.call("fs.read", {"path": edit["path"]})
+                        orig = await host.bridge.call("fs.read", {"path": edit["path"]})
                         if isinstance(orig, str):
                             new = orig.replace(edit["search"], edit["replace"], 1)
-                            d = await self.bridge.call("fs.diff", {"old": orig, "new": new, "path": edit["path"]})
+                            d = await host.bridge.call("fs.diff", {"old": orig, "new": new, "path": edit["path"]})
                             diff_parts.append(str(d))
                     except Exception as _e:
                         log.debug("event record skipped: %s", _e)
@@ -204,7 +219,7 @@ class AgentToolSelectorMixin:
             })
 
             # Request approval via the standard approval modal
-            approved = await self.bridge.request_approval(
+            approved = await host.bridge.request_approval(
                 f"Apply changes to {args.get('path', 'files')}? (see diff above)"
             )
             return "approved" if approved else "rejected"

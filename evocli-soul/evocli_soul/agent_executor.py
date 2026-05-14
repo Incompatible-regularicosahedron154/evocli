@@ -36,6 +36,17 @@ def _tool_display_name(rpc_method: str, args: dict) -> str:
     return rpc_method
 
 
+def _is_read_error(result: str) -> bool:
+    """True if the result is a file/web read failure string."""
+    return isinstance(result, str) and (
+        "cannot read" in result.lower()
+        or "not found" in result.lower()
+        or "no such file" in result.lower()
+        or "permission denied" in result.lower()
+        or result.startswith("Error:")
+    )
+
+
 class AgentExecutorMixin:
     """Mixin: _execute_tool for EvoCLIAgent."""
 
@@ -684,6 +695,92 @@ class AgentExecutorMixin:
                 pass
             return _gu_j.dumps({"withdrawn": True, "reason": reason, "what_was_tried": what_was_tried,
                                  "suggestion": suggestion or "Please clarify requirements."}, ensure_ascii=False)
+
+        if name == "fetch_url":
+            import json as _fu_j
+            url        = args.get("url", "")
+            max_chars  = args.get("max_chars", 8000)
+            selector   = args.get("selector", "")
+            params: dict = {"url": url, "max_chars": max_chars}
+            if selector:
+                params["selector"] = selector
+            result = await self.bridge.call("web.fetch", params)
+            if _is_read_error(str(result)):
+                return _fu_j.dumps({"ok": False, "url": url, "error": str(result)})
+            return result if isinstance(result, str) else _fu_j.dumps(result, ensure_ascii=False)
+
+        if name == "code_semantic_search":
+            import json as _css_j
+            try:
+                from evocli_soul.code_chunks import get_index
+                from evocli_soul.state import get_session_root as _get_root
+                idx = get_index(_get_root())
+                results = idx.search(
+                    args.get("query", ""),
+                    top_k=args.get("top_k", 5),
+                    language=args.get("language", ""),
+                    kind=args.get("kind", ""),
+                    file_filter=args.get("file_filter", ""),
+                )
+                if not results:
+                    return _css_j.dumps({"query": args.get("query"), "results": [], "hint": "No results. Run 'evocli index' first."})
+                return _css_j.dumps({"query": args.get("query"), "results": results[:10]}, ensure_ascii=False)
+            except Exception as e:
+                return _css_j.dumps({"error": str(e), "hint": "Run 'evocli index' to build code index."})
+
+        if name == "code_hybrid_search":
+            import json as _ch_j
+            import evocli_soul.state as _ch_st
+            query = args.get("query", "")
+            limit = args.get("limit", 10)
+            top_k = limit * 2
+            bm25_hits: list = []
+            try:
+                bm25_raw = await self.bridge.call("code_intel.bm25_search", {"query": query, "limit": top_k})
+                bm25_hits = bm25_raw.get("results", []) if isinstance(bm25_raw, dict) else []
+            except Exception:
+                pass
+            vec_hits: list = []
+            try:
+                memory = _ch_st.get_memory_if_ready()
+                if memory:
+                    for i, item in enumerate(memory.search(query, top_k=top_k)):
+                        vec_hits.append({"symbol_id": item.get("id", item.get("title", "")), "name": item.get("title", ""), "rank": i + 1})
+            except Exception:
+                pass
+            K = 60.0
+            scores: dict = {}
+            meta: dict = {}
+            for r in bm25_hits:
+                sid = r.get("symbol_id", "")
+                scores[sid] = scores.get(sid, 0) + 1.0 / (K + r.get("rank", 99))
+                meta[sid] = {"name": r.get("name", ""), "kind": r.get("kind", ""), "file": r.get("file", "")}
+            for r in vec_hits:
+                sid = r.get("symbol_id", "")
+                scores[sid] = scores.get(sid, 0) + 1.0 / (K + r.get("rank", 99))
+                if sid not in meta:
+                    meta[sid] = {"name": r.get("name", "")}
+            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+            results = [{"symbol_id": sid, "rrf_score": round(sc, 4), **meta.get(sid, {})} for sid, sc in ranked]
+            return _ch_j.dumps({"query": query, "results": results, "count": len(results)}, ensure_ascii=False)
+
+        if name == "spawn_agent":
+            import json as _sa_j
+            task    = args.get("task", "")
+            context = args.get("context", "")
+            try:
+                from evocli_soul.agent import EvoCLIAgent
+                import evocli_soul.state as _sa_st
+                _sub_sid = f"{self._session_id}_sub_{hash(task) & 0xFFFF:04x}"
+                full_task = f"{task}\n\n{context}" if context else task
+                from evocli_soul.rpc import emit_event as _sa_ev
+                await _sa_ev("soul_status", {"status": "loading", "message": f"Sub-agent: {task[:50]}…"})
+                sub_agent = EvoCLIAgent(_sa_st.get_bridge(), _sa_st.get_memory_if_ready(), _sa_st.get_config(), session_id=_sub_sid)
+                result = await sub_agent.run(full_task)
+                _sa_st.append_session_event({"type": "spawn_agent", "task": task[:200], "result_len": len(result or "")}, session_id=self._session_id)
+                return _sa_j.dumps({"ok": True, "task": task, "result": (result or "")[:2000]}, ensure_ascii=False)
+            except Exception as e:
+                return _sa_j.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
         # ── Standard tools via Rust bridge ──────────────────────────────────────
         if name not in self._TOOL_TO_RPC:
