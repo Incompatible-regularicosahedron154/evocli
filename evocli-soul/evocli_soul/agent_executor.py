@@ -564,6 +564,35 @@ class AgentExecutorMixin:
             except Exception as e:
                 return _ssj.dumps({"error": str(e), "query": args.get("query", "")}, ensure_ascii=False)
 
+        if name == "experience_lookup":
+            import json as _elj
+            try:
+                from evocli_soul.tool_flow_miner import check_flow_trigger
+                matched_flow, score = check_flow_trigger(args.get("task_description", ""))
+                if not matched_flow:
+                    return _elj.dumps({"found": False, "message": "No matching past experience found."}, ensure_ascii=False)
+                failures_before = getattr(matched_flow, "failures_before", 0)
+                struggle_note = (
+                    f"Discovered after {failures_before} failed attempts — battle-tested knowledge."
+                    if failures_before >= 1 else "First-try success pattern."
+                )
+                return _elj.dumps({
+                    "found": True,
+                    "name": matched_flow.name,
+                    "similarity": round(score, 2),
+                    "success_rate": round(getattr(matched_flow, "success_rate", 0.0), 2),
+                    "failures_before": failures_before,
+                    "note": struggle_note,
+                    "steps": [
+                        {"step": i + 1, "tool": s.tool,
+                         "description": getattr(s, "description", s.tool)}
+                        for i, s in enumerate(matched_flow.steps[:8])
+                    ],
+                    "guidance": "Use this pattern as a reference; adapt to current context.",
+                }, ensure_ascii=False)
+            except Exception as e:
+                return _elj.dumps({"error": str(e)}, ensure_ascii=False)
+
         # ── Standard tools via Rust bridge ──────────────────────────────────────
         if name not in self._TOOL_TO_RPC:
             return f"Error: Unknown tool '{name}'"
