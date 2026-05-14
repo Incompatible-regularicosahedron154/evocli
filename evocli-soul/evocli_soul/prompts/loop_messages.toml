@@ -1,0 +1,75 @@
+# EvoCLI autonomous loop messages
+# Override by copying to ~/.evocli/prompts/loop_messages.toml
+
+[status]
+loading_context = "⚙ 正在构建上下文…"
+continuing = "⟳ 继续执行… ({current}/{max})"
+
+[tool_flow]
+auto_execute_hint = """
+🔄 **检测到匹配的工具流**: {name}
+步骤: {steps}
+置信度: {score}  历史成功率: {success_rate}
+
+正在自动执行...
+
+"""
+step_progress = "{icon} [{current}/{total}] {description}\n"
+execution_completed = "\n✅ 工具流执行完成\n{final_output}"
+execution_failed = "⚠️ 工具流执行失败（步骤{failed_step}），使用 AI 继续...\n\n"
+suggestion_hint = "💡 *发现相关工具流: {name}*  (置信度 {score}，输入 `/flows` 查看)\n\n"
+history_entry = "[工具流: {name}]\n{output}"
+
+[errors]
+no_api_key = """⚠️  **No API key configured** for provider `{provider}`.
+
+Run `evocli init` to set your key interactively, or export:
+```
+{key_hint}=sk-...
+```
+Then restart EvoCLI."""
+primary_failed_retrying = "Primary path failed: {error} — retrying with LiteLLM…"
+both_llm_failed = """
+⛔ **Both LLM paths failed.**
+- Primary: `{primary}`
+- Fallback: `{fallback}`
+
+Check API key and network, or run `evocli doctor`.
+"""
+empty_response = "⚠️ The model returned an empty response. This may be a content-filter rejection. Try rephrasing."
+unexpected_error = """
+⛔ **Unexpected error in agent.stream:** `{error}`
+Press F12 to view full logs.
+"""
+
+[verification]
+auto_verify_banner = "\n\n---\n🔍 **自动验证**: `{command}`\n"
+result = "```\n{output}\n```\n{status_icon} 验证{status_text}（exit {exit_code}）\n"
+status_pass = "通过"
+status_fail = "失败"
+retry_prompt = """验证命令失败（exit {exit_code}）:
+```
+{output}
+```
+请分析错误，修复问题，然后再次调用 task_complete。"""
+
+[completion]
+task_complete_banner = "\n\n---\n✅ **任务完成**\n\n{result}\n"
+auto_commit = "💾 **自动提交**: `{message}`{hash_suffix}\n"
+
+[loop]
+# Injected when agent produces 0 tool calls but hasn't called task_complete
+# Set to empty string "" to disable the forcing behavior entirely
+forcing_message = """
+The previous response was text-only. If you have a concrete task to execute, use tools now.
+If the task is already complete or this was a conversational exchange, call `task_complete` to wrap up.
+"""
+
+# Injected between iterations when todos remain
+continuation_with_todos = "Continue. {pending_count} todo items remain. Check with `todo_read`, then call `task_complete` when done."
+
+# Injected between iterations when no todos
+continuation_clean = "Continue. Verify the work is complete, then call `task_complete`."
+
+# Injected on last iteration
+last_iteration = "Final step ({current}/{max}). Summarize completed work and call `task_complete`. List Next Steps for anything unfinished."

@@ -8,17 +8,135 @@ Single responsibility: run the multi-turn autonomous execution loop
 """
 from __future__ import annotations
 import asyncio
-import traceback as _tb
 import logging
+from pathlib import Path
+from typing import Any
 
 log = logging.getLogger("evocli.handlers.agent_loop")
 
 
+def _is_conversational(prompt: str) -> bool:
+    """True for short greetings/questions that need no tool calls."""
+    p = prompt.strip()
+    if len(p) <= 15:
+        return True
+    action_verbs = {
+        "fix", "add", "create", "update", "delete", "implement", "write", "edit",
+        "refactor", "build", "run", "test", "check", "analyze", "generate", "make",
+        "修改", "创建", "删除", "实现", "添加", "编写", "重构", "构建", "运行",
+        "分析", "生成", "检查", "修复",
+    }
+    p_lower = p.lower()
+    has_action = any(v in p_lower for v in action_verbs)
+    has_path = any(c in p for c in ["/", "\\", ".py", ".rs", ".ts", ".toml", ".json"])
+    return not has_action and not has_path
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {**base}
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_loop_messages() -> dict[str, dict[str, str]]:
+    """Load loop messages from prompts/loop_messages.toml with user override support."""
+    try:
+        import tomllib  # type: ignore[attr-defined]
+    except ImportError:
+        import importlib as _importlib
+        tomllib = _importlib.import_module("tomli")
+
+    defaults = {
+        "status": {
+            "loading_context": "Loading context…",
+            "continuing": "Continuing… ({current}/{max})",
+        },
+        "tool_flow": {
+            "auto_execute_hint": (
+                "Detected matching tool flow: {name}\n"
+                "Steps: {steps}\n"
+                "Confidence: {score}  Success rate: {success_rate}\n\n"
+                "Executing automatically...\n\n"
+            ),
+            "step_progress": "{icon} [{current}/{total}] {description}\n",
+            "execution_completed": "\nTool flow complete\n{final_output}",
+            "execution_failed": "Tool flow failed at step {failed_step}; continuing with AI.\n\n",
+            "suggestion_hint": "Related tool flow found: {name} (confidence {score}). Use `/flows` to inspect.\n\n",
+            "history_entry": "[tool flow: {name}]\n{output}",
+        },
+        "errors": {
+            "no_api_key": (
+                "No API key configured for provider `{provider}`.\n\n"
+                "Run `evocli init`, or export:\n```\n{key_hint}=sk-...\n```\n"
+                "Then restart EvoCLI."
+            ),
+            "primary_failed_retrying": "Primary path failed: {error} — retrying with LiteLLM…",
+            "both_llm_failed": (
+                "\n\n⛔ **Both LLM paths failed.**\n"
+                "- Primary: `{primary}`\n- Fallback: `{fallback}`\n\n"
+                "Check API key and network, or run `evocli doctor`."
+            ),
+            "empty_response": "⚠️ The model returned an empty response. This may be a content-filter rejection. Try rephrasing.",
+            "unexpected_error": "\n\n⛔ **Unexpected error in agent.stream:** `{error}`\nPress F12 to view full logs.",
+        },
+        "verification": {
+            "auto_verify_banner": "\n\n---\n🔍 **Auto-verify**: `{command}`\n",
+            "result": "```\n{output}\n```\n{status_icon} Verification {status_text} (exit {exit_code})\n",
+            "status_pass": "passed",
+            "status_fail": "failed",
+            "retry_prompt": (
+                "Verification command failed (exit {exit_code}):\n```\n{output}\n```\n"
+                "Analyze the error, fix it, then call task_complete again."
+            ),
+        },
+        "completion": {
+            "task_complete_banner": "\n\n---\n✅ **Task complete**\n\n{result}\n",
+            "auto_commit": "💾 **Auto-commit**: `{message}`{hash_suffix}\n",
+        },
+        "loop": {
+            "forcing_message": (
+                "The previous response was text-only. If you have a concrete task to execute, use tools now.\n"
+                "If the task is already complete or this was a conversational exchange, call `task_complete` to wrap up."
+            ),
+            "continuation_with_todos": "Continue. {pending_count} todo items remain. Check with `todo_read`, then call `task_complete` when done.",
+            "continuation_clean": "Continue. Verify the work is complete, then call `task_complete`.",
+            "last_iteration": "Final step ({current}/{max}). Summarize completed work and call `task_complete`. List Next Steps for anything unfinished.",
+        },
+    }
+    for base in (Path.home() / ".evocli" / "prompts", Path(__file__).parent.parent / "prompts"):
+        p = base / "loop_messages.toml"
+        if p.exists():
+            try:
+                with open(p, "rb") as f:
+                    data = tomllib.load(f)
+                return _deep_merge_dicts(defaults, data)
+            except Exception as e:
+                log.warning("Failed to load loop messages from %s: %s", p, e)
+    return defaults
+
+
+def _loop_msg(section: str, key: str, **kwargs: object) -> str:
+    template = _LOOP_MSGS.get(section, {}).get(key, "")
+    if not kwargs:
+        return template
+    try:
+        return template.format(**kwargs)
+    except Exception:
+        return template
+
+
+_LOOP_MSGS = _load_loop_messages()
+
+
 async def run_agent_stream_body(
     req_id: str,
-    params: dict,
-    send,
-    state,
+    params: dict[str, Any],
+    send: Any,
+    state: Any,
 ) -> None:
     """
     Main agent stream body — session setup + autonomous execution loop.
@@ -60,7 +178,7 @@ async def run_agent_stream_body(
     if _turn > 0 and _turn % 8 == 0:
         _hist_for_summary = _st.get_history(session_id)
         if len(_hist_for_summary) >= 8:
-            async def _auto_summarize(sid: str, hist: list) -> None:
+            async def _auto_summarize(sid: str, hist: list[Any]) -> None:
                 try:
                     from evocli_soul.context_engine import compact_session_to_anchor
                     existing = _st.get_anchored_summary(sid)
@@ -111,10 +229,7 @@ async def run_agent_stream_body(
                 key_hint = env_var or "YOUR_PROVIDER_API_KEY"
                 await send.stream_chunk(
                     req_id,
-                    f"⚠️  **No API key configured** for provider `{provider}`.\n\n"
-                    f"Run `evocli init` to set your key interactively, or export:\n"
-                    f"```\n{key_hint}=sk-...\n```\n"
-                    f"Then restart EvoCLI.",
+                    _loop_msg("errors", "no_api_key", provider=provider, key_hint=key_hint),
                     done=True,
                 )
                 return
@@ -125,7 +240,7 @@ async def run_agent_stream_body(
         # so the TUI shows activity and the 120s timer doesn't fire during context build.
         await emit_event("soul_status", {
             "status":  "loading",
-            "message": "⚙ 正在构建上下文…",
+            "message": _loop_msg("status", "loading_context"),
         })
         # Send first visible progress chunk — this resets the TUI first_chunk timer.
         # The chunk is styled as a status line that will be replaced by actual response.
@@ -143,10 +258,14 @@ async def run_agent_stream_body(
             if _matched_flow and _flow_score >= AUTO_EXECUTE_THRESH:
                 # 高置信度：直接建议执行工具流，以 system 消息通知用户
                 _flow_hint = (
-                    f"🔄 **检测到匹配的工具流**: {_matched_flow.name}\n"
-                    f"步骤: {' → '.join(s.tool for s in _matched_flow.steps[:5])}\n"
-                    f"置信度: {_flow_score:.0%}  历史成功率: {_matched_flow.success_rate:.0%}\n\n"
-                    f"正在自动执行...\n\n"
+                    _loop_msg(
+                        "tool_flow",
+                        "auto_execute_hint",
+                        name=_matched_flow.name,
+                        steps=" → ".join(s.tool for s in _matched_flow.steps[:5]),
+                        score=f"{_flow_score:.0%}",
+                        success_rate=f"{_matched_flow.success_rate:.0%}",
+                    )
                 )
                 await send.stream_chunk(req_id, _flow_hint, done=False)
                 # 执行工具流
@@ -155,7 +274,14 @@ async def run_agent_stream_body(
 
                 async def _progress_cb(step_n, total, desc, result):
                     await send.stream_chunk(req_id,
-                        f"{'✓' if result else '⏳'} [{step_n}/{total}] {desc}\n",
+                        _loop_msg(
+                            "tool_flow",
+                            "step_progress",
+                            icon="✓" if result else "⏳",
+                            current=step_n,
+                            total=total,
+                            description=desc,
+                        ),
                         done=False)
 
                 _flow_result = await _executor.execute(
@@ -166,24 +292,26 @@ async def run_agent_stream_body(
                 if _flow_result.get("ok"):
                     _final = _flow_result.get("final_output", "")
                     await send.stream_chunk(req_id,
-                        f"\n✅ 工具流执行完成\n{_final[:500] if _final else ''}",
+                        _loop_msg("tool_flow", "execution_completed", final_output=_final[:500] if _final else ""),
                         done=True)
                     # 持久化本轮历史
                     _st.append_history([
                         {"role": "user",      "content": prompt},
-                        {"role": "assistant", "content": f"[工具流: {_matched_flow.name}]\n{_final[:1000]}"},
+                        {"role": "assistant", "content": _loop_msg("tool_flow", "history_entry", name=_matched_flow.name, output=_final[:1000])},
                     ], session_id)
                     return
                 else:
                     # 工具流失败 → 降级到正常 agent 流程
                     await send.stream_chunk(req_id,
-                        f"⚠️ 工具流执行失败（步骤{_flow_result.get('failed_step')}），使用 AI 继续...\n\n",
+                        _loop_msg("tool_flow", "execution_failed", failed_step=_flow_result.get("failed_step")),
                         done=False)
             elif _matched_flow and _flow_score >= SUGGEST_THRESH:
                 # 中置信度：在响应开头提示有工具流可用（不打断流程）
-                _hint = (
-                    f"💡 *发现相关工具流: {_matched_flow.name}*  "
-                    f"(置信度 {_flow_score:.0%}，输入 `/flows` 查看)\n\n"
+                _hint = _loop_msg(
+                    "tool_flow",
+                    "suggestion_hint",
+                    name=_matched_flow.name,
+                    score=f"{_flow_score:.0%}",
                 )
                 await send.stream_chunk(req_id, _hint, done=False)
         except Exception as _tf_err:
@@ -210,10 +338,24 @@ async def run_agent_stream_body(
         #   d. check tool_count → if 0, inject forcing message; else inject continuation
 
         _cfg_agent        = (cfg or {}).get("agent", {}) if isinstance(cfg, dict) else {}
-        from evocli_soul.config_defaults import cfg_int, cfg_bool
+        from evocli_soul.config_defaults import cfg_int
         _max_auto_iters       = int(_cfg_agent.get("max_auto_iterations", cfg_int("agent.max_auto_iterations")))
         _consecutive_no_tools = 0
         _MAX_NO_TOOL_ITERS    = cfg_int("agent.max_no_tool_turns")
+        _is_conv = _is_conversational(prompt)
+        if _is_conv:
+            _max_auto_iters = 1
+            log.debug("Conversational message detected — disabling autonomous loop")
+
+        _context_params = {
+            key: params.get(key)
+            for key in ("project_id", "current_file", "git_diff")
+            if params.get(key) is not None
+        }
+        if _is_conv:
+            _context_params["lightweight"] = True
+            _context_params["skip_repomap"] = True
+        _context_params = _context_params or None
 
         # Clear stale task_complete from any previous request
         _st.clear_task_complete(session_id)
@@ -268,6 +410,7 @@ async def run_agent_stream_body(
                         return cmd
             except Exception:
                 pass  # test cmd detection is best-effort, never block
+            return ""
         _detected_test_cmd = await _detect_test_command()
         if _detected_test_cmd:
             log.debug("Auto-detected test command: %s", _detected_test_cmd)
@@ -292,7 +435,7 @@ async def run_agent_stream_body(
             if not _is_first_iter:
                 await emit_event("soul_status", {
                     "status":  "loading",
-                    "message": f"⟳ 继续执行… ({_auto_iter + 1}/{_max_auto_iters})",
+                    "message": _loop_msg("status", "continuing", current=_auto_iter + 1, max=_max_auto_iters),
                 })
 
             # ── Stream one agent turn ──────────────────────────────────────────
@@ -302,6 +445,7 @@ async def run_agent_stream_body(
 
             try:
                 async for chunk in agent.stream(_current_prompt,
+                                                 context_params=_context_params,
                                                  prior_history=_prior,
                                                  session_id=session_id):
                     if chunk:
@@ -319,12 +463,16 @@ async def run_agent_stream_body(
                     first_line = str(primary_err).splitlines()[0] if str(primary_err) else repr(primary_err)
                     await emit_event("soul_status", {
                         "status":  "error",
-                        "message": f"Primary path failed: {first_line} — retrying with LiteLLM…",
+                        "message": _loop_msg("errors", "primary_failed_retrying", error=first_line),
                     })
                 try:
                     try:
                         fallback_ctx = await agent._build_context(
-                            _current_prompt, history=_prior, session_id=session_id)
+                            _current_prompt,
+                            context_params=_context_params,
+                            history=_prior,
+                            session_id=session_id,
+                        )
                     except Exception:
                         fallback_ctx = {}
                     try:
@@ -341,9 +489,7 @@ async def run_agent_stream_body(
                     if _is_first_iter:
                         await send.stream_chunk(
                             req_id,
-                            f"\n\n⛔ **Both LLM paths failed.**\n"
-                            f"- Primary: `{primary_err}`\n- Fallback: `{fallback_err}`\n\n"
-                            f"Check API key and network, or run `evocli doctor`.",
+                            _loop_msg("errors", "both_llm_failed", primary=primary_err, fallback=fallback_err),
                             done=True,
                         )
                         return
@@ -374,7 +520,7 @@ async def run_agent_stream_body(
                 if _cmd:
                     await send.stream_chunk(
                         req_id,
-                        f"\n\n---\n🔍 **自动验证**: `{_cmd}`\n",
+                        _loop_msg("verification", "auto_verify_banner", command=_cmd),
                         done=False,
                     )
                     try:
@@ -393,17 +539,27 @@ async def run_agent_stream_body(
                         v_code = verify_raw.get("exit_code", 0) if isinstance(verify_raw, dict) else 0
                         v_text = (v_out + "\n" + v_err).strip()
                         status_icon = "✅" if v_code == 0 else "❌"
+                        status_text = _loop_msg("verification", "status_pass") if v_code == 0 else _loop_msg("verification", "status_fail")
                         await send.stream_chunk(
                             req_id,
-                            f"```\n{v_text[:1500]}\n```\n{status_icon} 验证{'通过' if v_code == 0 else '失败'}（exit {v_code}）\n",
+                            _loop_msg(
+                                "verification",
+                                "result",
+                                output=v_text[:1500],
+                                status_icon=status_icon,
+                                status_text=status_text,
+                                exit_code=v_code,
+                            ),
                             done=False,
                         )
                         # If verification failed and we have iterations left → continue
                         if v_code != 0 and _auto_iter + 1 < _max_auto_iters:
                             _st.clear_task_complete(session_id)  # reset signal
-                            _current_prompt = (
-                                f"验证命令失败（exit {v_code}）:\n```\n{v_text[:800]}\n```\n"
-                                f"请分析错误，修复问题，然后再次调用 task_complete。"
+                            _current_prompt = _loop_msg(
+                                "verification",
+                                "retry_prompt",
+                                exit_code=v_code,
+                                output=v_text[:800],
                             )
                             _consecutive_no_tools = 0
                             continue  # go back to next iteration to fix the issue
@@ -411,9 +567,7 @@ async def run_agent_stream_body(
                         log.debug("Verification command failed (non-fatal): %s", _ve)
 
                 # Task complete: emit summary and write memory
-                _completion_banner = (
-                    f"\n\n---\n✅ **任务完成**\n\n{_result}\n"
-                )
+                _completion_banner = _loop_msg("completion", "task_complete_banner", result=_result)
                 await send.stream_chunk(req_id, _completion_banner, done=False)
 
                 # ── Auto-commit (Aider pattern) ──────────────────────────────
@@ -445,7 +599,12 @@ async def run_agent_stream_body(
                                 _hash = _commit_result.get("hash", "")[:8]
                             await send.stream_chunk(
                                 req_id,
-                                f"💾 **自动提交**: `{_commit_msg}`{' (' + _hash + ')' if _hash else ''}\n",
+                                _loop_msg(
+                                    "completion",
+                                    "auto_commit",
+                                    message=_commit_msg,
+                                    hash_suffix=f" ({_hash})" if _hash else "",
+                                ),
                                 done=False,
                             )
                             log.info("Auto-commit after task_complete: %s (%s)", _commit_msg, _hash)
@@ -455,8 +614,12 @@ async def run_agent_stream_body(
                 # Non-blocking: write completion to memory for future recall
                 async def _persist_completion(sid: str, res: str) -> None:
                     try:
-                        from evocli_soul.memory_distill import distill_success
-                        await distill_success(res, session_id=sid)
+                        import evocli_soul.memory_distill as _memory_distill
+                        _distill = getattr(_memory_distill, "distill_success", None)
+                        if callable(_distill):
+                            _maybe_awaitable = _distill(res, session_id=sid)
+                            if asyncio.iscoroutine(_maybe_awaitable):
+                                await _maybe_awaitable
                     except Exception as _dist_err:
                         log.warning("distill_success failed (memory flywheel): %s", _dist_err)
                 break  # Clean exit from autonomous loop
@@ -476,13 +639,9 @@ async def run_agent_stream_body(
 
                 if _auto_iter + 1 < _max_auto_iters:
                     # Inject Cline-style forcing message
-                    _current_prompt = (
-                        "你描述了计划但还没有执行。**现在立即采取行动**：\n"
-                        "- 使用 `fs_read`/`fs_write`/`shell_run` 等工具实际执行修改\n"
-                        "- 不要只是描述——要调用工具完成工作\n"
-                        "- 完成所有任务后调用 `task_complete` 工具\n\n"
-                        "如果任务已经完成，调用 `task_complete` 总结结果。"
-                    )
+                    _forcing = _loop_msg("loop", "forcing_message")
+                    if _forcing:
+                        _current_prompt = _forcing
             else:
                 # Tools were called — AI is making progress
                 _consecutive_no_tools = 0
@@ -494,19 +653,16 @@ async def run_agent_stream_body(
                     pending_count = sum(1 for t in todos if t.get("status") not in ("completed", "cancelled"))
 
                     if pending_count > 0:
-                        _current_prompt = (
-                            f"继续执行任务。还有 {pending_count} 个待办项。\n"
-                            f"使用 `todo_read` 查看剩余步骤，完成后调用 `task_complete`。"
-                        )
+                        _current_prompt = _loop_msg("loop", "continuation_with_todos", pending_count=pending_count)
                     else:
-                        _current_prompt = (
-                            "继续执行。检查工作是否完整，如果完成请调用 `task_complete` 工具。"
-                        )
+                        _current_prompt = _loop_msg("loop", "continuation_clean")
                 else:
                     # Last iteration — force completion summary
-                    _current_prompt = (
-                        f"这是最后一步（{_max_auto_iters}/{_max_auto_iters}）。\n"
-                        f"请总结已完成的工作并调用 `task_complete`，即使还有未完成的项目也要列出 Next Steps。"
+                    _current_prompt = _loop_msg(
+                        "loop",
+                        "last_iteration",
+                        current=_max_auto_iters,
+                        max=_max_auto_iters,
                     )
 
         # Loop ended (task_complete, max iterations, or no-tool exit)
@@ -514,8 +670,7 @@ async def run_agent_stream_body(
             log.warning("agent.stream completed but emitted 0 content chunks")
             await send.stream_chunk(
                 req_id,
-                "⚠️ The model returned an empty response. "
-                "This may be a content-filter rejection. Try rephrasing.",
+                _loop_msg("errors", "empty_response"),
                 done=True,
             )
             return
@@ -543,8 +698,7 @@ async def run_agent_stream_body(
         log.error("agent.stream handler crashed: %s\n%s", e, _tb.format_exc())
         await send.stream_chunk(
             req_id,
-            f"\n\n⛔ **Unexpected error in agent.stream:** `{e}`\n"
-            f"Press F12 to view full logs.",
+            _loop_msg("errors", "unexpected_error", error=e),
             done=True,
         )
     finally:

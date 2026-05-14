@@ -3,19 +3,29 @@ Extracted from agent_execution.py.
 """
 from __future__ import annotations
 import logging
+from typing import Any
+
 log = logging.getLogger('evocli.agent.context')
 
 
 class AgentContextMixin:
     """Mixin: _build_context and _inject_context for EvoCLIAgent."""
 
-    async def _build_context(self, user_input: str, context_params: dict | None = None,
-                              history: list[dict] | None = None,
-                              session_id: str = "default") -> dict:
+    bridge: Any = None
+    config: dict[str, Any] | None = None
+    _TOOL_TO_RPC: dict[str, Any] = {}
+    read_only: bool = False
+    _session_id: str = "default"
+
+    async def _build_context(self, user_input: str, context_params: dict[str, Any] | None = None,
+                              history: list[dict[str, Any]] | None = None,
+                              session_id: str = "default") -> dict[str, Any]:
         """Build context via ContextEngine."""
         try:
             from evocli_soul.context_engine import ContextEngine
             ctx_engine = ContextEngine(self.bridge)
+            context_params = context_params or {}
+            lightweight = bool(context_params.get("lightweight"))
     
             # Inject /add-ed files into context params (Aider /add pattern)
             try:
@@ -35,7 +45,7 @@ class AgentContextMixin:
             # Load anchored summary (preserved across /compress — this is the compact session memory)
             try:
                 import evocli_soul.state as _st_anchor
-                anchored_summary = _st_anchor.get_anchored_summary(session_id)
+                anchored_summary = "" if lightweight else _st_anchor.get_anchored_summary(session_id)
             except Exception:
                 anchored_summary = ""
     
@@ -46,9 +56,9 @@ class AgentContextMixin:
     
             return await ctx_engine.build({
                 "goal":             enriched_goal,
-                "project_id":       (context_params or {}).get("project_id", "."),
-                "current_file":     (context_params or {}).get("current_file"),
-                "git_diff":         (context_params or {}).get("git_diff", ""),
+                "project_id":       context_params.get("project_id", "."),
+                "current_file":     context_params.get("current_file"),
+                "git_diff":         context_params.get("git_diff", ""),
                 "history":          history or [],
                 "active_tools":     list(self._TOOL_TO_RPC.keys()),
                 "session_id":       session_id,
@@ -56,12 +66,13 @@ class AgentContextMixin:
                 "read_only":        self.read_only,
                 "model_id":         _model_id,    # for per-model prompt specialization
                 "provider_id":      _provider,    # for env block
+                "skip_repomap":     bool(lightweight or context_params.get("skip_repomap")),
             })
         except Exception as e:
             log.debug("Context build failed: %s", e)
             return {}
     
-    async def _inject_context(self, user_input: str, ctx: dict) -> str:
+    async def _inject_context(self, user_input: str, ctx: dict[str, Any]) -> str:
         """Prefix user input with context from ContextEngine + per-turn environment details.
     
         注入策略（避免双重注入）：
