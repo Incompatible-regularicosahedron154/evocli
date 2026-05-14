@@ -57,6 +57,11 @@ async def dispatch_slash(
         await _handle_compress(req_id, params, send, state, derive_session_id, emit_event)
         return True
 
+    # ── /cancel ───────────────────────────────────────────────────────────────
+    if stripped_lower == "/cancel":
+        await _handle_cancel(req_id, params, send, state, derive_session_id)
+        return True
+
     # ── /flows / /flow ────────────────────────────────────────────────────────
     if stripped_lower in ("/flows", "/flow"):
         await _handle_flows(req_id, send)
@@ -90,6 +95,7 @@ async def _handle_help(req_id: str, send) -> None:
 |---|---|
 | `/help` 或 `/?` | 显示此帮助 |
 | `/compress` 或 `/compact` | 压缩会话历史，释放上下文空间 |
+| `/cancel` | 取消当前正在运行的任务 |
 | `/undo` | 撤销上一轮操作（移除最后一轮历史 + 尝试 git 快照恢复）|
 | `/plan <任务>` | 计划模式：只读分析代码库，生成结构化实现计划（不修改文件）|
 | `/btw <问题>` | 旁白问题：不写入历史，不污染上下文（适合临时性查询）|
@@ -165,6 +171,29 @@ async def _handle_add(
     msg += f"\n**Context files ({len(all_files)}):** {', '.join(all_files)}\n"
     msg += "These files will be injected into every turn automatically."
     await send.stream_chunk(req_id, msg, done=True)
+
+
+async def _handle_cancel(
+    req_id: str,
+    params: dict,
+    send,
+    state,
+    derive_session_id,
+) -> None:
+    """Cancel the currently running autonomous loop for this session.
+
+    Sets the per-session cancel flag that the loop checks at every
+    iteration boundary. The running task will stop at the next safe point.
+    """
+    import evocli_soul.state as _st_cancel
+    session_id = derive_session_id(params)
+    _st_cancel.cancel_session(session_id)
+    await send.stream_chunk(
+        req_id,
+        "⛔ **Cancel signal sent.** The running task will stop at the next safe point.\n"
+        "If no task is running, this has no effect.",
+        done=True,
+    )
 
 
 async def _handle_compress(

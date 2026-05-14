@@ -93,8 +93,8 @@ class LLMClient:
         model_list = self._build_router_model_list(api_key)
         self._router = Router(
             model_list    = model_list,
-            num_retries   = self._max_retries,
-            retry_after   = 5,
+            num_retries   = 0,           # retries owned by _acompletion_with_retry_events
+            retry_after   = 5,           # kept for Router's internal cooldown logic
             allowed_fails = 2,
             cooldown_time = 30,
         )

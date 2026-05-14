@@ -350,7 +350,45 @@ async def run_agent_stream_body(
         cfg = state.get_config()
         memory = _st.get_memory_if_ready()
 
-        agent = EvoCLIAgent(state.get_bridge(), memory, cfg, session_id=session_id)
+        # ── Intent classification — BEFORE agent creation and API key check ──────
+        # Must run first so require_confirm gate can fire before any other logic.
+        # Oracle finding: gate was placed too late (after API-key check) causing
+        # risky prompts with no API key to get "No API key" instead of warning.
+        _intent_profile_early = _classify_intent(prompt, cfg)
+        if _intent_profile_early.require_confirm:
+            _CONFIRM_PREFIXES = ("yes ", "yes,", "确认", "confirm ", "y ")
+            _user_confirmed = any(prompt.lower().startswith(p) for p in _CONFIRM_PREFIXES)
+            if not _user_confirmed:
+                _confirm_msg = (
+                    f"⚠️ **Confirmation required**\n\n"
+                    f"This request was classified as **{_intent_profile_early.intent}** "
+                    f"({_intent_profile_early.reason}).\n"
+                    f"It may involve destructive or irreversible operations "
+                    f"(deleting files, dropping data, mass overwrites).\n\n"
+                    f"**To proceed**, resend your message with `yes` at the start:\n\n"
+                    f"```\nyes {prompt[:120]}{'…' if len(prompt) > 120 else ''}\n```\n\n"
+                    f"Or rephrase to make your intent more specific and less destructive."
+                )
+                await send.stream_chunk(req_id, _confirm_msg, done=True)
+                log.info(
+                    "require_confirm: blocked risky request BEFORE agent creation (intent=%s)",
+                    _intent_profile_early.intent,
+                )
+                return
+            # User confirmed — strip prefix
+            for _pfx in _CONFIRM_PREFIXES:
+                if prompt.lower().startswith(_pfx):
+                    prompt = prompt[len(_pfx):].lstrip()
+                    break
+
+        agent = EvoCLIAgent(
+            state.get_bridge(), memory, cfg,
+            session_id=session_id,
+            # Enforce write access from intent profile (Oracle finding: writes_allowed
+            # was classified but not passed to the agent, so read-only intents
+            # like "reviewer" and "researcher" could still mutate files).
+            read_only=not _intent_profile_early.writes_allowed,
+        )
 
         # ── Fast-fail: no API key configured ─────────────────────────────────
         # Without this check the code falls through to _stream_litellm, which
@@ -501,44 +539,8 @@ async def run_agent_stream_body(
             _intent_profile.context_depth,
             _intent_profile.writes_allowed,
         )
-
-        # ── Require-confirm gate (SECURITY — risky intent) ────────────────────────
-        # IntentProfile.require_confirm=True for "risky" intents (mass deletes,
-        # database drops, mass overwrites). Surface the risk and require an
-        # explicit "yes" prefix before the agent executes anything.
-        #
-        # UX (Option A — re-send pattern, no new RPC handler needed):
-        #   1. Prompt WITHOUT confirmation prefix → emit warning, return done=True.
-        #   2. Prompt WITH prefix → strip it, proceed normally.
-        if _intent_profile.require_confirm:
-            _CONFIRM_PREFIXES = ("yes ", "yes,", "确认", "confirm ", "y ")
-            _user_confirmed = any(prompt.lower().startswith(p) for p in _CONFIRM_PREFIXES)
-            if not _user_confirmed:
-                _confirm_msg = (
-                    f"⚠️ **Confirmation required**\n\n"
-                    f"This request was classified as **{_intent_profile.intent}** "
-                    f"({_intent_profile.reason}).\n"
-                    f"It may involve destructive or irreversible operations "
-                    f"(deleting files, dropping data, mass overwrites).\n\n"
-                    f"**To proceed**, resend your message with `yes` at the start:\n\n"
-                    f"```\nyes {prompt[:120]}{'…' if len(prompt) > 120 else ''}\n```\n\n"
-                    f"Or rephrase to make your intent more specific and less destructive."
-                )
-                await send.stream_chunk(req_id, _confirm_msg, done=True)
-                log.info(
-                    "require_confirm: blocked risky request (intent=%s session=%s)",
-                    _intent_profile.intent, session_id[:12],
-                )
-                return
-            # User confirmed — strip the prefix before proceeding
-            for _pfx in _CONFIRM_PREFIXES:
-                if prompt.lower().startswith(_pfx):
-                    prompt = prompt[len(_pfx):].lstrip()
-                    break
-            log.info(
-                "require_confirm: user confirmed risky intent (intent=%s session=%s)",
-                _intent_profile.intent, session_id[:12],
-            )
+        # Note: require_confirm gate already fired BEFORE agent creation (early check above).
+        # No duplicate gate here.
 
         # Profile overrides config values — profile is goal-aware, config is a global ceiling
         _cfg_max = int(_cfg_agent.get("max_auto_iterations", cfg_int("agent.max_auto_iterations")))
