@@ -1,4 +1,4 @@
-# pyright: reportMissingTypeArgument=false, reportOptionalMemberAccess=false
+# pyright: reportMissingTypeArgument=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false
 """
 handlers/agent_loop.py — Autonomous agent execution loop
 
@@ -246,12 +246,16 @@ def _load_loop_messages() -> dict[str, dict[str, str]]:
         },
         "loop": {
             "forcing_message": (
-                "The previous response was text-only. If you have a concrete task to execute, use tools now.\n"
-                "If the task is already complete or this was a conversational exchange, call `task_complete` to wrap up."
+                "\n[Loop state: previous turn had no tool calls]\n"
+                "If the task requires further action, continue. If complete, call task_complete.\n"
             ),
-            "continuation_with_todos": "Continue. {pending_count} todo items remain. Check with `todo_read`, then call `task_complete` when done.",
-            "continuation_clean": "Continue. Verify the work is complete, then call `task_complete`.",
-            "last_iteration": "Final step ({current}/{max}). Summarize completed work and call `task_complete`. List Next Steps for anything unfinished.",
+            "continuation_with_todos": "[Loop state: {pending_count} todo items still pending]",
+            "continuation_clean": "[Loop state: continuing]",
+            "last_iteration": "[Loop state: final iteration {current}/{max}] Call task_complete to finish, or give_up if unable to complete.",
+            "no_tools_state": (
+                "\n[Loop state: previous turn had no tool calls]\n"
+                "If the task requires further action, continue. If complete, call task_complete.\n"
+            ),
         },
     }
     for base in (Path.home() / ".evocli" / "prompts", Path(__file__).parent.parent / "prompts"):

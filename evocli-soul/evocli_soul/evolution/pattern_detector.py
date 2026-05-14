@@ -1,3 +1,4 @@
+# pyright: reportMissingTypeArgument=false, reportArgumentType=false, reportMissingTypeStubs=false
 """模式检测 — 唯一职责：从事件序列中发现重复模式。"""
 from __future__ import annotations
 import importlib.util
@@ -35,7 +36,8 @@ def detect_patterns(sequences: list[list[str]]) -> list[Pattern]:
             return [
                 Pattern(sequence=list(seq), frequency=freq,
                         last_seen=datetime.now().isoformat())
-                for freq, seq in ps.frequent(2, minlen=2, maxlen=6)
+                for freq, seq in ps.frequent(2, maxlen=6)
+                if len(seq) >= 2
             ]
         except Exception as e:
             log.warning("PrefixSpan error: %s — sliding window fallback", e)

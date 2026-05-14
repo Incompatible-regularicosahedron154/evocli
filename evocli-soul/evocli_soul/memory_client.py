@@ -1,3 +1,4 @@
+# pyright: reportMissingTypeArgument=false, reportOptionalMemberAccess=false, reportUninitializedInstanceVariable=false, reportMissingTypeStubs=false
 """
 EvoCLI Memory Client — 本地优先，支持向量语义搜索
 
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -183,7 +185,9 @@ class _JSONLinesStore:
                 if entry.get("priority_scope") != "global":
                     continue
             results.append(entry)
-        return results[:limit]
+        if limit <= 0:
+            return []
+        return results[-limit:]
 
     def _read_all(self) -> list[dict]:
         entries = []
@@ -545,6 +549,11 @@ class EvoCLIMemory:
         if memory_type not in MEMORY_TYPES:
             memory_type = "episodic"
 
+        duplicate_id = self._find_duplicate_memory_id(content, priority)
+        if duplicate_id:
+            log.debug("Memory dedup: skipped duplicate content, reusing %s", duplicate_id[:8])
+            return duplicate_id
+
         entry = {
             "title":          content[:80],
             "body":           content,
@@ -565,6 +574,53 @@ class EvoCLIMemory:
             self._upsert_vector(mid, content, entry)
         log.debug("Memory added: %s [%s/%s importance=%.1f]", mid[:8], priority, memory_type, importance)
         return mid
+
+    def _find_duplicate_memory_id(self, content: str, priority: str) -> str | None:
+        """Return an existing memory id for identical or near-duplicate recent content."""
+        normalized_new = self._normalize_memory_text(content)
+        if not normalized_new:
+            return None
+
+        from evocli_soul.config_defaults import cfg_int
+
+        dedupe_window = max(1, int(cfg_int("memory.dedupe_window")))
+        scope_project = "global" if priority == "global" else self.project_id
+        recent = self._store.get_all(scope_project, dedupe_window)
+        tokens_new = self._tokenize_memory_text(normalized_new)
+
+        for mem in recent:
+            existing_text = mem.get("body") or mem.get("memory") or mem.get("title", "")
+            normalized_existing = self._normalize_memory_text(existing_text)
+            if not normalized_existing:
+                continue
+            existing_id = str(mem.get("id") or "") or None
+            if normalized_existing == normalized_new:
+                return existing_id
+
+            tokens_existing = self._tokenize_memory_text(normalized_existing)
+            if not tokens_new or not tokens_existing:
+                continue
+
+            union = tokens_new | tokens_existing
+            if not union:
+                continue
+
+            similarity = len(tokens_new & tokens_existing) / len(union)
+            if similarity >= 0.85:
+                return existing_id
+
+        return None
+
+    @staticmethod
+    def _normalize_memory_text(text: str) -> str:
+        return " ".join(text.casefold().split())
+
+    @staticmethod
+    def _tokenize_memory_text(text: str) -> set[str]:
+        if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+            compact = "".join(ch for ch in text if not ch.isspace())
+            return {compact[i : i + 2] for i in range(len(compact) - 1)} or set(compact)
+        return set(re.findall(r"\w+", text))
 
     def search(self, query: str, top_k: int = 5,
                current_project: str | None = None,
@@ -674,4 +730,3 @@ class EvoCLIMemory:
                 log.warning("Memory forget failed: %s", e)
 
         return to_forget
-

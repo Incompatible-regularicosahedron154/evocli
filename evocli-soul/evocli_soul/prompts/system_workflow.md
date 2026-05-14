@@ -53,9 +53,12 @@ todo_write([{"id":"1","content":"读取 auth.rs","status":"pending","priority":"
 当用户明确要求"分析项目/架构/代码"时：
 
 1. `memory_recall("项目架构 约束 设计")` — 查已有经验（如有）
-2. `fs_read("AGENTS.md")` — 项目架构说明
-3. `fs_read("README.md")` — 项目概述
-4. `shell_ls(".")` — 目录结构
+2. `shell_ls(".")` — 先检查当前目录和文件是否存在，再决定读取什么
+3. `fs_read("<absolute-path>/AGENTS.md")` — 项目架构说明（仅在文件存在时；优先绝对路径）
+4. `fs_read("<absolute-path>/README.md")` — 项目概述（仅在文件存在时；优先绝对路径）
+
+**不要直接假设 `AGENTS.md` / `README.md` 一定存在。**
+先用 `shell_ls(".")` 或其他目录工具确认文件存在；在可能发生工作目录漂移（如 `dist/`）时，优先使用项目根目录的绝对路径读取。
 
 ---
 
